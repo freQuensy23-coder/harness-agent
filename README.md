@@ -80,6 +80,11 @@ command: ["python", "/workspace/mcp_server.py"]
 cwd: /workspace
 ```
 
+Documentation
+-------------
+
+- [System and development rules](docs/system-and-development-rules.md)
+
 Run
 ---
 
