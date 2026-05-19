@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 
 from harness_agent.bus import EventBus
+from harness_agent.compaction import ContextCompactor
 from harness_agent.context import AgentFileSet, ContextBuilder, Skill
 from harness_agent.events import (
     AgentTurnRequested,
@@ -35,7 +36,7 @@ from harness_agent.llm import (
     UserMessage,
 )
 from harness_agent.llm_audit import AuditedLlmClient, SQLiteLlmAuditStore
-from harness_agent.projections import SQLiteConversationProjection
+from harness_agent.projections import SQLiteConversationProjection, summary_to_llm_message
 from harness_agent.runtime import (
     FakeUserRuntime,
     RuntimeToolResult,
@@ -545,6 +546,151 @@ async def test_tool_history_bytes_are_identical_in_next_llm_request(tmp_path: Pa
         if json.loads(message)["kind"] in {"assistant_tool_call", "tool_result"}
     ]
     assert second_turn_tool_history == tool_history_bytes
+
+
+@pytest.mark.asyncio
+async def test_context_compaction_archives_summarized_items_and_keeps_last_two(
+    tmp_path: Path,
+) -> None:
+    store = SQLiteEventStore(tmp_path / "events.sqlite3")
+    projection = SQLiteConversationProjection(tmp_path / "messages.sqlite3")
+    runtime = FakeUserRuntime(
+        agent_files=AgentFileSet(soul="SOUL", agents="AGENTS", user="USER", tools="TOOLS"),
+    )
+    llm = FakeLlmClient(
+        [
+            AssistantText(text="summary: old user and pwd result"),
+            AssistantText(text="final"),
+        ]
+    )
+    bus = EventBus(store)
+    conversation_projector = ConversationProjector(projection)
+    agent_turn_handler = AgentTurnHandler(
+        bus=bus,
+        context_builder=ContextBuilder(runtime=runtime),
+        llm=llm,
+        tool_registry=default_tool_registry(),
+        projection=projection,
+        context_compactor=ContextCompactor(
+            llm=llm,
+            projection=projection,
+            runtime=runtime,
+            max_tokens_per_model=15_001,
+        ),
+    )
+    bus.subscribe(UserTextReceived, conversation_projector.handle_user_text)
+    bus.subscribe(AssistantTextProduced, conversation_projector.handle_assistant_text)
+    bus.subscribe(UserTextReceived, agent_turn_handler.handle_user_text)
+    bus.subscribe(AgentTurnRequested, agent_turn_handler.handle_agent_turn)
+
+    await projection.append_user_message(
+        user_id="u:1",
+        conversation_id="cli:compact",
+        text="old user " + ("x" * 500),
+    )
+    await projection.append_tool_exchange(
+        user_id="u:1",
+        conversation_id="cli:compact",
+        generation=1,
+        call_id="call_1",
+        tool_name="shell.exec",
+        input=ShellExecInput(command="pwd", cwd="/workspace"),
+        result=RuntimeToolResult(stdout="/workspace\n"),
+    )
+    await projection.append_assistant_message(
+        user_id="u:1",
+        conversation_id="cli:compact",
+        generation=1,
+        text="recent assistant",
+    )
+
+    await bus.publish(
+        UserTextReceived(
+            user_id="u:1",
+            conversation_id="cli:compact",
+            source="cli",
+            text="latest user",
+        )
+    )
+
+    assert len(llm.requests) == 2
+    summary_request = llm.requests[0]
+    assert summary_request.tools == []
+    assert '"kind":"assistant_tool_call"' in summary_request.messages[0].text
+    assert '"kind":"tool_result"' in summary_request.messages[0].text
+
+    archive_write = runtime.file_write_calls[0]
+    assert archive_write.path.startswith("/workspace/.old-sessions/")
+    assert archive_write.path.endswith(".jsonl")
+    assert '"kind":"user"' in archive_write.content
+    assert '"kind":"assistant_tool_call"' in archive_write.content
+    assert '"kind":"tool_result"' in archive_write.content
+    assert "recent assistant" not in archive_write.content
+    assert "latest user" not in archive_write.content
+
+    compacted_summary = summary_to_llm_message("summary: old user and pwd result")
+    assert llm.requests[1].messages == [
+        compacted_summary,
+        AssistantMessage(text="recent assistant"),
+        UserMessage(text="latest user"),
+    ]
+    assert await projection.list_llm_messages("cli:compact") == [
+        compacted_summary,
+        AssistantMessage(text="recent assistant"),
+        UserMessage(text="latest user"),
+        AssistantMessage(text="final"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_context_compaction_does_not_run_below_threshold(tmp_path: Path) -> None:
+    store = SQLiteEventStore(tmp_path / "events.sqlite3")
+    projection = SQLiteConversationProjection(tmp_path / "messages.sqlite3")
+    runtime = FakeUserRuntime(
+        agent_files=AgentFileSet(soul="SOUL", agents="AGENTS", user="USER", tools="TOOLS"),
+    )
+    llm = FakeLlmClient([AssistantText(text="final")])
+    bus = EventBus(store)
+    conversation_projector = ConversationProjector(projection)
+    agent_turn_handler = AgentTurnHandler(
+        bus=bus,
+        context_builder=ContextBuilder(runtime=runtime),
+        llm=llm,
+        tool_registry=default_tool_registry(),
+        projection=projection,
+        context_compactor=ContextCompactor(
+            llm=llm,
+            projection=projection,
+            runtime=runtime,
+            max_tokens_per_model=1_000_000,
+        ),
+    )
+    bus.subscribe(UserTextReceived, conversation_projector.handle_user_text)
+    bus.subscribe(AssistantTextProduced, conversation_projector.handle_assistant_text)
+    bus.subscribe(UserTextReceived, agent_turn_handler.handle_user_text)
+    bus.subscribe(AgentTurnRequested, agent_turn_handler.handle_agent_turn)
+
+    await projection.append_user_message(
+        user_id="u:1",
+        conversation_id="cli:no-compact",
+        text="old user",
+    )
+
+    await bus.publish(
+        UserTextReceived(
+            user_id="u:1",
+            conversation_id="cli:no-compact",
+            source="cli",
+            text="latest user",
+        )
+    )
+
+    assert len(llm.requests) == 1
+    assert llm.requests[0].messages == [
+        UserMessage(text="old user"),
+        UserMessage(text="latest user"),
+    ]
+    assert runtime.file_write_calls == []
 
 
 @pytest.mark.asyncio

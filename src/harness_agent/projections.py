@@ -1,6 +1,8 @@
 import json
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
+from uuid import uuid4
 
 import aiosqlite
 from pydantic import TypeAdapter
@@ -18,6 +20,31 @@ from harness_agent.tools import ToolInput
 
 
 MessageRole = Literal["user", "assistant"]
+CONTEXT_SUMMARY_PREFIX = "Previous conversation summary (auto-generated):"
+
+
+@dataclass(frozen=True)
+class ProjectedConversationMessage:
+    sequence: int
+    message: LlmMessage
+
+
+@dataclass(frozen=True)
+class ConversationContextWindow:
+    summary: str | None
+    compacted_through_sequence: int
+    rows: list[ProjectedConversationMessage]
+
+    def to_llm_messages(self) -> list[LlmMessage]:
+        messages: list[LlmMessage] = []
+        if self.summary is not None:
+            messages.append(summary_to_llm_message(self.summary))
+        messages.extend(row.message for row in self.rows)
+        return messages
+
+
+def summary_to_llm_message(summary: str) -> UserMessage:
+    return UserMessage(text=f"{CONTEXT_SUMMARY_PREFIX}\n{summary}")
 
 
 class SQLiteConversationProjection:
@@ -208,18 +235,85 @@ class SQLiteConversationProjection:
             await db.commit()
 
     async def list_llm_messages(self, conversation_id: str) -> list[LlmMessage]:
+        return (await self.list_context_window(conversation_id)).to_llm_messages()
+
+    async def list_context_window(self, conversation_id: str) -> ConversationContextWindow:
         await self._ensure_schema()
         async with aiosqlite.connect(self._path) as db:
-            rows = await db.execute_fetchall(
+            compaction = await db.execute_fetchall(
                 """
-                select message_json
-                from conversation_items
+                select summary, compacted_through_sequence
+                from conversation_compactions
                 where conversation_id = ?
-                order by sequence asc
+                order by sequence desc
+                limit 1
                 """,
                 (conversation_id,),
             )
-        return [self._message_adapter.validate_json(row[0]) for row in rows]
+            summary = None
+            compacted_through_sequence = 0
+            if compaction:
+                summary = compaction[0][0]
+                compacted_through_sequence = compaction[0][1]
+            rows = await db.execute_fetchall(
+                """
+                select sequence, message_json
+                from conversation_items
+                where conversation_id = ?
+                  and sequence > ?
+                order by sequence asc
+                """,
+                (conversation_id, compacted_through_sequence),
+            )
+        return ConversationContextWindow(
+            summary=summary,
+            compacted_through_sequence=compacted_through_sequence,
+            rows=[
+                ProjectedConversationMessage(
+                    sequence=row[0],
+                    message=self._message_adapter.validate_json(row[1]),
+                )
+                for row in rows
+            ],
+        )
+
+    async def record_compaction(
+        self,
+        *,
+        user_id: str,
+        conversation_id: str,
+        compacted_through_sequence: int,
+        source_message_count: int,
+        archive_path: str,
+        summary: str,
+    ) -> None:
+        await self._ensure_schema()
+        async with aiosqlite.connect(self._path) as db:
+            await db.execute(
+                """
+                insert into conversation_compactions (
+                    id,
+                    user_id,
+                    conversation_id,
+                    created_at,
+                    compacted_through_sequence,
+                    source_message_count,
+                    archive_path,
+                    summary
+                )
+                values (?, ?, ?, datetime('now'), ?, ?, ?, ?)
+                """,
+                (
+                    uuid4().hex,
+                    user_id,
+                    conversation_id,
+                    compacted_through_sequence,
+                    source_message_count,
+                    archive_path,
+                    summary,
+                ),
+            )
+            await db.commit()
 
     async def list_tool_history_json(self, conversation_id: str) -> list[str]:
         await self._ensure_schema()
@@ -312,6 +406,27 @@ class SQLiteConversationProjection:
                     payload_json text,
                     message_json text not null
                 )
+                """
+            )
+            await db.execute(
+                """
+                create table if not exists conversation_compactions (
+                    sequence integer primary key autoincrement,
+                    id text not null unique,
+                    user_id text not null,
+                    conversation_id text not null,
+                    created_at text not null,
+                    compacted_through_sequence integer not null,
+                    source_message_count integer not null,
+                    archive_path text not null,
+                    summary text not null
+                )
+                """
+            )
+            await db.execute(
+                """
+                create index if not exists idx_conversation_compactions_conversation
+                on conversation_compactions (conversation_id, sequence)
                 """
             )
             await db.commit()
