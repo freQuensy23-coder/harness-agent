@@ -30,7 +30,7 @@ from harness_agent.llm import OpenAIResponsesClient
 from harness_agent.llm_audit import AuditedLlmClient, SQLiteLlmAuditStore
 from harness_agent.mcp import McpManager
 from harness_agent.projections import SQLiteConversationProjection
-from harness_agent.runtime import DockerUserRuntime
+from harness_agent.runtime import DockerUserRuntime, SQLiteSpawnedProcessStore
 from harness_agent.scheduler import (
     SchedulerDueHandler,
     SchedulerPump,
@@ -54,6 +54,7 @@ class HarnessApp:
         llm_path = _derived_db_path(db_path, "llm")
         messages_path = _derived_db_path(db_path, "messages")
         schedules_path = _derived_db_path(db_path, "schedules")
+        runtime_path = _derived_db_path(db_path, "runtime")
         sub_agents_path = _derived_db_path(db_path, "subagents")
         tasks_path = _derived_db_path(db_path, "tasks")
 
@@ -74,6 +75,7 @@ class HarnessApp:
             memory=config.runtime.docker.memory,
             cpus=config.runtime.docker.cpus,
             ensure_container=True,
+            spawned_process_store=SQLiteSpawnedProcessStore(runtime_path),
         )
         self.mcp_manager = McpManager(
             runtime=self.runtime,
