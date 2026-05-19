@@ -5,7 +5,7 @@ from loguru import logger
 
 from harness_agent.adapters.cli import event_from_cli_send
 from harness_agent.adapters.telegram import AiogramTelegramAdapter
-from harness_agent.bus import EventBus
+from harness_agent.bus import EventBus, HandlerResult
 from harness_agent.config import HarnessConfig
 from harness_agent.context import ContextBuilder
 from harness_agent.events import (
@@ -91,7 +91,7 @@ class HarnessApp:
             store=self.sub_agent_store,
             result_waiter=self.sub_agent_results,
         )
-        self.telegram: AiogramTelegramAdapter | None = None
+        self.telegram: AiogramTelegramAdapter | None = self._build_telegram_adapter()
         self.scheduler_service: SchedulerService | None = None
         self._cli_replies: dict[str, Queue[str]] = {}
         self._wire()
@@ -122,10 +122,8 @@ class HarnessApp:
             raise RuntimeError("telegram.enabled is false")
         if self._config.telegram.bot_token is None:
             raise RuntimeError("telegram.bot_token is required when telegram is enabled")
-        self.telegram = AiogramTelegramAdapter(
-            token=self._config.telegram.bot_token,
-            bus=self.bus,
-        )
+        if self.telegram is None:
+            raise RuntimeError("telegram adapter is not initialized")
         self.scheduler_service = SchedulerService(
             pump=SchedulerPump(store=self.schedule_store, bus=self.bus),
             poll_seconds=self._config.scheduler.poll_seconds,
@@ -174,30 +172,27 @@ class HarnessApp:
         self.bus.subscribe(ToolCallRequested, tool_call_executor.handle_tool_call_requested)
         self.bus.subscribe(ToolCallCompleted, self.tool_results.handle_tool_call_completed)
         self.bus.subscribe(ToolCallCompleted, conversation_projector.handle_tool_call_completed)
+        if self.telegram is not None:
+            self.telegram.subscribe_outbound()
         self.bus.subscribe(UserTextReceived, agent_turn_handler.handle_user_text)
         self.bus.subscribe(
             AgentTurnRequested,
             agent_turn_handler.handle_agent_turn,
         )
-        self.bus.subscribe(AssistantTextProduced, self._send_telegram_reply)
         self.bus.subscribe(AssistantTextProduced, self._send_cli_reply)
 
-    async def _send_telegram_reply(self, event: AssistantTextProduced) -> tuple:
-        if event.reply_target is None:
-            return ()
-        if event.reply_target.kind != "telegram":
-            return ()
-        if not await self.turn_coordinator.is_current(
-            event.conversation_id,
-            event.generation,
-        ):
-            return ()
-        if self.telegram is None:
-            raise RuntimeError("telegram adapter is not running")
-        await self.telegram.send_assistant_text(event)
-        return ()
+    def _build_telegram_adapter(self) -> AiogramTelegramAdapter | None:
+        if not self._config.telegram.enabled:
+            return None
+        if self._config.telegram.bot_token is None:
+            return None
+        return AiogramTelegramAdapter(
+            token=self._config.telegram.bot_token,
+            bus=self.bus,
+            is_current_generation=self.turn_coordinator.is_current,
+        )
 
-    async def _send_cli_reply(self, event: AssistantTextProduced) -> tuple:
+    async def _send_cli_reply(self, event: AssistantTextProduced) -> HandlerResult:
         if event.reply_target is None:
             return ()
         if event.reply_target.kind != "cli":

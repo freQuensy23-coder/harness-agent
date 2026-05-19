@@ -1,12 +1,23 @@
 import base64
 import re
+from collections.abc import Awaitable, Callable
 
 from aiogram import Bot, Dispatcher, Router
+from aiogram.enums import ChatAction, ParseMode
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import CommandStart
 from aiogram.types import Message
 
-from harness_agent.bus import EventBus
-from harness_agent.events import AssistantTextProduced, InboundAttachment, TelegramTextReceived
+from harness_agent.bus import EventBus, HandlerResult
+from harness_agent.events import (
+    AgentTurnRequested,
+    AssistantTextProduced,
+    InboundAttachment,
+    TelegramTextReceived,
+)
+
+
+GenerationCurrentPredicate = Callable[[str, int], Awaitable[bool]]
 
 
 def event_from_aiogram_message(
@@ -102,25 +113,85 @@ def safe_file_name(file_name: str) -> str:
 
 
 class AiogramTelegramAdapter:
-    def __init__(self, *, token: str, bus: EventBus) -> None:
+    def __init__(
+        self,
+        *,
+        token: str,
+        bus: EventBus,
+        is_current_generation: GenerationCurrentPredicate | None = None,
+    ) -> None:
         self._bot = Bot(token=token)
         self._dispatcher = Dispatcher()
         self._router = Router()
         self._bus = bus
+        self._is_current_generation = (
+            _always_current_generation
+            if is_current_generation is None
+            else is_current_generation
+        )
         self._router.message(CommandStart())(self._on_start)
         self._router.message()(self._on_message)
         self._dispatcher.include_router(self._router)
+
+    def subscribe_outbound(self) -> None:
+        self._bus.subscribe(AgentTurnRequested, self.handle_agent_turn_requested)
+        self._bus.subscribe(AssistantTextProduced, self.handle_assistant_text)
 
     async def start_polling(self) -> None:
         await self._dispatcher.start_polling(self._bot)
 
     async def send_assistant_text(self, event: AssistantTextProduced) -> None:
-        if event.reply_target is None:
+        if event.reply_target is None or event.reply_target.kind != "telegram":
             raise ValueError("Assistant text has no Telegram reply target")
-        await self._bot.send_message(chat_id=event.reply_target.chat_id, text=event.text)
+        try:
+            await self._bot.send_message(
+                chat_id=event.reply_target.chat_id,
+                text=event.text,
+                parse_mode=ParseMode.MARKDOWN,
+            )
+        except TelegramBadRequest:
+            await self._bot.send_message(
+                chat_id=event.reply_target.chat_id,
+                text=event.text,
+            )
+
+    async def handle_assistant_text(self, event: AssistantTextProduced) -> HandlerResult:
+        if event.reply_target is None or event.reply_target.kind != "telegram":
+            return ()
+        if not await self._is_current_generation(
+            event.conversation_id,
+            event.generation,
+        ):
+            return ()
+        await self.send_assistant_text(event)
+        return ()
+
+    async def handle_agent_turn_requested(
+        self,
+        event: AgentTurnRequested,
+    ) -> HandlerResult:
+        if event.reply_target is None or event.reply_target.kind != "telegram":
+            return ()
+        if not await self._is_current_generation(
+            event.conversation_id,
+            event.generation,
+        ):
+            return ()
+        await self._bot.send_chat_action(
+            chat_id=event.reply_target.chat_id,
+            action=ChatAction.TYPING,
+        )
+        return ()
 
     async def _on_start(self, message: Message) -> None:
         await self._on_message(message)
 
     async def _on_message(self, message: Message) -> None:
         await self._bus.publish(await event_from_aiogram_message_with_files(message, self._bot))
+
+
+async def _always_current_generation(
+    _conversation_id: str,
+    _generation: int,
+) -> bool:
+    return True
