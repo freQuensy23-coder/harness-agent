@@ -2,13 +2,22 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from aiogram.exceptions import TelegramBadRequest
 
+from harness_agent.bus import EventBus
 from harness_agent.adapters.cli import event_from_cli_send
-from harness_agent.adapters.telegram import event_from_aiogram_message
+from harness_agent.adapters.telegram import AiogramTelegramAdapter, event_from_aiogram_message
 from harness_agent.config import load_config
 from harness_agent.context import Skill
+from harness_agent.events import (
+    AgentTurnRequested,
+    AssistantTextProduced,
+    TelegramReplyTarget,
+)
 from harness_agent.runtime import DockerProcessResult, DockerUserRuntime
+from harness_agent.store import SQLiteEventStore
 from harness_agent.tools import FileWriteInput, ShellExecInput
+from harness_agent.turns import ConversationTurnCoordinator
 
 
 def test_yaml_config_rejects_unknown_fields(tmp_path: Path) -> None:
@@ -43,6 +52,96 @@ def test_telegram_adapter_only_creates_event() -> None:
     assert event.telegram_chat_id == 456
     assert event.telegram_message_id == 999
     assert event.text == "Say hi"
+
+
+@pytest.mark.asyncio
+async def test_telegram_adapter_sends_assistant_markdown() -> None:
+    bot = RecordingTelegramBot()
+    adapter = telegram_adapter_with_bot(bot)
+
+    await adapter.send_assistant_text(
+        AssistantTextProduced(
+            user_id="u:123",
+            conversation_id="tg:456",
+            generation=1,
+            text="*bold*",
+            reply_target=TelegramReplyTarget(chat_id=456),
+        )
+    )
+
+    assert bot.calls == [
+        (
+            "send_message",
+            {"chat_id": 456, "text": "*bold*", "parse_mode": "Markdown"},
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_telegram_adapter_falls_back_to_plain_text_for_invalid_markdown() -> None:
+    bot = RecordingTelegramBot(fail_first_message=True)
+    adapter = telegram_adapter_with_bot(bot)
+
+    await adapter.send_assistant_text(
+        AssistantTextProduced(
+            user_id="u:123",
+            conversation_id="tg:456",
+            generation=1,
+            text="*broken",
+            reply_target=TelegramReplyTarget(chat_id=456),
+        )
+    )
+
+    assert bot.calls == [
+        (
+            "send_message",
+            {"chat_id": 456, "text": "*broken", "parse_mode": "Markdown"},
+        ),
+        ("send_message", {"chat_id": 456, "text": "*broken"}),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_telegram_adapter_wires_typing_before_agent_turn_handler(
+    tmp_path: Path,
+) -> None:
+    store = SQLiteEventStore(tmp_path / "events.sqlite3")
+    bus = EventBus(store)
+    order: list[str] = []
+    bot = RecordingTelegramBot(order=order)
+    adapter = telegram_adapter_with_bot(bot, bus=bus)
+    turn_coordinator = ConversationTurnCoordinator()
+    generation = await turn_coordinator.request_generation("tg:456")
+
+    async def agent_turn_handler(event: AgentTurnRequested) -> tuple:
+        order.append("agent_turn")
+        return ()
+
+    bus.subscribe(AgentTurnRequested, agent_turn_handler)
+    adapter.subscribe_outbound(turn_coordinator=turn_coordinator)
+
+    await bus.publish(
+        AgentTurnRequested(
+            user_id="u:123",
+            conversation_id="tg:456",
+            generation=generation,
+            input_event_id="event-1",
+            reply_target=TelegramReplyTarget(chat_id=456),
+        )
+    )
+
+    assert bot.calls == [
+        ("send_chat_action", {"chat_id": 456, "action": "typing"}),
+    ]
+    assert order == ["telegram_typing", "agent_turn"]
+
+
+def test_harness_app_does_not_own_outbound_telegram_ux() -> None:
+    app_source = Path("src/harness_agent/app.py").read_text(encoding="utf-8")
+
+    assert "def _send_telegram_reply" not in app_source
+    assert "send_assistant_text(event)" not in app_source
+    assert "send_writing_action" not in app_source
 
 
 def test_cli_adapter_only_creates_event() -> None:
@@ -137,6 +236,44 @@ async def test_docker_runtime_loads_skills_from_markdown_frontmatter() -> None:
             body="Stay in /workspace.\n",
         )
     ]
+
+
+class FakeTelegramBadRequest(TelegramBadRequest):
+    def __init__(self) -> None:
+        Exception.__init__(self, "can't parse entities")
+
+
+class RecordingTelegramBot:
+    def __init__(
+        self,
+        *,
+        fail_first_message: bool = False,
+        order: list[str] | None = None,
+    ) -> None:
+        self._fail_first_message = fail_first_message
+        self._order = order
+        self.calls: list[tuple[str, dict]] = []
+
+    async def send_message(self, **kwargs) -> None:
+        self.calls.append(("send_message", kwargs))
+        if self._fail_first_message and len(self.calls) == 1:
+            raise FakeTelegramBadRequest()
+
+    async def send_chat_action(self, **kwargs) -> None:
+        self.calls.append(("send_chat_action", kwargs))
+        if self._order is not None:
+            self._order.append("telegram_typing")
+
+
+def telegram_adapter_with_bot(
+    bot: RecordingTelegramBot,
+    *,
+    bus: EventBus | None = None,
+) -> AiogramTelegramAdapter:
+    adapter = AiogramTelegramAdapter.__new__(AiogramTelegramAdapter)
+    adapter._bot = bot  # type: ignore[attr-defined]
+    adapter._bus = bus  # type: ignore[attr-defined]
+    return adapter
 
 
 class RecordingDockerRunner:
