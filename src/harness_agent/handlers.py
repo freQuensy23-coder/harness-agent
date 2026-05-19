@@ -1,6 +1,7 @@
 import base64
 
 from harness_agent.bus import EventBus
+from harness_agent.compaction import ContextCompactor
 from harness_agent.content import content_ref_from_bytes
 from harness_agent.context import ContextBuilder
 from harness_agent.events import (
@@ -19,8 +20,9 @@ from harness_agent.events import (
 from harness_agent.identity import StaticIdentityResolver
 from harness_agent.llm import (
     AssistantToolCallMessage,
-    LlmRequest,
     LlmClient,
+    LlmMessage,
+    LlmRequest,
     ToolResultMessage,
     UserMessage,
 )
@@ -31,6 +33,7 @@ from harness_agent.tool_executor import ToolCallResultWaiter
 from harness_agent.turns import ConversationTurnCoordinator
 from harness_agent.tools import (
     ToolRegistry,
+    ToolSpec,
 )
 
 
@@ -159,6 +162,7 @@ class AgentTurnHandler:
         mcp_manager: McpManager | None = None,
         turn_coordinator: ConversationTurnCoordinator | None = None,
         tool_results: ToolCallResultWaiter | None = None,
+        context_compactor: ContextCompactor | None = None,
     ) -> None:
         self._bus = bus
         self._context_builder = context_builder
@@ -172,6 +176,7 @@ class AgentTurnHandler:
         if tool_results is None:
             tool_results = ToolCallResultWaiter()
         self._tool_results = tool_results
+        self._context_compactor = context_compactor
 
     async def handle_user_text(self, event: UserTextReceived) -> EventBatch:
         generation = await self._turn_coordinator.request_generation(event.conversation_id)
@@ -202,6 +207,12 @@ class AgentTurnHandler:
             while True:
                 if await self._stop_if_superseded(event):
                     return
+                messages = await self._compact_if_needed(
+                    event=event,
+                    system=context.system,
+                    messages=messages,
+                    tools=tools,
+                )
                 response = await self._llm.respond(
                     LlmRequest(
                         user_id=event.user_id,
@@ -262,6 +273,25 @@ class AgentTurnHandler:
                                 attachments=[attachment],
                             )
                         )
+
+    async def _compact_if_needed(
+        self,
+        *,
+        event: AgentTurnRequested,
+        system: str,
+        messages: list[LlmMessage],
+        tools: list[ToolSpec],
+    ) -> list[LlmMessage]:
+        if self._context_compactor is None:
+            return messages
+        return await self._context_compactor.compact_if_needed(
+            user_id=event.user_id,
+            conversation_id=event.conversation_id,
+            generation=event.generation,
+            system=system,
+            messages=messages,
+            tools=tools,
+        )
 
     async def _stop_if_superseded(self, event: AgentTurnRequested) -> bool:
         current_generation = await self._turn_coordinator.current_generation(

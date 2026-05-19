@@ -86,15 +86,17 @@ class OpenAICompatibleChatClient(LlmClient):
         self._model = model
 
     async def respond(self, request: LlmRequest) -> LlmResponse:
-        response = await self._client.chat.completions.create(
-            model=self._model,
-            messages=[
+        create_kwargs = {
+            "model": self._model,
+            "messages": [
                 {"role": "system", "content": request.system},
                 *[message_to_openai(message) for message in request.messages],
             ],
-            tools=[tool_to_openai(tool) for tool in request.tools],
-            parallel_tool_calls=False,
-        )
+        }
+        if request.tools:
+            create_kwargs["tools"] = [tool_to_openai(tool) for tool in request.tools]
+            create_kwargs["parallel_tool_calls"] = False
+        response = await self._client.chat.completions.create(**create_kwargs)
         message = response.choices[0].message
         if message.tool_calls:
             tool_call = message.tool_calls[0]
