@@ -2,11 +2,17 @@ import base64
 import re
 
 from aiogram import Bot, Dispatcher, Router
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import CommandStart
 from aiogram.types import Message
 
 from harness_agent.bus import EventBus
-from harness_agent.events import AssistantTextProduced, InboundAttachment, TelegramTextReceived
+from harness_agent.events import (
+    AgentTurnRequested,
+    AssistantTextProduced,
+    InboundAttachment,
+    TelegramTextReceived,
+)
 
 
 def event_from_aiogram_message(
@@ -117,7 +123,24 @@ class AiogramTelegramAdapter:
     async def send_assistant_text(self, event: AssistantTextProduced) -> None:
         if event.reply_target is None:
             raise ValueError("Assistant text has no Telegram reply target")
-        await self._bot.send_message(chat_id=event.reply_target.chat_id, text=event.text)
+        try:
+            await self._bot.send_message(
+                chat_id=event.reply_target.chat_id,
+                text=event.text,
+                parse_mode="Markdown",
+            )
+        except TelegramBadRequest:
+            await self._bot.send_message(chat_id=event.reply_target.chat_id, text=event.text)
+
+    async def send_writing_action(self, event: AgentTurnRequested) -> None:
+        if event.reply_target is None:
+            return
+        if event.reply_target.kind != "telegram":
+            return
+        await self._bot.send_chat_action(
+            chat_id=event.reply_target.chat_id,
+            action="typing",
+        )
 
     async def _on_start(self, message: Message) -> None:
         await self._on_message(message)
