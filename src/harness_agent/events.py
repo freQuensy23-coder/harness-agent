@@ -85,6 +85,16 @@ class AgentTurnSuperseded(EventBase):
     reason: Literal["newer_user_message"] = "newer_user_message"
 
 
+class ContextCompacting(EventBase):
+    type: Literal["context.compacting"] = "context.compacting"
+    user_id: str
+    conversation_id: str
+    generation: int
+    estimated_tokens: int
+    threshold_tokens: int
+    archive_path: str
+
+
 class ToolCallRequested(EventBase):
     type: Literal["tool.call.requested"] = "tool.call.requested"
     user_id: str
@@ -184,6 +194,7 @@ AgentEvent = Annotated[
     | UserTextReceived
     | AgentTurnRequested
     | AgentTurnSuperseded
+    | ContextCompacting
     | ToolCallRequested
     | ToolCallCompleted
     | AssistantTextProduced
