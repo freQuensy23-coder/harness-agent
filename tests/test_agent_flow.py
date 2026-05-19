@@ -2,10 +2,12 @@ import asyncio
 import json
 from pathlib import Path
 
+import aiosqlite
 import pytest
 
 from harness_agent.bus import EventBus
 from harness_agent.context import AgentFileSet, ContextBuilder, Skill
+from harness_agent.content import ContentRef
 from harness_agent.events import (
     AgentTurnRequested,
     AgentTurnSuperseded,
@@ -548,6 +550,221 @@ async def test_tool_history_bytes_are_identical_in_next_llm_request(tmp_path: Pa
 
 
 @pytest.mark.asyncio
+async def test_agent_turn_compacts_context_before_llm_request(tmp_path: Path) -> None:
+    store = SQLiteEventStore(tmp_path / "events.sqlite3")
+    messages_path = tmp_path / "messages.sqlite3"
+    projection = SQLiteConversationProjection(messages_path)
+    runtime = FakeUserRuntime(
+        agent_files=AgentFileSet(soul="SOUL", agents="AGENTS", user="USER", tools="TOOLS"),
+    )
+    llm = FakeLlmClient([AssistantText(text="summary of old context"), AssistantText(text="done")])
+    bus = EventBus(store)
+    conversation_projector = ConversationProjector(projection)
+    agent_turn_handler = AgentTurnHandler(
+        bus=bus,
+        context_builder=ContextBuilder(runtime=runtime),
+        llm=llm,
+        tool_registry=default_tool_registry(),
+        projection=projection,
+        context_archive_runtime=runtime,
+        max_tokens_per_model=20,
+        compaction_reserved_tokens=19,
+        compaction_keep_last_messages=2,
+    )
+    bus.subscribe(UserTextReceived, conversation_projector.handle_user_text)
+    bus.subscribe(AssistantTextProduced, conversation_projector.handle_assistant_text)
+    bus.subscribe(UserTextReceived, agent_turn_handler.handle_user_text)
+    bus.subscribe(AgentTurnRequested, agent_turn_handler.handle_agent_turn)
+
+    await projection.append_user_message(
+        user_id="u:1",
+        conversation_id="cli:compact",
+        text="old user request",
+    )
+    await projection.append_assistant_message(
+        user_id="u:1",
+        conversation_id="cli:compact",
+        generation=1,
+        text="old assistant answer",
+    )
+    await projection.append_tool_exchange(
+        user_id="u:1",
+        conversation_id="cli:compact",
+        generation=1,
+        call_id="call_1",
+        tool_name="shell.exec",
+        input=ShellExecInput(command="pwd", cwd="/workspace"),
+        result=RuntimeToolResult(stdout="/workspace\n"),
+        attachments=[
+            ContentRef(
+                kind="image",
+                file_name="plot.png",
+                mime_type="image/png",
+                size_bytes=8,
+                sha256="sha",
+                workspace_path="/workspace/content/plot.png",
+                content_base64="aW1hZ2U=",
+            )
+        ],
+    )
+    await projection.append_user_message(
+        user_id="u:1",
+        conversation_id="cli:compact",
+        text="recent user context",
+    )
+    await projection.append_assistant_message(
+        user_id="u:1",
+        conversation_id="cli:compact",
+        generation=2,
+        text="recent assistant context",
+    )
+
+    await bus.publish(
+        UserTextReceived(
+            user_id="u:1",
+            conversation_id="cli:compact",
+            source="cli",
+            text="new request",
+        )
+    )
+
+    events = await store.list_events()
+    assert [event.type for event in events] == [
+        "user.text.received",
+        "agent.turn.requested",
+        "context.compacting",
+        "assistant.text.produced",
+    ]
+    compacting = next(event for event in events if event.type == "context.compacting")
+    assert compacting.archive_path.startswith("/workspace/.old-sessions/")
+    assert compacting.estimated_tokens >= compacting.threshold_tokens
+
+    summary_request = llm.requests[0]
+    assert summary_request.tools == []
+
+    archive_write = runtime.file_write_calls[0]
+    assert archive_write.path == compacting.archive_path
+    archived_kinds = [
+        json.loads(line)["item_kind"] for line in archive_write.content.splitlines()
+    ]
+    assert {
+        "user",
+        "assistant",
+        "assistant_tool_call",
+        "tool_result",
+        "tool_context",
+    }.issubset(archived_kinds)
+
+    final_request = llm.requests[-1]
+    assert final_request.messages == [
+        UserMessage(
+            text="Previous conversation summary:\nsummary of old context\n\n"
+            f"Archived raw session: {compacting.archive_path}"
+        ),
+        AssistantMessage(text="recent assistant context"),
+        UserMessage(text="new request"),
+    ]
+    assert await projection.list_llm_messages("cli:compact") == [
+        *final_request.messages,
+        AssistantMessage(text="done"),
+    ]
+    async with aiosqlite.connect(messages_path) as db:
+        rows = await db.execute_fetchall(
+            """
+            select item_kind, text
+            from conversation_items
+            where conversation_id = ?
+            order by sequence asc
+            """,
+            ("cli:compact",),
+        )
+    assert ("user", "old user request") in rows
+    assert ("assistant", "old assistant answer") in rows
+    assert [kind for kind, _ in rows].count("summary") == 1
+
+
+@pytest.mark.asyncio
+async def test_agent_turn_compacts_between_sequential_tool_calls(tmp_path: Path) -> None:
+    store = SQLiteEventStore(tmp_path / "events.sqlite3")
+    projection = SQLiteConversationProjection(tmp_path / "messages.sqlite3")
+    runtime = FakeUserRuntime(
+        agent_files=AgentFileSet(soul="SOUL", agents="AGENTS", user="USER", tools="TOOLS"),
+        shell_results=[
+            RuntimeToolResult(stdout="first\n"),
+            RuntimeToolResult(stdout="second\n"),
+        ],
+    )
+    llm = SummaryAwareLlmClient(
+        [
+            LlmToolCall(
+                call_id="call_1",
+                name="shell.exec",
+                input=ShellExecInput(command="printf first", cwd="/workspace"),
+            ),
+            LlmToolCall(
+                call_id="call_2",
+                name="shell.exec",
+                input=ShellExecInput(command="printf second", cwd="/workspace"),
+            ),
+            AssistantText(text="done"),
+        ]
+    )
+    bus = EventBus(store)
+    coordinator = ConversationTurnCoordinator()
+    tool_results = ToolCallResultWaiter()
+    tool_executor = ToolCallExecutor(runtime=runtime)
+    conversation_projector = ConversationProjector(projection, turn_coordinator=coordinator)
+    agent_turn_handler = AgentTurnHandler(
+        bus=bus,
+        context_builder=ContextBuilder(runtime=runtime),
+        llm=llm,
+        tool_registry=default_tool_registry(),
+        projection=projection,
+        turn_coordinator=coordinator,
+        tool_results=tool_results,
+        context_archive_runtime=runtime,
+        max_tokens_per_model=1,
+        compaction_reserved_tokens=1,
+        compaction_keep_last_messages=2,
+    )
+    bus.subscribe(UserTextReceived, conversation_projector.handle_user_text)
+    bus.subscribe(AssistantTextProduced, conversation_projector.handle_assistant_text)
+    bus.subscribe(ToolCallRequested, tool_executor.handle_tool_call_requested)
+    bus.subscribe(ToolCallCompleted, tool_results.handle_tool_call_completed)
+    bus.subscribe(ToolCallCompleted, conversation_projector.handle_tool_call_completed)
+    bus.subscribe(UserTextReceived, agent_turn_handler.handle_user_text)
+    bus.subscribe(AgentTurnRequested, agent_turn_handler.handle_agent_turn)
+
+    await bus.publish(
+        UserTextReceived(
+            user_id="u:1",
+            conversation_id="cli:mid-tool-compact",
+            source="cli",
+            text="run two tools",
+        )
+    )
+
+    assert runtime.shell_exec_calls == [
+        ShellExecInput(command="printf first", cwd="/workspace"),
+        ShellExecInput(command="printf second", cwd="/workspace"),
+    ]
+    assert all(request.tools == [] for request in llm.summary_requests)
+    assert len(llm.summary_requests) >= 1
+    second_main_request = llm.main_requests[1]
+    assert second_main_request.messages[0].kind == "user"
+    assert second_main_request.messages[0].text.startswith("Previous conversation summary:")
+    assert [message.kind for message in second_main_request.messages[-2:]] == [
+        "assistant_tool_call",
+        "tool_result",
+    ]
+    event_types = [event.type for event in await store.list_events()]
+    first_completed = event_types.index("tool.call.completed")
+    first_compacting = event_types.index("context.compacting")
+    second_tool_requested = event_types.index("tool.call.requested", first_completed + 1)
+    assert first_completed < first_compacting < second_tool_requested
+
+
+@pytest.mark.asyncio
 async def test_new_message_supersedes_running_turn_before_tool_side_effect(tmp_path: Path) -> None:
     store = SQLiteEventStore(tmp_path / "events.sqlite3")
     projection = SQLiteConversationProjection(tmp_path / "messages.sqlite3")
@@ -636,6 +853,24 @@ class BlockingToolThenTextLlm(LlmClient):
                 input=ShellExecInput(command="echo stale"),
             )
         return AssistantText(text="latest")
+
+
+class SummaryAwareLlmClient(LlmClient):
+    def __init__(self, main_responses) -> None:
+        self._main_responses = list(main_responses)
+        self.requests: list[LlmRequest] = []
+        self.main_requests: list[LlmRequest] = []
+        self.summary_requests: list[LlmRequest] = []
+
+    async def respond(self, request: LlmRequest):
+        self.requests.append(request)
+        if request.tools == []:
+            self.summary_requests.append(request)
+            return AssistantText(text=f"summary {len(self.summary_requests)}")
+        self.main_requests.append(request)
+        if not self._main_responses:
+            raise AssertionError("SummaryAwareLlmClient has no queued main response")
+        return self._main_responses.pop(0)
 
 
 def capture_current_reply(

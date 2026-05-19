@@ -154,6 +154,10 @@ class HarnessApp:
             mcp_manager=self.mcp_manager,
             turn_coordinator=self.turn_coordinator,
             tool_results=self.tool_results,
+            context_archive_runtime=self.runtime,
+            max_tokens_per_model=self._config.llm.max_tokens_per_model,
+            compaction_reserved_tokens=self._config.llm.compaction_reserved_tokens,
+            compaction_keep_last_messages=self._config.llm.compaction_keep_last_messages,
         )
         tool_call_executor = ToolCallExecutor(
             runtime=self.runtime,
