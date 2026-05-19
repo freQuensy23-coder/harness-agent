@@ -17,9 +17,14 @@ class EventBus:
         self,
         event_class: type[EventBase],
         handler: EventHandler,
+        *,
+        prepend: bool = False,
     ) -> None:
         if event_class not in self._handlers:
             self._handlers[event_class] = []
+        if prepend:
+            self._handlers[event_class].insert(0, handler)
+            return
         self._handlers[event_class].append(handler)
 
     async def publish(self, event: AgentEvent) -> None:

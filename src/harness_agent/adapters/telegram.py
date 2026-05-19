@@ -2,11 +2,18 @@ import base64
 import re
 
 from aiogram import Bot, Dispatcher, Router
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import CommandStart
 from aiogram.types import Message
 
 from harness_agent.bus import EventBus
-from harness_agent.events import AssistantTextProduced, InboundAttachment, TelegramTextReceived
+from harness_agent.events import (
+    AgentTurnRequested,
+    AssistantTextProduced,
+    InboundAttachment,
+    TelegramTextReceived,
+)
+from harness_agent.turns import ConversationTurnCoordinator
 
 
 def event_from_aiogram_message(
@@ -107,6 +114,7 @@ class AiogramTelegramAdapter:
         self._dispatcher = Dispatcher()
         self._router = Router()
         self._bus = bus
+        self._outbound_subscribed = False
         self._router.message(CommandStart())(self._on_start)
         self._router.message()(self._on_message)
         self._dispatcher.include_router(self._router)
@@ -114,10 +122,71 @@ class AiogramTelegramAdapter:
     async def start_polling(self) -> None:
         await self._dispatcher.start_polling(self._bot)
 
+    def subscribe_outbound(
+        self,
+        *,
+        turn_coordinator: ConversationTurnCoordinator,
+    ) -> None:
+        if getattr(self, "_outbound_subscribed", False):
+            return
+        self._turn_coordinator = turn_coordinator
+        self._bus.subscribe(
+            AgentTurnRequested,
+            self.handle_agent_turn_requested,
+            prepend=True,
+        )
+        self._bus.subscribe(AssistantTextProduced, self.handle_assistant_text)
+        self._outbound_subscribed = True
+
+    async def handle_agent_turn_requested(self, event: AgentTurnRequested) -> tuple:
+        if event.reply_target is None:
+            return ()
+        if event.reply_target.kind != "telegram":
+            return ()
+        if not await self._turn_coordinator.is_current(
+            event.conversation_id,
+            event.generation,
+        ):
+            return ()
+        await self.send_writing_action(event)
+        return ()
+
+    async def handle_assistant_text(self, event: AssistantTextProduced) -> tuple:
+        if event.reply_target is None:
+            return ()
+        if event.reply_target.kind != "telegram":
+            return ()
+        if not await self._turn_coordinator.is_current(
+            event.conversation_id,
+            event.generation,
+        ):
+            return ()
+        await self.send_assistant_text(event)
+        return ()
+
     async def send_assistant_text(self, event: AssistantTextProduced) -> None:
         if event.reply_target is None:
             raise ValueError("Assistant text has no Telegram reply target")
-        await self._bot.send_message(chat_id=event.reply_target.chat_id, text=event.text)
+        if event.reply_target.kind != "telegram":
+            raise ValueError("Assistant text has no Telegram reply target")
+        try:
+            await self._bot.send_message(
+                chat_id=event.reply_target.chat_id,
+                text=event.text,
+                parse_mode="Markdown",
+            )
+        except TelegramBadRequest:
+            await self._bot.send_message(chat_id=event.reply_target.chat_id, text=event.text)
+
+    async def send_writing_action(self, event: AgentTurnRequested) -> None:
+        if event.reply_target is None:
+            return
+        if event.reply_target.kind != "telegram":
+            return
+        await self._bot.send_chat_action(
+            chat_id=event.reply_target.chat_id,
+            action="typing",
+        )
 
     async def _on_start(self, message: Message) -> None:
         await self._on_message(message)
