@@ -2,11 +2,11 @@ from datetime import UTC, datetime
 from typing import Annotated, Literal
 from uuid import uuid4
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationInfo, field_validator
 
 from harness_agent.content import ContentRef
 from harness_agent.runtime import RuntimeToolResult
-from harness_agent.tools import ToolInput
+from harness_agent.tools import ToolInput, parse_stored_tool_input
 
 
 class EventBase(BaseModel):
@@ -61,7 +61,7 @@ class UserTextReceived(EventBase):
     type: Literal["user.text.received"] = "user.text.received"
     user_id: str
     conversation_id: str
-    source: Literal["telegram", "cli", "api", "scheduler"]
+    source: Literal["telegram", "cli", "api", "scheduler", "subagent"]
     text: str
     attachments: list[InboundAttachment] = Field(default_factory=list)
     reply_target: ReplyTarget | None = None
@@ -95,6 +95,14 @@ class ToolCallRequested(EventBase):
     input: ToolInput
     reply_target: ReplyTarget | None = None
 
+    @field_validator("input", mode="before")
+    @classmethod
+    def parse_input_for_tool(cls, value, info: ValidationInfo):
+        tool_name = info.data.get("tool_name")
+        if tool_name is None:
+            return value
+        return parse_stored_tool_input(tool_name, value)
+
 
 class ToolCallCompleted(EventBase):
     type: Literal["tool.call.completed"] = "tool.call.completed"
@@ -106,6 +114,14 @@ class ToolCallCompleted(EventBase):
     input: ToolInput
     result: RuntimeToolResult
     attachments: list[ContentRef] = Field(default_factory=list)
+
+    @field_validator("input", mode="before")
+    @classmethod
+    def parse_input_for_tool(cls, value, info: ValidationInfo):
+        tool_name = info.data.get("tool_name")
+        if tool_name is None:
+            return value
+        return parse_stored_tool_input(tool_name, value)
 
 
 class AssistantTextProduced(EventBase):
@@ -126,6 +142,42 @@ class ScheduledMessageDue(EventBase):
     reply_target: ReplyTarget | None = None
 
 
+class SubAgentStarted(EventBase):
+    type: Literal["subagent.started"] = "subagent.started"
+    agent_id: str
+    user_id: str
+    parent_conversation_id: str
+    child_conversation_id: str
+    parent_call_id: str
+    name: str
+
+
+class SubAgentCompleted(EventBase):
+    type: Literal["subagent.completed"] = "subagent.completed"
+    agent_id: str
+    user_id: str
+    parent_conversation_id: str
+    child_conversation_id: str
+    result: str
+
+
+class SubAgentFailed(EventBase):
+    type: Literal["subagent.failed"] = "subagent.failed"
+    agent_id: str
+    user_id: str
+    parent_conversation_id: str
+    child_conversation_id: str
+    error: str
+
+
+class SubAgentCancelled(EventBase):
+    type: Literal["subagent.cancelled"] = "subagent.cancelled"
+    agent_id: str
+    user_id: str
+    parent_conversation_id: str
+    child_conversation_id: str
+
+
 AgentEvent = Annotated[
     TelegramTextReceived
     | CliTextReceived
@@ -135,6 +187,10 @@ AgentEvent = Annotated[
     | ToolCallRequested
     | ToolCallCompleted
     | AssistantTextProduced
-    | ScheduledMessageDue,
+    | ScheduledMessageDue
+    | SubAgentStarted
+    | SubAgentCompleted
+    | SubAgentFailed
+    | SubAgentCancelled,
     Field(discriminator="type"),
 ]

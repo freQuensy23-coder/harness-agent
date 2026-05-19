@@ -10,7 +10,7 @@ from uuid import uuid4
 
 import yaml
 from loguru import logger
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from harness_agent.context import AgentFileSet, Skill, UserContextRuntime
 from harness_agent.content import WorkspaceFile
@@ -45,6 +45,11 @@ class RuntimeToolResult(BaseModel):
 
 class DockerProcessResult(RuntimeToolResult):
     pass
+
+
+class RuntimeFileRead(BaseModel):
+    file: WorkspaceFile | None = None
+    result: RuntimeToolResult = Field(default_factory=RuntimeToolResult)
 
 
 class SkillFrontmatter(BaseModel):
@@ -108,8 +113,8 @@ class UserRuntime(UserContextRuntime):
         self,
         user_id: str,
         path: str,
-        max_bytes: int,
-    ) -> WorkspaceFile:
+        max_bytes: int | None,
+    ) -> RuntimeFileRead:
         raise NotImplementedError
 
     async def shell_exec(self, user_id: str, input: ShellExecInput) -> RuntimeToolResult:
@@ -318,23 +323,30 @@ class DockerUserRuntime(UserRuntime):
         self,
         user_id: str,
         path: str,
-        max_bytes: int,
-    ) -> WorkspaceFile:
+        max_bytes: int | None,
+    ) -> RuntimeFileRead:
         path = _workspace_path(path)
         code = (
             "import base64, pathlib, sys;"
-            "data=pathlib.Path(sys.argv[1]).read_bytes()[:int(sys.argv[2])];"
+            "path=pathlib.Path(sys.argv[1]);"
+            "limit=sys.argv[2];"
+            "stream=path.open('rb');"
+            "data=stream.read() if limit == '' else stream.read(int(limit));"
+            "stream.close();"
             "sys.stdout.write(base64.b64encode(data).decode('ascii'))"
         )
+        limit = "" if max_bytes is None else str(max_bytes)
         result = await self._exec(
             user_id,
-            ["python", "-c", code, path, str(max_bytes)],
+            ["python", "-c", code, path, limit],
         )
         if result.exit_code != 0:
-            raise RuntimeError(result.stderr)
-        return WorkspaceFile(
-            path=path,
-            content=base64.b64decode(result.stdout),
+            return RuntimeFileRead(result=result)
+        return RuntimeFileRead(
+            file=WorkspaceFile(
+                path=path,
+                content=base64.b64decode(result.stdout),
+            )
         )
 
     async def file_write(self, user_id: str, input: FileWriteInput) -> RuntimeToolResult:
@@ -553,14 +565,23 @@ class FakeUserRuntime(UserRuntime):
         self,
         user_id: str,
         path: str,
-        max_bytes: int,
-    ) -> WorkspaceFile:
+        max_bytes: int | None,
+    ) -> RuntimeFileRead:
+        if path not in self._files:
+            return RuntimeFileRead(
+                result=RuntimeToolResult(
+                    stderr=f"No such file: {path}\n",
+                    exit_code=1,
+                )
+            )
         content = self._files[path]
         try:
             data = content.encode("latin1")
         except AttributeError:
             data = content
-        return WorkspaceFile(path=path, content=data[:max_bytes])
+        if max_bytes is None:
+            return RuntimeFileRead(file=WorkspaceFile(path=path, content=data))
+        return RuntimeFileRead(file=WorkspaceFile(path=path, content=data[:max_bytes]))
 
     async def shell_exec(self, user_id: str, input: ShellExecInput) -> RuntimeToolResult:
         self.shell_exec_calls.append(input)

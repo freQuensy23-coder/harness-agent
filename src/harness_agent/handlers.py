@@ -1,6 +1,7 @@
 import base64
 
 from harness_agent.bus import EventBus
+from harness_agent.content import content_ref_from_bytes
 from harness_agent.context import ContextBuilder
 from harness_agent.events import (
     AgentTurnRequested,
@@ -22,7 +23,6 @@ from harness_agent.llm import (
     LlmClient,
     ToolResultMessage,
     UserMessage,
-    UserMessageAttachment,
 )
 from harness_agent.mcp import McpManager
 from harness_agent.projections import SQLiteConversationProjection
@@ -89,15 +89,12 @@ class ConversationProjector:
             conversation_id=event.conversation_id,
             text=event.text,
             attachments=[
-                UserMessageAttachment(
+                content_ref_from_bytes(
                     kind=attachment.kind,
                     file_name=attachment.file_name,
                     mime_type=attachment.mime_type,
-                    size_bytes=attachment.size_bytes,
                     workspace_path=attachment.workspace_path,
-                    content_base64=(
-                        attachment.content_base64 if attachment.kind == "image" else None
-                    ),
+                    content=base64.b64decode(attachment.content_base64),
                 )
                 for attachment in event.attachments
             ],
@@ -126,6 +123,7 @@ class ConversationProjector:
             tool_name=event.tool_name,
             input=event.input,
             result=event.result,
+            attachments=event.attachments,
         )
         return ()
 
@@ -257,7 +255,7 @@ class AgentTurnHandler:
                             ),
                         ]
                     )
-                    for attachment in result.attachments:
+                    for attachment in completed.attachments:
                         messages.append(
                             UserMessage(
                                 text=f"Opened image file {attachment.workspace_path}",

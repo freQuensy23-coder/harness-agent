@@ -1,14 +1,26 @@
 import asyncio
 from collections.abc import Awaitable, Callable
-
 from datetime import UTC, datetime
 
+from pydantic import BaseModel, Field
+
+from harness_agent.content import ContentRef, content_ref_from_workspace_file
 from harness_agent.events import EventBase, ToolCallCompleted, ToolCallRequested
 from harness_agent.mcp import McpManager
 from harness_agent.runtime import RuntimeToolResult, UserRuntime
 from harness_agent.scheduler import SQLiteScheduleStore
+from harness_agent.subagents import (
+    SubAgentService,
+    render_sub_agent_record,
+    render_sub_agent_records,
+)
 from harness_agent.tasks import SQLiteTaskStore, tasks_to_json
 from harness_agent.tools import (
+    AgentCancelInput,
+    AgentListInput,
+    AgentResultInput,
+    AgentRunInput,
+    AgentSpawnInput,
     FileEditInput,
     FileGlobInput,
     FileGrepInput,
@@ -40,6 +52,11 @@ from harness_agent.web_fetch import WebFetcher
 EventBatch = tuple[EventBase, ...]
 ToolExecutor = Callable[[str, ToolCallRequested], Awaitable[RuntimeToolResult]]
 ToolCallKey = tuple[str, int, str]
+
+
+class ToolExecutionResult(BaseModel):
+    result: RuntimeToolResult
+    attachments: list[ContentRef] = Field(default_factory=list)
 
 
 class ToolCallResultWaiter:
@@ -74,18 +91,19 @@ class ToolCallExecutor:
         schedule_store: SQLiteScheduleStore | None = None,
         web_fetcher: WebFetcher | None = None,
         mcp_manager: McpManager | None = None,
+        sub_agents: SubAgentService | None = None,
     ) -> None:
         self._runtime = runtime
         self._task_store = task_store
         self._schedule_store = schedule_store
         self._web_fetcher = web_fetcher
         self._mcp_manager = mcp_manager
+        self._sub_agents = sub_agents
         self._tool_executors: dict[str, ToolExecutor] = {
             "shell.exec": self._shell_exec,
             "shell.spawn": self._shell_spawn,
             "shell.read": self._shell_read,
             "shell.kill": self._shell_kill,
-            "file.read": self._file_read,
             "file.write": self._file_write,
             "file.edit": self._file_edit,
             "file.multi_edit": self._file_multi_edit,
@@ -104,10 +122,15 @@ class ToolCallExecutor:
             "schedule.cancel": self._schedule_cancel,
             "skill.list": self._skill_list,
             "skill.read": self._skill_read,
+            "agent.run": self._agent_run,
+            "agent.spawn": self._agent_spawn,
+            "agent.result": self._agent_result,
+            "agent.list": self._agent_list,
+            "agent.cancel": self._agent_cancel,
         }
 
     async def handle_tool_call_requested(self, event: ToolCallRequested) -> EventBatch:
-        result = await self._execute_tool(event)
+        execution = await self._execute_tool(event)
         return (
             ToolCallCompleted(
                 user_id=event.user_id,
@@ -116,16 +139,21 @@ class ToolCallExecutor:
                 call_id=event.call_id,
                 tool_name=event.tool_name,
                 input=event.input,
-                result=result,
+                result=execution.result,
+                attachments=execution.attachments,
             ),
         )
 
-    async def _execute_tool(self, event: ToolCallRequested) -> RuntimeToolResult:
+    async def _execute_tool(self, event: ToolCallRequested) -> ToolExecutionResult:
+        if event.tool_name == "file.read":
+            return await self._file_read_for_model(event.user_id, event)
         if event.tool_name not in self._tool_executors:
             if event.tool_name.startswith("mcp."):
-                return await self._mcp_call(event)
+                return ToolExecutionResult(result=await self._mcp_call(event))
             raise ValueError(f"Unsupported tool call: {event.tool_name}")
-        return await self._tool_executors[event.tool_name](event.user_id, event)
+        return ToolExecutionResult(
+            result=await self._tool_executors[event.tool_name](event.user_id, event)
+        )
 
     async def _mcp_call(self, event: ToolCallRequested) -> RuntimeToolResult:
         if self._mcp_manager is None:
@@ -165,12 +193,45 @@ class ToolCallExecutor:
     ) -> RuntimeToolResult:
         return await self._runtime.shell_kill(user_id, ShellKillInput.model_validate(event.input))
 
-    async def _file_read(
+    async def _file_read_for_model(
         self,
         user_id: str,
         event: ToolCallRequested,
-    ) -> RuntimeToolResult:
-        return await self._runtime.file_read(user_id, FileReadInput.model_validate(event.input))
+    ) -> ToolExecutionResult:
+        input = FileReadInput.model_validate(event.input)
+        read = await self._runtime.read_file_bytes(
+            user_id,
+            input.path,
+            input.max_bytes,
+        )
+        if read.result.exit_code != 0:
+            return ToolExecutionResult(result=read.result)
+        if read.file is None:
+            raise RuntimeError("file read succeeded without file content")
+        workspace_file = read.file
+        content_ref = content_ref_from_workspace_file(workspace_file)
+        if content_ref.kind == "image":
+            full_read = await self._runtime.read_file_bytes(
+                user_id,
+                input.path,
+                None,
+            )
+            if full_read.result.exit_code != 0:
+                return ToolExecutionResult(result=full_read.result)
+            if full_read.file is None:
+                raise RuntimeError("image file read succeeded without file content")
+            full_content_ref = content_ref_from_workspace_file(full_read.file)
+            return ToolExecutionResult(
+                result=RuntimeToolResult(
+                    stdout=f"Opened image file {full_content_ref.workspace_path}\n"
+                ),
+                attachments=[full_content_ref],
+            )
+        return ToolExecutionResult(
+            result=RuntimeToolResult(
+                stdout=workspace_file.content.decode("utf-8", errors="replace")
+            )
+        )
 
     async def _file_write(
         self,
@@ -392,6 +453,82 @@ class ToolCallExecutor:
         )
         return self._text_result(schedule.model_dump_json(indent=2))
 
+    async def _agent_run(
+        self,
+        user_id: str,
+        event: ToolCallRequested,
+    ) -> RuntimeToolResult:
+        input = AgentRunInput.model_validate(event.input)
+        record = await self._require_sub_agents().run(
+            user_id=user_id,
+            parent_conversation_id=event.conversation_id,
+            parent_call_id=event.call_id,
+            input=input,
+        )
+        exit_code = 0 if record.status == "completed" else 1
+        return RuntimeToolResult(
+            stdout=render_sub_agent_record(record),
+            stderr="" if record.error is None else record.error,
+            exit_code=exit_code,
+        )
+
+    async def _agent_spawn(
+        self,
+        user_id: str,
+        event: ToolCallRequested,
+    ) -> RuntimeToolResult:
+        input = AgentSpawnInput.model_validate(event.input)
+        record = await self._require_sub_agents().spawn(
+            user_id=user_id,
+            parent_conversation_id=event.conversation_id,
+            parent_call_id=event.call_id,
+            input=input,
+        )
+        return self._text_result(render_sub_agent_record(record))
+
+    async def _agent_result(
+        self,
+        user_id: str,
+        event: ToolCallRequested,
+    ) -> RuntimeToolResult:
+        input = AgentResultInput.model_validate(event.input)
+        record = await self._require_sub_agents().result(
+            agent_id=input.agent_id,
+            user_id=user_id,
+            parent_conversation_id=event.conversation_id,
+        )
+        if record is None:
+            return RuntimeToolResult(stderr=f"Unknown sub-agent: {input.agent_id}\n", exit_code=1)
+        return self._text_result(render_sub_agent_record(record))
+
+    async def _agent_list(
+        self,
+        user_id: str,
+        event: ToolCallRequested,
+    ) -> RuntimeToolResult:
+        input = AgentListInput.model_validate(event.input)
+        records = await self._require_sub_agents().list_for_parent(
+            user_id=user_id,
+            parent_conversation_id=event.conversation_id,
+            include_completed=input.include_completed,
+        )
+        return self._text_result(render_sub_agent_records(records))
+
+    async def _agent_cancel(
+        self,
+        user_id: str,
+        event: ToolCallRequested,
+    ) -> RuntimeToolResult:
+        input = AgentCancelInput.model_validate(event.input)
+        record = await self._require_sub_agents().cancel(
+            agent_id=input.agent_id,
+            user_id=user_id,
+            parent_conversation_id=event.conversation_id,
+        )
+        if record is None:
+            return RuntimeToolResult(stderr=f"Unknown sub-agent: {input.agent_id}\n", exit_code=1)
+        return self._text_result(render_sub_agent_record(record))
+
     def _require_task_store(self) -> SQLiteTaskStore:
         if self._task_store is None:
             raise RuntimeError("task store is not configured")
@@ -401,6 +538,11 @@ class ToolCallExecutor:
         if self._schedule_store is None:
             raise RuntimeError("schedule store is not configured")
         return self._schedule_store
+
+    def _require_sub_agents(self) -> SubAgentService:
+        if self._sub_agents is None:
+            raise RuntimeError("sub-agent service is not configured")
+        return self._sub_agents
 
     def _text_result(self, text: str) -> RuntimeToolResult:
         return RuntimeToolResult(stdout=text)

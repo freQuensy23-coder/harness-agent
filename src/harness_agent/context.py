@@ -49,6 +49,7 @@ class ContextBuilder:
                 "- schedule.cron schedules recurring synthetic user messages.",
                 "- schedule.list and schedule.cancel manage scheduled messages.",
                 "- skill.* reads enabled markdown skills.",
+                "- agent.* runs sub-agents that can use workspace file and shell tools.",
             ]
         )
         blocks = [

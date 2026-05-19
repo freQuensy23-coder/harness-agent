@@ -1,3 +1,4 @@
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -16,9 +17,15 @@ from harness_agent.projections import SQLiteConversationProjection
 from harness_agent.runtime import FakeUserRuntime, RuntimeToolResult
 from harness_agent.scheduler import SQLiteScheduleStore
 from harness_agent.store import SQLiteEventStore
+from harness_agent.subagents import SubAgentRecord
 from harness_agent.tasks import SQLiteTaskStore
 from harness_agent.tool_executor import ToolCallExecutor, ToolCallResultWaiter
 from harness_agent.tools import (
+    AgentCancelInput,
+    AgentListInput,
+    AgentResultInput,
+    AgentRunInput,
+    AgentSpawnInput,
     FileEditInput,
     FileEditOperation,
     FileGlobInput,
@@ -112,6 +119,11 @@ async def test_every_exposed_tool_completes_through_agent_turn_handler(tmp_path:
         LlmToolCall(call_id="schedule-cancel", name="schedule.cancel", input=ScheduleCancelInput(schedule_id=existing_schedule.id)),
         LlmToolCall(call_id="skill-list", name="skill.list", input=SkillListInput()),
         LlmToolCall(call_id="skill-read", name="skill.read", input=SkillReadInput(name="demo")),
+        LlmToolCall(call_id="agent-run", name="agent.run", input=AgentRunInput(prompt="write file")),
+        LlmToolCall(call_id="agent-spawn", name="agent.spawn", input=AgentSpawnInput(prompt="background write")),
+        LlmToolCall(call_id="agent-result", name="agent.result", input=AgentResultInput(agent_id="agent-1")),
+        LlmToolCall(call_id="agent-list", name="agent.list", input=AgentListInput(include_completed=True)),
+        LlmToolCall(call_id="agent-cancel", name="agent.cancel", input=AgentCancelInput(agent_id="agent-1")),
         LlmToolCall(call_id="mcp-echo", name="mcp.local.echo", input=McpToolInput(arguments={"text": "mcp-ok"})),
         AssistantText(text="done"),
     ]
@@ -148,6 +160,7 @@ async def test_every_exposed_tool_completes_through_agent_turn_handler(tmp_path:
         schedule_store=schedule_store,
         web_fetcher=FakeWebFetcher(),
         mcp_manager=mcp_manager,
+        sub_agents=FakeSubAgentService(),
     )
     projector = ConversationProjector(projection)
     bus.subscribe(UserTextReceived, projector.handle_user_text)
@@ -194,6 +207,11 @@ async def test_every_exposed_tool_completes_through_agent_turn_handler(tmp_path:
         "schedule.cancel",
         "skill.list",
         "skill.read",
+        "agent.run",
+        "agent.spawn",
+        "agent.result",
+        "agent.list",
+        "agent.cancel",
         "mcp.local.echo",
     ]
 
@@ -215,3 +233,108 @@ class FakeMcpManager:
         arguments: dict,
     ) -> RuntimeToolResult:
         return RuntimeToolResult(stdout=arguments["text"])
+
+
+class FakeSubAgentService:
+    async def run(
+        self,
+        *,
+        user_id: str,
+        parent_conversation_id: str,
+        parent_call_id: str,
+        input: AgentRunInput,
+    ) -> SubAgentRecord:
+        return fake_sub_agent_record(
+            parent_conversation_id=parent_conversation_id,
+            parent_call_id=parent_call_id,
+            prompt=input.prompt,
+            status="completed",
+            result="done",
+        )
+
+    async def spawn(
+        self,
+        *,
+        user_id: str,
+        parent_conversation_id: str,
+        parent_call_id: str,
+        input: AgentSpawnInput,
+    ) -> SubAgentRecord:
+        return fake_sub_agent_record(
+            parent_conversation_id=parent_conversation_id,
+            parent_call_id=parent_call_id,
+            prompt=input.prompt,
+            status="running",
+            result=None,
+        )
+
+    async def result(
+        self,
+        *,
+        agent_id: str,
+        user_id: str,
+        parent_conversation_id: str,
+    ) -> SubAgentRecord:
+        return fake_sub_agent_record(
+            parent_conversation_id=parent_conversation_id,
+            parent_call_id="agent-run",
+            prompt="write file",
+            status="completed",
+            result="done",
+        )
+
+    async def list_for_parent(
+        self,
+        *,
+        user_id: str,
+        parent_conversation_id: str,
+        include_completed: bool,
+    ) -> list[SubAgentRecord]:
+        return [
+            fake_sub_agent_record(
+                parent_conversation_id=parent_conversation_id,
+                parent_call_id="agent-run",
+                prompt="write file",
+                status="completed",
+                result="done",
+            )
+        ]
+
+    async def cancel(
+        self,
+        *,
+        agent_id: str,
+        user_id: str,
+        parent_conversation_id: str,
+    ) -> SubAgentRecord:
+        return fake_sub_agent_record(
+            parent_conversation_id=parent_conversation_id,
+            parent_call_id="agent-run",
+            prompt="write file",
+            status="cancelled",
+            result=None,
+        )
+
+
+def fake_sub_agent_record(
+    *,
+    parent_conversation_id: str,
+    parent_call_id: str,
+    prompt: str,
+    status: str,
+    result: str | None,
+) -> SubAgentRecord:
+    now = datetime.now(UTC)
+    return SubAgentRecord(
+        id="agent-1",
+        user_id="u:1",
+        parent_conversation_id=parent_conversation_id,
+        child_conversation_id=f"{parent_conversation_id}:subagent:agent-1",
+        parent_call_id=parent_call_id,
+        name="subagent",
+        prompt=prompt,
+        status=status,
+        result=result,
+        created_at=now,
+        updated_at=now,
+    )

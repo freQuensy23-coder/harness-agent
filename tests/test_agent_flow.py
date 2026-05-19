@@ -137,6 +137,7 @@ async def test_telegram_say_hi_builds_context_from_runtime_and_replies(tmp_path:
                     "- schedule.cron schedules recurring synthetic user messages.",
                     "- schedule.list and schedule.cancel manage scheduled messages.",
                     "- skill.* reads enabled markdown skills.",
+                    "- agent.* runs sub-agents that can use workspace file and shell tools.",
                 ]
             ),
             "Runtime: tools run in the user's workspace. Container details are not part of the model context.",
@@ -169,6 +170,11 @@ async def test_telegram_say_hi_builds_context_from_runtime_and_replies(tmp_path:
         "schedule.cancel",
         "skill.list",
         "skill.read",
+        "agent.run",
+        "agent.spawn",
+        "agent.result",
+        "agent.list",
+        "agent.cancel",
     ]
     assert not any("docker" in tool.name for tool in request.tools)
     assert runtime.read_agent_files_calls == ["u:123"]

@@ -6,32 +6,9 @@ from pydantic import BaseModel, Field
 
 from harness_agent.content import ContentRef
 from harness_agent.tools import (
-    FileEditInput,
-    FileGlobInput,
-    FileGrepInput,
-    FileListInput,
-    FileMultiEditInput,
-    FileReadInput,
-    FileWriteInput,
-    ShellExecInput,
-    ShellKillInput,
-    ShellReadInput,
-    ShellSpawnInput,
-    ScheduleCancelInput,
-    ScheduleCronInput,
-    ScheduleListInput,
-    ScheduleOnceInput,
-    SkillListInput,
-    SkillReadInput,
-    TaskCreateInput,
-    TaskGetInput,
-    TaskListInput,
-    TaskStopInput,
-    TaskUpdateInput,
     ToolInput,
     ToolSpec,
-    WebFetchInput,
-    McpToolInput,
+    parse_llm_tool_input,
 )
 
 
@@ -224,36 +201,7 @@ def render_user_text(message: UserMessage) -> str:
 
 def parse_tool_input(name: str, arguments: dict) -> ToolInput:
     name = canonical_tool_name(name)
-    if name.startswith("mcp."):
-        return McpToolInput(arguments=arguments)
-    models = {
-        "shell.exec": ShellExecInput,
-        "shell.spawn": ShellSpawnInput,
-        "shell.read": ShellReadInput,
-        "shell.kill": ShellKillInput,
-        "file.read": FileReadInput,
-        "file.write": FileWriteInput,
-        "file.edit": FileEditInput,
-        "file.multi_edit": FileMultiEditInput,
-        "file.glob": FileGlobInput,
-        "file.grep": FileGrepInput,
-        "file.list": FileListInput,
-        "web.fetch": WebFetchInput,
-        "task.create": TaskCreateInput,
-        "task.get": TaskGetInput,
-        "task.list": TaskListInput,
-        "task.update": TaskUpdateInput,
-        "task.stop": TaskStopInput,
-        "schedule.once": ScheduleOnceInput,
-        "schedule.cron": ScheduleCronInput,
-        "schedule.list": ScheduleListInput,
-        "schedule.cancel": ScheduleCancelInput,
-        "skill.list": SkillListInput,
-        "skill.read": SkillReadInput,
-    }
-    if name not in models:
-        raise ValueError(f"unknown tool: {name}")
-    return models[name].model_validate(arguments)
+    return parse_llm_tool_input(name, arguments)
 
 
 def api_tool_name(name: str) -> str:

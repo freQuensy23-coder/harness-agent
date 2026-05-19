@@ -22,7 +22,7 @@ class LlmConfig(BaseModel):
 
     base_url: str = "https://openrouter.ai/api/v1"
     api_key: str = "replace-me"
-    model: str = "z-ai/glm-5.1"
+    model: str = "z-ai/glm-5v-turbo"
 
 
 class TelegramConfig(BaseModel):

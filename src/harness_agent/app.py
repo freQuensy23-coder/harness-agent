@@ -38,6 +38,7 @@ from harness_agent.scheduler import (
     SQLiteScheduleStore,
 )
 from harness_agent.store import SQLiteEventStore
+from harness_agent.subagents import SQLiteSubAgentStore, SubAgentResultWaiter, SubAgentService
 from harness_agent.tasks import SQLiteTaskStore
 from harness_agent.tool_executor import ToolCallExecutor, ToolCallResultWaiter
 from harness_agent.turns import ConversationTurnCoordinator
@@ -53,16 +54,19 @@ class HarnessApp:
         llm_path = _derived_db_path(db_path, "llm")
         messages_path = _derived_db_path(db_path, "messages")
         schedules_path = _derived_db_path(db_path, "schedules")
+        sub_agents_path = _derived_db_path(db_path, "subagents")
         tasks_path = _derived_db_path(db_path, "tasks")
 
         self.event_store = SQLiteEventStore(events_path)
         self.llm_audit_store = SQLiteLlmAuditStore(llm_path)
         self.projection = SQLiteConversationProjection(messages_path)
         self.schedule_store = SQLiteScheduleStore(schedules_path)
+        self.sub_agent_store = SQLiteSubAgentStore(sub_agents_path)
         self.task_store = SQLiteTaskStore(tasks_path)
         self.bus = EventBus(self.event_store)
         self.turn_coordinator = ConversationTurnCoordinator()
         self.tool_results = ToolCallResultWaiter()
+        self.sub_agent_results = SubAgentResultWaiter()
         self.runtime = DockerUserRuntime(
             image=config.runtime.docker.image,
             container_prefix=config.runtime.docker.container_prefix,
@@ -81,6 +85,11 @@ class HarnessApp:
                 model=config.llm.model,
             ),
             store=self.llm_audit_store,
+        )
+        self.sub_agents = SubAgentService(
+            bus=self.bus,
+            store=self.sub_agent_store,
+            result_waiter=self.sub_agent_results,
         )
         self.telegram: AiogramTelegramAdapter | None = None
         self.scheduler_service: SchedulerService | None = None
@@ -152,6 +161,7 @@ class HarnessApp:
             schedule_store=self.schedule_store,
             web_fetcher=HttpxWebFetcher(),
             mcp_manager=self.mcp_manager,
+            sub_agents=self.sub_agents,
         )
         scheduler_due_handler = SchedulerDueHandler()
         self.bus.subscribe(TelegramTextReceived, identity_handler.handle_telegram_text)
@@ -160,6 +170,7 @@ class HarnessApp:
         self.bus.subscribe(UserTextReceived, content_ingestion_handler.handle_user_text)
         self.bus.subscribe(UserTextReceived, conversation_projector.handle_user_text)
         self.bus.subscribe(AssistantTextProduced, conversation_projector.handle_assistant_text)
+        self.bus.subscribe(AssistantTextProduced, self.sub_agent_results.handle_assistant_text)
         self.bus.subscribe(ToolCallRequested, tool_call_executor.handle_tool_call_requested)
         self.bus.subscribe(ToolCallCompleted, self.tool_results.handle_tool_call_completed)
         self.bus.subscribe(ToolCallCompleted, conversation_projector.handle_tool_call_completed)

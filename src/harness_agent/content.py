@@ -7,8 +7,11 @@ from typing import Literal
 from pydantic import BaseModel
 
 
+ContentKind = Literal["image", "file"]
+
+
 class ContentRef(BaseModel):
-    kind: Literal["image", "file"]
+    kind: ContentKind
     file_name: str
     mime_type: str
     size_bytes: int
@@ -22,18 +25,41 @@ class WorkspaceFile(BaseModel):
     content: bytes
 
 
+def content_ref_from_bytes(
+    *,
+    kind: ContentKind,
+    file_name: str,
+    mime_type: str | None,
+    workspace_path: str,
+    content: bytes,
+) -> ContentRef:
+    resolved_mime_type = mime_type or detect_mime_type(workspace_path, content)
+    if kind == "image" or is_image_mime_type(resolved_mime_type):
+        resolved_kind: ContentKind = "image"
+    else:
+        resolved_kind = "file"
+    return ContentRef(
+        kind=resolved_kind,
+        file_name=file_name,
+        mime_type=resolved_mime_type,
+        size_bytes=len(content),
+        sha256=hashlib.sha256(content).hexdigest(),
+        workspace_path=workspace_path,
+        content_base64=base64.b64encode(content).decode("ascii")
+        if resolved_kind == "image"
+        else None,
+    )
+
+
 def content_ref_from_workspace_file(file: WorkspaceFile) -> ContentRef:
     mime_type = detect_mime_type(file.path, file.content)
-    return ContentRef(
-        kind="image" if is_image_mime_type(mime_type) else "file",
+    kind: ContentKind = "image" if is_image_mime_type(mime_type) else "file"
+    return content_ref_from_bytes(
+        kind=kind,
         file_name=PurePosixPath(file.path).name,
         mime_type=mime_type,
-        size_bytes=len(file.content),
-        sha256=hashlib.sha256(file.content).hexdigest(),
         workspace_path=file.path,
-        content_base64=base64.b64encode(file.content).decode("ascii")
-        if is_image_mime_type(mime_type)
-        else None,
+        content=file.content,
     )
 
 

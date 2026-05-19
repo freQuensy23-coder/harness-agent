@@ -1,4 +1,5 @@
 import base64
+import hashlib
 import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -6,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from harness_agent.bus import EventBus
+from harness_agent.content import ContentRef
 from harness_agent.context import AgentFileSet, ContextBuilder
 from harness_agent.events import (
     AgentTurnRequested,
@@ -17,16 +19,38 @@ from harness_agent.events import (
     ToolCallRequested,
     UserTextReceived,
 )
-from harness_agent.handlers import AgentTurnHandler, ContentIngestionHandler, ConversationProjector, IdentityHandler
+from harness_agent.handlers import (
+    AgentTurnHandler,
+    ContentIngestionHandler,
+    ConversationProjector,
+    IdentityHandler,
+)
 from harness_agent.identity import StaticIdentityResolver
-from harness_agent.llm import AssistantText, FakeLlmClient, LlmToolCall, UserMessage, UserMessageAttachment, message_to_openai
+from harness_agent.llm import (
+    AssistantText,
+    FakeLlmClient,
+    LlmToolCall,
+    ToolResultMessage,
+    UserMessage,
+    message_to_openai,
+)
 from harness_agent.projections import SQLiteConversationProjection
 from harness_agent.runtime import FakeUserRuntime
 from harness_agent.scheduler import SchedulerDueHandler, SchedulerPump, SQLiteScheduleStore
 from harness_agent.store import SQLiteEventStore
 from harness_agent.tasks import SQLiteTaskStore
 from harness_agent.tool_executor import ToolCallExecutor, ToolCallResultWaiter
-from harness_agent.tools import FileReadInput, ScheduleCronInput, ScheduleOnceInput, default_tool_registry
+from harness_agent.tools import (
+    FileReadInput,
+    ScheduleCronInput,
+    ScheduleOnceInput,
+    default_tool_registry,
+)
+
+
+def test_runtime_layer_has_no_llm_context_import() -> None:
+    runtime_source = Path("src/harness_agent/runtime.py").read_text(encoding="utf-8")
+    assert "harness_agent.llm" not in runtime_source
 
 
 @pytest.mark.asyncio
@@ -76,11 +100,12 @@ async def test_telegram_image_is_saved_and_passed_to_llm_context(tmp_path: Path)
         )
     )
 
-    expected_attachment = UserMessageAttachment(
+    expected_attachment = ContentRef(
         kind="image",
         file_name="photo.jpg",
         mime_type="image/jpeg",
         size_bytes=len(image_bytes),
+        sha256=hashlib.sha256(image_bytes).hexdigest(),
         workspace_path="/workspace/content/777/photo.jpg",
         content_base64=image_base64,
     )
@@ -162,7 +187,7 @@ async def test_telegram_file_is_saved_and_referenced_without_file_bytes_in_llm(t
 async def test_file_read_on_image_injects_image_into_next_llm_context(tmp_path: Path) -> None:
     store = SQLiteEventStore(tmp_path / "events.sqlite3")
     projection = SQLiteConversationProjection(tmp_path / "messages.sqlite3")
-    image_bytes = b"\x89PNG\r\n\x1a\nimage-bytes"
+    image_bytes = b"\x89PNG\r\n\x1a\n" + (b"image-bytes" * 3_000)
     image_base64 = base64.b64encode(image_bytes).decode("ascii")
     runtime = FakeUserRuntime(
         agent_files=AgentFileSet(soul="S", agents="A", user="U", tools="T"),
@@ -206,11 +231,12 @@ async def test_file_read_on_image_injects_image_into_next_llm_context(tmp_path: 
         )
     )
 
-    expected_attachment = UserMessageAttachment(
+    expected_attachment = ContentRef(
         kind="image",
         file_name="picture.png",
         mime_type="image/png",
         size_bytes=len(image_bytes),
+        sha256=hashlib.sha256(image_bytes).hexdigest(),
         workspace_path="/workspace/content/picture.png",
         content_base64=image_base64,
     )
@@ -218,6 +244,10 @@ async def test_file_read_on_image_injects_image_into_next_llm_context(tmp_path: 
         text="Opened image file /workspace/content/picture.png",
         attachments=[expected_attachment],
     )
+    completed_events = [
+        event for event in await store.list_events() if event.type == "tool.call.completed"
+    ]
+    assert completed_events[0].attachments == [expected_attachment]
     assert await projection.list_llm_messages("cli:image-open") == [
         UserMessage(text="open /workspace/content/picture.png"),
         llm.requests[1].messages[-3],
@@ -226,13 +256,74 @@ async def test_file_read_on_image_injects_image_into_next_llm_context(tmp_path: 
             text="Opened image file /workspace/content/picture.png",
             attachments=[expected_attachment],
         ),
-        UserMessage(text="Opened image file /workspace/content/picture.png", attachments=[expected_attachment]),
-    ][:4]
+    ]
     openai_message = message_to_openai(llm.requests[1].messages[-1])
     assert openai_message["content"][1] == {
         "type": "image_url",
         "image_url": {"url": f"data:image/png;base64,{image_base64}"},
     }
+
+
+@pytest.mark.asyncio
+async def test_file_read_missing_file_returns_tool_result(tmp_path: Path) -> None:
+    store = SQLiteEventStore(tmp_path / "events.sqlite3")
+    projection = SQLiteConversationProjection(tmp_path / "messages.sqlite3")
+    runtime = FakeUserRuntime(
+        agent_files=AgentFileSet(soul="S", agents="A", user="U", tools="T"),
+    )
+    llm = FakeLlmClient(
+        [
+            LlmToolCall(
+                call_id="missing",
+                name="file.read",
+                input=FileReadInput(path="/workspace/missing.png"),
+            ),
+            AssistantText(text="reported"),
+        ]
+    )
+    bus = EventBus(store)
+    tool_results = ToolCallResultWaiter()
+    tool_executor = ToolCallExecutor(runtime=runtime)
+    conversation_projector = ConversationProjector(projection)
+    agent_turn_handler = AgentTurnHandler(
+        bus=bus,
+        context_builder=ContextBuilder(runtime=runtime),
+        llm=llm,
+        tool_registry=default_tool_registry(),
+        projection=projection,
+        tool_results=tool_results,
+    )
+    bus.subscribe(UserTextReceived, conversation_projector.handle_user_text)
+    bus.subscribe(ToolCallRequested, tool_executor.handle_tool_call_requested)
+    bus.subscribe(ToolCallCompleted, tool_results.handle_tool_call_completed)
+    bus.subscribe(ToolCallCompleted, conversation_projector.handle_tool_call_completed)
+    bus.subscribe(UserTextReceived, agent_turn_handler.handle_user_text)
+    bus.subscribe(AgentTurnRequested, agent_turn_handler.handle_agent_turn)
+
+    await bus.publish(
+        UserTextReceived(
+            user_id="u:1",
+            conversation_id="cli:missing-file",
+            source="cli",
+            text="open missing image",
+        )
+    )
+
+    completed_events = [
+        event for event in await store.list_events() if event.type == "tool.call.completed"
+    ]
+    assert completed_events[0].result.exit_code == 1
+    assert completed_events[0].result.stderr == "No such file: /workspace/missing.png\n"
+    assert completed_events[0].attachments == []
+    assert llm.requests[1].messages[-1] == ToolResultMessage(
+        call_id="missing",
+        name="file.read",
+        content=(
+            "file.read stdout:\n"
+            "stderr:\nNo such file: /workspace/missing.png\n\n"
+            "exit_code: 1"
+        ),
+    )
 
 
 @pytest.mark.asyncio

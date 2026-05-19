@@ -5,13 +5,13 @@ from typing import Literal
 import aiosqlite
 from pydantic import TypeAdapter
 
+from harness_agent.content import ContentRef
 from harness_agent.llm import (
     AssistantMessage,
     AssistantToolCallMessage,
     LlmMessage,
     ToolResultMessage,
     UserMessage,
-    UserMessageAttachment,
 )
 from harness_agent.runtime import RuntimeToolResult
 from harness_agent.tools import ToolInput
@@ -57,7 +57,7 @@ class SQLiteConversationProjection:
         user_id: str,
         conversation_id: str,
         text: str,
-        attachments: list[UserMessageAttachment] | None = None,
+        attachments: list[ContentRef] | None = None,
     ) -> None:
         message = UserMessage(text=text, attachments=[] if attachments is None else attachments)
         await self._append_item(
@@ -103,9 +103,11 @@ class SQLiteConversationProjection:
         tool_name: str,
         input: ToolInput,
         result: RuntimeToolResult,
+        attachments: list[ContentRef] | None = None,
     ) -> None:
         await self._ensure_schema()
         result_text = result.render_for_llm(tool_name)
+        tool_attachments = [] if attachments is None else attachments
         tool_call_message = AssistantToolCallMessage(
             call_id=call_id,
             name=tool_name,
@@ -171,7 +173,7 @@ class SQLiteConversationProjection:
                     tool_result_message.model_dump_json(),
                 ),
             )
-            for attachment in result.attachments:
+            for attachment in tool_attachments:
                 image_context_message = UserMessage(
                     text=f"Opened image file {attachment.workspace_path}",
                     attachments=[attachment],

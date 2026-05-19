@@ -128,6 +128,65 @@ class McpToolInput(BaseModel):
     arguments: dict[str, Any]
 
 
+class AgentRunInput(BaseModel):
+    prompt: str
+    name: str = "subagent"
+    timeout_seconds: float = 300.0
+
+
+class AgentSpawnInput(BaseModel):
+    prompt: str
+    name: str = "subagent"
+    timeout_seconds: float = 300.0
+
+
+class AgentResultInput(BaseModel):
+    agent_id: str
+
+
+class AgentCancelInput(BaseModel):
+    agent_id: str
+
+
+class AgentListInput(BaseModel):
+    include_completed: bool = True
+
+
+ToolInputModel = type[BaseModel]
+
+
+TOOL_INPUT_MODELS: dict[str, ToolInputModel] = {
+    "shell.exec": ShellExecInput,
+    "shell.spawn": ShellSpawnInput,
+    "shell.read": ShellReadInput,
+    "shell.kill": ShellKillInput,
+    "file.read": FileReadInput,
+    "file.write": FileWriteInput,
+    "file.edit": FileEditInput,
+    "file.multi_edit": FileMultiEditInput,
+    "file.glob": FileGlobInput,
+    "file.grep": FileGrepInput,
+    "file.list": FileListInput,
+    "web.fetch": WebFetchInput,
+    "task.create": TaskCreateInput,
+    "task.get": TaskGetInput,
+    "task.list": TaskListInput,
+    "task.update": TaskUpdateInput,
+    "task.stop": TaskStopInput,
+    "schedule.once": ScheduleOnceInput,
+    "schedule.cron": ScheduleCronInput,
+    "schedule.list": ScheduleListInput,
+    "schedule.cancel": ScheduleCancelInput,
+    "skill.list": SkillListInput,
+    "skill.read": SkillReadInput,
+    "agent.run": AgentRunInput,
+    "agent.spawn": AgentSpawnInput,
+    "agent.result": AgentResultInput,
+    "agent.list": AgentListInput,
+    "agent.cancel": AgentCancelInput,
+}
+
+
 class ToolSpec(BaseModel):
     name: str
     description: str
@@ -185,6 +244,11 @@ ToolName = Literal[
     "schedule.cancel",
     "skill.list",
     "skill.read",
+    "agent.run",
+    "agent.spawn",
+    "agent.result",
+    "agent.list",
+    "agent.cancel",
 ]
 ToolInput = (
     ShellExecInput
@@ -210,8 +274,32 @@ ToolInput = (
     | ScheduleCancelInput
     | SkillListInput
     | SkillReadInput
+    | AgentRunInput
+    | AgentSpawnInput
+    | AgentResultInput
+    | AgentListInput
+    | AgentCancelInput
     | McpToolInput
 )
+
+
+def parse_llm_tool_input(name: str, arguments: Any) -> ToolInput:
+    if name.startswith("mcp."):
+        return McpToolInput(arguments=arguments)
+    return parse_known_tool_input(name, arguments)
+
+
+def parse_stored_tool_input(name: str, payload: Any) -> ToolInput:
+    if name.startswith("mcp."):
+        return McpToolInput.model_validate(payload)
+    return parse_known_tool_input(name, payload)
+
+
+def parse_known_tool_input(name: str, payload: Any) -> ToolInput:
+    input_model = TOOL_INPUT_MODELS.get(name)
+    if input_model is None:
+        raise ValueError(f"unknown tool: {name}")
+    return input_model.model_validate(payload)
 
 
 def default_tool_registry() -> ToolRegistry:
@@ -337,6 +425,37 @@ def default_tool_registry() -> ToolRegistry:
                 name="skill.read",
                 description="Read the body of an enabled markdown skill.",
                 input_model=SkillReadInput,
+            ),
+            ToolSpec(
+                name="agent.run",
+                description=(
+                    "Run a sub-agent to completion. The sub-agent can use workspace "
+                    "file, shell, web, task, schedule, skill, MCP, and agent tools."
+                ),
+                input_model=AgentRunInput,
+            ),
+            ToolSpec(
+                name="agent.spawn",
+                description=(
+                    "Start a background sub-agent. The sub-agent can use workspace "
+                    "file, shell, web, task, schedule, skill, MCP, and agent tools."
+                ),
+                input_model=AgentSpawnInput,
+            ),
+            ToolSpec(
+                name="agent.result",
+                description="Read one sub-agent status and result by id.",
+                input_model=AgentResultInput,
+            ),
+            ToolSpec(
+                name="agent.list",
+                description="List sub-agents created by the current conversation.",
+                input_model=AgentListInput,
+            ),
+            ToolSpec(
+                name="agent.cancel",
+                description="Cancel a running background sub-agent.",
+                input_model=AgentCancelInput,
             ),
         ]
     )
