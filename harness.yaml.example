@@ -1,0 +1,26 @@
+server:
+  host: 127.0.0.1
+  port: 8080
+
+database:
+  path: ./data/harness.sqlite3
+
+llm:
+  base_url: https://openrouter.ai/api/v1
+  api_key: replace-me
+  model: z-ai/glm-5.1
+
+telegram:
+  enabled: false
+  bot_token: null
+
+runtime:
+  docker:
+    image: python:3.14-slim
+    container_prefix: harness
+    network: null
+    memory: 1g
+    cpus: "1"
+
+scheduler:
+  poll_seconds: 5
