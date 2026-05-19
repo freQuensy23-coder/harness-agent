@@ -1,13 +1,16 @@
 import asyncio
 import base64
+import json
 import posixpath
 import re
 import shlex
 from collections.abc import Sequence
+from pathlib import Path
 from pathlib import PurePosixPath
 from typing import Protocol
 from uuid import uuid4
 
+import aiosqlite
 import yaml
 from loguru import logger
 from pydantic import BaseModel, Field
@@ -66,6 +69,163 @@ class DockerRunner(Protocol):
         timeout_seconds: int | None = None,
     ) -> DockerProcessResult:
         pass
+
+
+class SpawnedProcessRecord(BaseModel):
+    """Persisted `shell.spawn` metadata.
+
+    Stdout/stderr offsets are byte positions in container output files. `shell.read`
+    starts at those offsets, returns new bytes, then stores the next offsets so a
+    core restart does not replay already-delivered output.
+    """
+
+    process_id: str
+    user_id: str
+    container_name: str
+    command: str
+    cwd: str
+    base_path: str
+    stdout_path: str
+    stderr_path: str
+    pid_path: str
+    exit_code_path: str
+    stdout_offset: int = 0
+    stderr_offset: int = 0
+
+
+class SpawnedProcessStore(Protocol):
+    async def create(self, record: SpawnedProcessRecord) -> SpawnedProcessRecord:
+        pass
+
+    async def get(self, *, process_id: str, user_id: str) -> SpawnedProcessRecord | None:
+        pass
+
+    async def update_offsets(
+        self,
+        *,
+        process_id: str,
+        user_id: str,
+        stdout_offset: int,
+        stderr_offset: int,
+    ) -> None:
+        pass
+
+    async def delete(self, *, process_id: str, user_id: str) -> None:
+        pass
+
+
+class SQLiteSpawnedProcessStore:
+    def __init__(self, path: Path) -> None:
+        self._path = path
+
+    async def create(self, record: SpawnedProcessRecord) -> SpawnedProcessRecord:
+        await self._ensure_schema()
+        async with aiosqlite.connect(self._path) as db:
+            await db.execute(
+                """
+                insert into spawned_processes (
+                    process_id,
+                    user_id,
+                    container_name,
+                    command,
+                    cwd,
+                    base_path,
+                    stdout_path,
+                    stderr_path,
+                    pid_path,
+                    exit_code_path,
+                    stdout_offset,
+                    stderr_offset
+                )
+                values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                _spawned_process_row(record),
+            )
+            await db.commit()
+        return record
+
+    async def get(self, *, process_id: str, user_id: str) -> SpawnedProcessRecord | None:
+        await self._ensure_schema()
+        async with aiosqlite.connect(self._path) as db:
+            rows = await db.execute_fetchall(
+                """
+                select
+                    process_id,
+                    user_id,
+                    container_name,
+                    command,
+                    cwd,
+                    base_path,
+                    stdout_path,
+                    stderr_path,
+                    pid_path,
+                    exit_code_path,
+                    stdout_offset,
+                    stderr_offset
+                from spawned_processes
+                where process_id = ? and user_id = ?
+                """,
+                (process_id, user_id),
+            )
+        if not rows:
+            return None
+        return _spawned_process_from_row(rows[0])
+
+    async def update_offsets(
+        self,
+        *,
+        process_id: str,
+        user_id: str,
+        stdout_offset: int,
+        stderr_offset: int,
+    ) -> None:
+        await self._ensure_schema()
+        async with aiosqlite.connect(self._path) as db:
+            await db.execute(
+                """
+                update spawned_processes
+                set stdout_offset = ?, stderr_offset = ?
+                where process_id = ? and user_id = ?
+                """,
+                (stdout_offset, stderr_offset, process_id, user_id),
+            )
+            await db.commit()
+
+    async def delete(self, *, process_id: str, user_id: str) -> None:
+        await self._ensure_schema()
+        async with aiosqlite.connect(self._path) as db:
+            await db.execute(
+                """
+                delete from spawned_processes
+                where process_id = ? and user_id = ?
+                """,
+                (process_id, user_id),
+            )
+            await db.commit()
+
+    async def _ensure_schema(self) -> None:
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        async with aiosqlite.connect(self._path) as db:
+            await db.execute(
+                """
+                create table if not exists spawned_processes (
+                    process_id text not null,
+                    user_id text not null,
+                    container_name text not null,
+                    command text not null,
+                    cwd text not null,
+                    base_path text not null,
+                    stdout_path text not null,
+                    stderr_path text not null,
+                    pid_path text not null,
+                    exit_code_path text not null,
+                    stdout_offset integer not null,
+                    stderr_offset integer not null,
+                    primary key (process_id, user_id)
+                )
+                """
+            )
+            await db.commit()
 
 
 class AsyncioDockerRunner:
@@ -160,6 +320,7 @@ class DockerUserRuntime(UserRuntime):
         self,
         *,
         runner: DockerRunner | None = None,
+        spawned_process_store: SpawnedProcessStore | None = None,
         image: str = "python:3.14-slim",
         container_prefix: str = "harness",
         ensure_container: bool = False,
@@ -176,7 +337,11 @@ class DockerUserRuntime(UserRuntime):
         self._network = network
         self._memory = memory
         self._cpus = cpus
-        self._spawned: dict[str, asyncio.subprocess.Process] = {}
+        self._spawned_processes = (
+            spawned_process_store
+            if spawned_process_store is not None
+            else SQLiteSpawnedProcessStore(Path("./data/harness.runtime.sqlite3"))
+        )
 
     async def ensure_user_container(self, user_id: str) -> None:
         name = self._container_name(user_id)
@@ -283,33 +448,107 @@ class DockerUserRuntime(UserRuntime):
         await self._maybe_ensure(user_id)
         cwd = _workspace_path(input.cwd)
         process_id = uuid4().hex
-        process = await self.open_stdio(
+        base_path = f"/workspace/.harness/spawned/{process_id}"
+        record = SpawnedProcessRecord(
+            process_id=process_id,
             user_id=user_id,
-            argv=["sh", "-lc", input.command],
+            container_name=self._container_name(user_id),
+            command=input.command,
             cwd=cwd,
+            base_path=base_path,
+            stdout_path=f"{base_path}/stdout",
+            stderr_path=f"{base_path}/stderr",
+            pid_path=f"{base_path}/pid",
+            exit_code_path=f"{base_path}/exit_code",
         )
-        self._spawned[process_id] = process
+        await self._spawned_processes.create(record)
+        try:
+            result = await self._run_in_container_detached(
+                record.container_name,
+                [
+                    "sh",
+                    "-c",
+                    _SPAWN_SHELL_SCRIPT,
+                    "spawn",
+                    record.base_path,
+                    record.stdout_path,
+                    record.stderr_path,
+                    record.pid_path,
+                    record.exit_code_path,
+                    record.cwd,
+                    record.command,
+                ],
+                workdir="/workspace",
+            )
+        except Exception:
+            await self._spawned_processes.delete(process_id=process_id, user_id=user_id)
+            raise
+        if result.exit_code != 0:
+            await self._spawned_processes.delete(process_id=process_id, user_id=user_id)
+            return result
         return RuntimeToolResult(stdout=process_id)
 
     async def shell_read(self, user_id: str, input: ShellReadInput) -> RuntimeToolResult:
-        process = self._spawned.get(input.process_id)
-        if process is None:
+        record = await self._spawned_processes.get(
+            process_id=input.process_id,
+            user_id=user_id,
+        )
+        if record is None:
             raise KeyError(f"Unknown process: {input.process_id}")
-        stdout = await _read_available_now(process.stdout, input.max_bytes)
-        stderr = await _read_available_now(process.stderr, input.max_bytes)
+        await self._maybe_ensure(user_id)
+        result = await self._run_in_container(
+            record.container_name,
+            [
+                "python",
+                "-c",
+                _READ_SPAWNED_PROCESS_CODE,
+                record.stdout_path,
+                record.stderr_path,
+                str(record.stdout_offset),
+                str(record.stderr_offset),
+                str(input.max_bytes),
+                record.pid_path,
+                record.exit_code_path,
+            ],
+        )
+        if result.exit_code != 0:
+            return result
+        payload = json.loads(result.stdout)
+        await self._spawned_processes.update_offsets(
+            process_id=input.process_id,
+            user_id=user_id,
+            stdout_offset=int(payload["stdout_offset"]),
+            stderr_offset=int(payload["stderr_offset"]),
+        )
         return RuntimeToolResult(
-            stdout=stdout,
-            stderr=stderr,
-            exit_code=process.returncode if process.returncode is not None else 0,
+            stdout=base64.b64decode(payload["stdout"]).decode("utf-8", errors="replace"),
+            stderr=base64.b64decode(payload["stderr"]).decode("utf-8", errors="replace"),
+            exit_code=int(payload["exit_code"]),
         )
 
     async def shell_kill(self, user_id: str, input: ShellKillInput) -> RuntimeToolResult:
-        process = self._spawned.pop(input.process_id, None)
-        if process is None:
+        record = await self._spawned_processes.get(
+            process_id=input.process_id,
+            user_id=user_id,
+        )
+        if record is None:
             raise KeyError(f"Unknown process: {input.process_id}")
-        if process.returncode is None:
-            process.terminate()
-            await asyncio.wait_for(process.wait(), timeout=2)
+        await self._maybe_ensure(user_id)
+        result = await self._run_in_container(
+            record.container_name,
+            [
+                "sh",
+                "-c",
+                _KILL_SPAWNED_PROCESS_SCRIPT,
+                "kill-spawned",
+                record.pid_path,
+                record.base_path,
+                record.exit_code_path,
+            ],
+        )
+        if result.exit_code != 0:
+            return result
+        await self._spawned_processes.delete(process_id=input.process_id, user_id=user_id)
         return RuntimeToolResult(stdout=f"killed {input.process_id}\n")
 
     async def file_read(self, user_id: str, input: FileReadInput) -> RuntimeToolResult:
@@ -455,18 +694,49 @@ touch /workspace/agent/SOUL.md /workspace/agent/AGENTS.md /workspace/agent/USER.
         timeout_seconds: int | None = None,
     ) -> DockerProcessResult:
         await self._maybe_ensure(user_id)
+        return await self._run_in_container(
+            self._container_name(user_id),
+            argv,
+            workdir=workdir,
+            stdin=stdin,
+            timeout_seconds=timeout_seconds,
+        )
+
+    async def _run_in_container(
+        self,
+        container_name: str,
+        argv: list[str],
+        *,
+        workdir: str | None = None,
+        stdin: bytes | None = None,
+        timeout_seconds: int | None = None,
+    ) -> DockerProcessResult:
         docker_argv = ["docker", "exec"]
         if stdin is not None:
             docker_argv.append("-i")
         if workdir is not None:
             docker_argv.extend(["-w", workdir])
-        docker_argv.append(self._container_name(user_id))
+        docker_argv.append(container_name)
         docker_argv.extend(argv)
         return await self._runner.run(
             docker_argv,
             stdin=stdin,
             timeout_seconds=timeout_seconds,
         )
+
+    async def _run_in_container_detached(
+        self,
+        container_name: str,
+        argv: list[str],
+        *,
+        workdir: str | None = None,
+    ) -> DockerProcessResult:
+        docker_argv = ["docker", "exec", "-d"]
+        if workdir is not None:
+            docker_argv.extend(["-w", workdir])
+        docker_argv.append(container_name)
+        docker_argv.extend(argv)
+        return await self._runner.run(docker_argv)
 
     async def open_stdio(
         self,
@@ -650,6 +920,169 @@ class FakeUserRuntime(UserRuntime):
         )
 
 
+def _spawned_process_row(record: SpawnedProcessRecord) -> tuple:
+    return (
+        record.process_id,
+        record.user_id,
+        record.container_name,
+        record.command,
+        record.cwd,
+        record.base_path,
+        record.stdout_path,
+        record.stderr_path,
+        record.pid_path,
+        record.exit_code_path,
+        record.stdout_offset,
+        record.stderr_offset,
+    )
+
+
+def _spawned_process_from_row(row: tuple) -> SpawnedProcessRecord:
+    return SpawnedProcessRecord(
+        process_id=row[0],
+        user_id=row[1],
+        container_name=row[2],
+        command=row[3],
+        cwd=row[4],
+        base_path=row[5],
+        stdout_path=row[6],
+        stderr_path=row[7],
+        pid_path=row[8],
+        exit_code_path=row[9],
+        stdout_offset=row[10],
+        stderr_offset=row[11],
+    )
+
+
+_SPAWN_SHELL_SCRIPT = """
+set -u
+base_path=$1
+stdout_path=$2
+stderr_path=$3
+pid_path=$4
+exit_code_path=$5
+cwd=$6
+command=$7
+
+mkdir -p "$base_path"
+: > "$stdout_path"
+: > "$stderr_path"
+rm -f "$exit_code_path"
+echo $$ > "$pid_path"
+
+if ! cd "$cwd"; then
+    printf '1' > "$exit_code_path"
+    exit 1
+fi
+
+child=
+terminate() {
+    if [ -n "${child:-}" ]; then
+        kill "$child" 2>/dev/null || true
+        wait "$child" 2>/dev/null || true
+    fi
+    printf '143' > "$exit_code_path"
+    exit 143
+}
+trap terminate TERM INT HUP
+
+sh -lc "$command" > "$stdout_path" 2> "$stderr_path" < /dev/null &
+child=$!
+wait "$child"
+code=$?
+printf '%s' "$code" > "$exit_code_path"
+exit "$code"
+"""
+
+
+_READ_SPAWNED_PROCESS_CODE = """
+import base64
+import json
+import os
+import pathlib
+import sys
+
+stdout_path = pathlib.Path(sys.argv[1])
+stderr_path = pathlib.Path(sys.argv[2])
+stdout_offset = int(sys.argv[3])
+stderr_offset = int(sys.argv[4])
+max_bytes = int(sys.argv[5])
+pid_path = pathlib.Path(sys.argv[6])
+exit_code_path = pathlib.Path(sys.argv[7])
+
+def read_available(path, offset):
+    # Offsets are bytes already returned by shell.read. Store byte positions, not
+    # decoded character counts, because output files and max_bytes are byte-based.
+    if not path.exists():
+        return "", offset
+    size = path.stat().st_size
+    start = min(offset, size)
+    with path.open("rb") as stream:
+        stream.seek(start)
+        data = stream.read(max_bytes)
+        next_offset = stream.tell()
+    return base64.b64encode(data).decode("ascii"), next_offset
+
+def is_running():
+    try:
+        pid = int(pid_path.read_text(encoding="utf-8").strip())
+    except (FileNotFoundError, ValueError):
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+stdout, next_stdout_offset = read_available(stdout_path, stdout_offset)
+stderr, next_stderr_offset = read_available(stderr_path, stderr_offset)
+exit_code = 0
+if exit_code_path.exists():
+    try:
+        exit_code = int(exit_code_path.read_text(encoding="utf-8").strip())
+    except ValueError:
+        exit_code = 1
+elif not is_running():
+    exit_code = 1
+
+print(json.dumps({
+    "stdout": stdout,
+    "stderr": stderr,
+    "stdout_offset": next_stdout_offset,
+    "stderr_offset": next_stderr_offset,
+    "exit_code": exit_code,
+}))
+"""
+
+
+_KILL_SPAWNED_PROCESS_SCRIPT = """
+set -u
+pid_path=$1
+base_path=$2
+exit_code_path=$3
+
+if [ -f "$pid_path" ]; then
+    pid=$(cat "$pid_path" 2>/dev/null || true)
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+        kill "$pid" 2>/dev/null || true
+        i=0
+        while kill -0 "$pid" 2>/dev/null && [ "$i" -lt 20 ]; do
+            sleep 0.1
+            i=$((i + 1))
+        done
+        if kill -0 "$pid" 2>/dev/null; then
+            kill -KILL "$pid" 2>/dev/null || true
+        fi
+    fi
+fi
+
+printf '143' > "$exit_code_path" 2>/dev/null || true
+rm -rf "$base_path"
+"""
+
+
 def parse_skill_markdown(text: str, *, file_name: str) -> Skill:
     if text.startswith("---\n"):
         _, frontmatter, body = text.split("---", 2)
@@ -676,15 +1109,3 @@ def _content_path(path: str) -> str:
     if normalized != "/workspace/content" and not normalized.startswith("/workspace/content/"):
         raise ValueError(f"content path must stay inside /workspace/content: {path}")
     return normalized
-
-
-async def _read_available_now(
-    reader: asyncio.StreamReader | None,
-    max_bytes: int,
-) -> str:
-    if reader is None:
-        raise RuntimeError("process stream is not available")
-    if not reader._buffer:
-        return ""
-    data = await reader.read(max_bytes)
-    return data.decode("utf-8", errors="replace")

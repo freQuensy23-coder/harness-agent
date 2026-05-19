@@ -8,7 +8,7 @@ import pytest
 
 from harness_agent.context import ContextBuilder
 from harness_agent.mcp import McpManager
-from harness_agent.runtime import DockerUserRuntime
+from harness_agent.runtime import DockerUserRuntime, SQLiteSpawnedProcessStore
 from harness_agent.tasks import SQLiteTaskStore
 from harness_agent.tools import (
     FileEditInput,
@@ -34,7 +34,7 @@ from harness_agent.web_fetch import HttpxWebFetcher
 
 
 @pytest.fixture
-def docker_runtime():
+def docker_runtime(tmp_path):
     prefix = f"harness-e2e-{uuid4().hex[:8]}"
     user_id = "u:e2e"
     runtime = DockerUserRuntime(
@@ -44,6 +44,7 @@ def docker_runtime():
         network="bridge",
         memory="1g",
         cpus="1",
+        spawned_process_store=SQLiteSpawnedProcessStore(tmp_path / "runtime.sqlite3"),
     )
     yield runtime, user_id, f"{prefix}-u-e2e"
     subprocess.run(["docker", "rm", "-f", f"{prefix}-u-e2e"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
