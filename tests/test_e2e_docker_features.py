@@ -154,7 +154,9 @@ async def test_all_container_tools_skills_soul_and_mcp_work_in_docker(docker_run
 
 @pytest.mark.asyncio
 async def test_web_fetch_and_task_tools_work(local_http_server, tmp_path):
-    fetched = await HttpxWebFetcher().fetch(WebFetchInput(url=local_http_server))
+    fetched = await HttpxWebFetcher().fetch(
+        WebFetchInput(url=local_http_server, prompt="Extract the response body.")
+    )
     assert fetched.stdout == "web-fetch-ok"
 
     store = SQLiteTaskStore(tmp_path / "tasks.sqlite3")

@@ -114,6 +114,7 @@ class UserRuntime(UserContextRuntime):
         user_id: str,
         path: str,
         max_bytes: int | None,
+        offset: int = 0,
     ) -> RuntimeFileRead:
         raise NotImplementedError
 
@@ -313,24 +314,33 @@ class DockerUserRuntime(UserRuntime):
         return RuntimeToolResult(stdout=f"killed {input.process_id}\n")
 
     async def file_read(self, user_id: str, input: FileReadInput) -> RuntimeToolResult:
-        path = _workspace_path(input.path)
-        return await self._exec(
+        read = await self.read_file_bytes(
             user_id,
-            ["sh", "-lc", f"head -c {int(input.max_bytes)} -- {shlex.quote(path)}"],
+            input.path,
+            input.max_bytes,
+            input.offset,
         )
+        if read.result.exit_code != 0:
+            return read.result
+        if read.file is None:
+            raise RuntimeError("file read succeeded without file content")
+        return RuntimeToolResult(stdout=read.file.content.decode("utf-8", errors="replace"))
 
     async def read_file_bytes(
         self,
         user_id: str,
         path: str,
         max_bytes: int | None,
+        offset: int = 0,
     ) -> RuntimeFileRead:
         path = _workspace_path(path)
         code = (
             "import base64, pathlib, sys;"
             "path=pathlib.Path(sys.argv[1]);"
             "limit=sys.argv[2];"
+            "offset=int(sys.argv[3]);"
             "stream=path.open('rb');"
+            "stream.seek(offset);"
             "data=stream.read() if limit == '' else stream.read(int(limit));"
             "stream.close();"
             "sys.stdout.write(base64.b64encode(data).decode('ascii'))"
@@ -338,7 +348,7 @@ class DockerUserRuntime(UserRuntime):
         limit = "" if max_bytes is None else str(max_bytes)
         result = await self._exec(
             user_id,
-            ["python", "-c", code, path, limit],
+            ["python", "-c", code, path, limit, str(offset)],
         )
         if result.exit_code != 0:
             return RuntimeFileRead(result=result)
@@ -361,7 +371,7 @@ class DockerUserRuntime(UserRuntime):
     async def file_edit(self, user_id: str, input: FileEditInput) -> RuntimeToolResult:
         current = await self.file_read(
             user_id,
-            FileReadInput(path=input.path, max_bytes=5_000_000),
+            FileReadInput(path=input.path),
         )
         if current.exit_code != 0:
             return current
@@ -378,7 +388,7 @@ class DockerUserRuntime(UserRuntime):
     ) -> RuntimeToolResult:
         current = await self.file_read(
             user_id,
-            FileReadInput(path=input.path, max_bytes=5_000_000),
+            FileReadInput(path=input.path),
         )
         if current.exit_code != 0:
             return current
@@ -394,20 +404,22 @@ class DockerUserRuntime(UserRuntime):
         cwd = _workspace_path(input.cwd)
         code = (
             "import glob, sys;"
-            "pattern=sys.argv[1]; limit=int(sys.argv[2]);"
-            "print('\\n'.join(sorted(glob.glob(pattern, recursive=True))[:limit]))"
+            "pattern=sys.argv[1];"
+            "print('\\n'.join(sorted(glob.glob(pattern, recursive=True))))"
         )
         return await self._exec(
             user_id,
-            ["python", "-c", code, input.pattern, str(input.max_results)],
+            ["python", "-c", code, input.pattern],
             workdir=cwd,
         )
 
     async def file_grep(self, user_id: str, input: FileGrepInput) -> RuntimeToolResult:
         path = _workspace_path(input.path)
         command = (
-            f"grep -RIn -- {shlex.quote(input.pattern)} {shlex.quote(path)} "
-            f"| head -n {int(input.max_results)}"
+            f"grep -RIn -- {shlex.quote(input.pattern)} {shlex.quote(path)}; "
+            "status=$?; "
+            'if [ "$status" -eq 1 ]; then exit 0; fi; '
+            'exit "$status"'
         )
         return await self._exec(user_id, ["sh", "-lc", command])
 
@@ -415,7 +427,7 @@ class DockerUserRuntime(UserRuntime):
         path = _workspace_path(input.path)
         command = (
             f"find {shlex.quote(path)} -maxdepth 1 -mindepth 1 "
-            f"| sort | head -n {int(input.max_results)}"
+            "| sort"
         )
         return await self._exec(user_id, ["sh", "-lc", command])
 
@@ -566,6 +578,7 @@ class FakeUserRuntime(UserRuntime):
         user_id: str,
         path: str,
         max_bytes: int | None,
+        offset: int = 0,
     ) -> RuntimeFileRead:
         if path not in self._files:
             return RuntimeFileRead(
@@ -579,9 +592,8 @@ class FakeUserRuntime(UserRuntime):
             data = content.encode("latin1")
         except AttributeError:
             data = content
-        if max_bytes is None:
-            return RuntimeFileRead(file=WorkspaceFile(path=path, content=data))
-        return RuntimeFileRead(file=WorkspaceFile(path=path, content=data[:max_bytes]))
+        window = data[offset:] if max_bytes is None else data[offset : offset + max_bytes]
+        return RuntimeFileRead(file=WorkspaceFile(path=path, content=window))
 
     async def shell_exec(self, user_id: str, input: ShellExecInput) -> RuntimeToolResult:
         self.shell_exec_calls.append(input)
@@ -601,10 +613,16 @@ class FakeUserRuntime(UserRuntime):
     async def file_read(self, user_id: str, input: FileReadInput) -> RuntimeToolResult:
         content = self._files[input.path]
         try:
-            return RuntimeToolResult(stdout=content.decode("utf-8", errors="replace"))
+            data = content[input.offset :]
+            if input.max_bytes is not None:
+                data = data[: input.max_bytes]
+            return RuntimeToolResult(stdout=data.decode("utf-8", errors="replace"))
         except AttributeError:
             pass
-        return RuntimeToolResult(stdout=content)
+        text = content[input.offset :]
+        if input.max_bytes is not None:
+            text = text[: input.max_bytes]
+        return RuntimeToolResult(stdout=text)
 
     async def file_write(self, user_id: str, input: FileWriteInput) -> RuntimeToolResult:
         self.file_write_calls.append(input)
@@ -642,7 +660,7 @@ class FakeUserRuntime(UserRuntime):
             for line_no, line in enumerate(content.splitlines(), start=1):
                 if input.pattern in line:
                     lines.append(f"{path}:{line_no}:{line}")
-        return RuntimeToolResult(stdout="\n".join(lines[: input.max_results]))
+        return RuntimeToolResult(stdout="\n".join(lines))
 
     async def file_list(self, user_id: str, input: FileListInput) -> RuntimeToolResult:
         return RuntimeToolResult(

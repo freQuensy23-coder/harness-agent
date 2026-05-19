@@ -124,6 +124,25 @@ class ToolCallCompleted(EventBase):
         return parse_stored_tool_input(tool_name, value)
 
 
+class ToolCallError(EventBase):
+    type: Literal["tool.call.error"] = "tool.call.error"
+    user_id: str
+    conversation_id: str
+    generation: int
+    call_id: str
+    tool_name: str
+    input: ToolInput
+    error: str
+
+    @field_validator("input", mode="before")
+    @classmethod
+    def parse_input_for_tool(cls, value, info: ValidationInfo):
+        tool_name = info.data.get("tool_name")
+        if tool_name is None:
+            return value
+        return parse_stored_tool_input(tool_name, value)
+
+
 class AssistantTextProduced(EventBase):
     type: Literal["assistant.text.produced"] = "assistant.text.produced"
     user_id: str
@@ -185,6 +204,7 @@ AgentEvent = Annotated[
     | AgentTurnRequested
     | AgentTurnSuperseded
     | ToolCallRequested
+    | ToolCallError
     | ToolCallCompleted
     | AssistantTextProduced
     | ScheduledMessageDue

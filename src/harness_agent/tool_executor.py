@@ -1,11 +1,12 @@
 import asyncio
+import re
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 
 from pydantic import BaseModel, Field
 
 from harness_agent.content import ContentRef, content_ref_from_workspace_file
-from harness_agent.events import EventBase, ToolCallCompleted, ToolCallRequested
+from harness_agent.events import EventBase, ToolCallCompleted, ToolCallError, ToolCallRequested
 from harness_agent.mcp import McpManager
 from harness_agent.runtime import RuntimeToolResult, UserRuntime
 from harness_agent.scheduler import SQLiteScheduleStore
@@ -52,6 +53,7 @@ from harness_agent.web_fetch import WebFetcher
 EventBatch = tuple[EventBase, ...]
 ToolExecutor = Callable[[str, ToolCallRequested], Awaitable[RuntimeToolResult]]
 ToolCallKey = tuple[str, int, str]
+TOOL_RESULT_CHAR_LIMIT = 30_000
 
 
 class ToolExecutionResult(BaseModel):
@@ -130,8 +132,27 @@ class ToolCallExecutor:
         }
 
     async def handle_tool_call_requested(self, event: ToolCallRequested) -> EventBatch:
-        execution = await self._execute_tool(event)
-        return (
+        events: list[EventBase] = []
+        try:
+            execution = await self._execute_tool(event)
+        except Exception as exc:
+            error = str(exc) or exc.__class__.__name__
+            events.append(
+                ToolCallError(
+                    user_id=event.user_id,
+                    conversation_id=event.conversation_id,
+                    generation=event.generation,
+                    call_id=event.call_id,
+                    tool_name=event.tool_name,
+                    input=event.input,
+                    error=error,
+                )
+            )
+            execution = ToolExecutionResult(
+                result=RuntimeToolResult(stderr=error, exit_code=1)
+            )
+        execution = await self._spill_oversized_result(event, execution)
+        events.append(
             ToolCallCompleted(
                 user_id=event.user_id,
                 conversation_id=event.conversation_id,
@@ -141,8 +162,9 @@ class ToolCallExecutor:
                 input=event.input,
                 result=execution.result,
                 attachments=execution.attachments,
-            ),
+            )
         )
+        return tuple(events)
 
     async def _execute_tool(self, event: ToolCallRequested) -> ToolExecutionResult:
         if event.tool_name == "file.read":
@@ -203,6 +225,7 @@ class ToolCallExecutor:
             user_id,
             input.path,
             input.max_bytes,
+            input.offset,
         )
         if read.result.exit_code != 0:
             return ToolExecutionResult(result=read.result)
@@ -285,7 +308,27 @@ class ToolCallExecutor:
     ) -> RuntimeToolResult:
         if self._web_fetcher is None:
             raise RuntimeError("web fetcher is not configured")
-        return await self._web_fetcher.fetch(WebFetchInput.model_validate(event.input))
+        input = WebFetchInput.model_validate(event.input)
+        page = await self._web_fetcher.fetch_markdown(input)
+        record = await self._require_sub_agents().run(
+            user_id=user_id,
+            parent_conversation_id=event.conversation_id,
+            parent_call_id=event.call_id,
+            input=AgentRunInput(
+                name="web-fetch",
+                prompt=_web_fetch_subagent_prompt(
+                    url=page.url,
+                    extraction_prompt=input.prompt,
+                    markdown=page.markdown,
+                ),
+            ),
+        )
+        if record.status != "completed":
+            return RuntimeToolResult(
+                stderr=record.error or f"web.fetch sub-agent ended with status {record.status}",
+                exit_code=1,
+            )
+        return self._text_result(record.result or "")
 
     async def _task_create(
         self,
@@ -547,6 +590,72 @@ class ToolCallExecutor:
     def _text_result(self, text: str) -> RuntimeToolResult:
         return RuntimeToolResult(stdout=text)
 
+    async def _spill_oversized_result(
+        self,
+        event: ToolCallRequested,
+        execution: ToolExecutionResult,
+    ) -> ToolExecutionResult:
+        rendered = execution.result.render_for_llm(event.tool_name)
+        if len(rendered) <= TOOL_RESULT_CHAR_LIMIT:
+            return execution
+        path = _tool_result_path(event)
+        write_result = await self._runtime.write_content_file(
+            event.user_id,
+            path,
+            rendered.encode("utf-8"),
+        )
+        if write_result.exit_code != 0:
+            return ToolExecutionResult(
+                result=RuntimeToolResult(
+                    stderr=(
+                        "Tool result exceeded the model-visible limit, but saving "
+                        f"the full result to {path} failed: {write_result.stderr}"
+                    ),
+                    exit_code=1,
+                ),
+                attachments=execution.attachments,
+            )
+        return ToolExecutionResult(
+            result=RuntimeToolResult(
+                stdout=(
+                    "truncated, because it is too long. "
+                    f"Full result saved to {path}. "
+                    "Use file.read with offset and max_bytes to read it in chunks.\n"
+                ),
+                exit_code=execution.result.exit_code,
+            ),
+            attachments=execution.attachments,
+        )
+
 
 def _tool_call_key(event: ToolCallRequested | ToolCallCompleted) -> ToolCallKey:
     return (event.conversation_id, event.generation, event.call_id)
+
+
+def _tool_result_path(event: ToolCallRequested) -> str:
+    conversation = _safe_path_part(event.conversation_id) or "conversation"
+    call = _safe_path_part(event.call_id) or "call"
+    tool = _safe_path_part(event.tool_name) or "tool"
+    return f"/workspace/content/tool-results/{conversation}/{event.generation}-{call}-{tool}.txt"
+
+
+def _safe_path_part(value: str) -> str:
+    return re.sub(r"[^a-zA-Z0-9_.-]+", "-", value).strip("-")
+
+
+def _web_fetch_subagent_prompt(
+    *,
+    url: str,
+    extraction_prompt: str,
+    markdown: str,
+) -> str:
+    return (
+        "You are the WebFetch extraction model. Answer the extraction prompt using only "
+        "the fetched page markdown below. Return a concise answer for the parent agent; "
+        "do not repeat the full markdown unless the prompt explicitly asks for it.\n\n"
+        f"URL: {url}\n\n"
+        "Extraction prompt:\n"
+        f"{extraction_prompt}\n\n"
+        "Fetched page markdown:\n"
+        f"{markdown}"
+    )

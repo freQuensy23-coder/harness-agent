@@ -43,7 +43,7 @@ class ContextBuilder:
                 "- file.glob finds files under /workspace.",
                 "- file.grep searches files under /workspace.",
                 "- file.list lists paths under /workspace.",
-                "- web.fetch fetches HTTP/HTTPS text.",
+                "- web.fetch fetches an HTTP/HTTPS URL and answers a specific extraction prompt.",
                 "- task.* manages the conversation checklist.",
                 "- schedule.once schedules one future synthetic user message.",
                 "- schedule.cron schedules recurring synthetic user messages.",

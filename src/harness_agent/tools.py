@@ -25,7 +25,8 @@ class ShellKillInput(BaseModel):
 
 class FileReadInput(BaseModel):
     path: str
-    max_bytes: int = 20000
+    offset: int = Field(default=0, ge=0)
+    max_bytes: int | None = Field(default=None, ge=1)
 
 
 class FileWriteInput(BaseModel):
@@ -54,23 +55,20 @@ class FileMultiEditInput(BaseModel):
 class FileGlobInput(BaseModel):
     pattern: str
     cwd: str = "/workspace"
-    max_results: int = 200
 
 
 class FileGrepInput(BaseModel):
     pattern: str
     path: str = "/workspace"
-    max_results: int = 200
 
 
 class FileListInput(BaseModel):
     path: str = "/workspace"
-    max_results: int = 200
 
 
 class WebFetchInput(BaseModel):
     url: str
-    max_bytes: int = 20000
+    prompt: str = Field(min_length=1)
 
 
 class TaskCreateInput(BaseModel):
@@ -362,7 +360,10 @@ def default_tool_registry() -> ToolRegistry:
             ),
             ToolSpec(
                 name="web.fetch",
-                description="Fetch text from an HTTP or HTTPS URL.",
+                description=(
+                    "Fetch an HTTP or HTTPS URL, convert it to Markdown, and answer "
+                    "the provided extraction prompt using a secondary model."
+                ),
                 input_model=WebFetchInput,
             ),
             ToolSpec(
