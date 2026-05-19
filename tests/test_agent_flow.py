@@ -102,6 +102,7 @@ async def test_telegram_say_hi_builds_context_from_runtime_and_replies(tmp_path:
         "telegram.text.received",
         "user.text.received",
         "agent.turn.requested",
+        "agent.generation.started",
         "assistant.text.produced",
     ]
     assert await projection.list_messages("tg:456") == [

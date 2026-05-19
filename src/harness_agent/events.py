@@ -76,6 +76,14 @@ class AgentTurnRequested(EventBase):
     reply_target: ReplyTarget | None = None
 
 
+class AgentGenerationStarted(EventBase):
+    type: Literal["agent.generation.started"] = "agent.generation.started"
+    user_id: str
+    conversation_id: str
+    generation: int
+    reply_target: ReplyTarget | None = None
+
+
 class AgentTurnSuperseded(EventBase):
     type: Literal["agent.turn.superseded"] = "agent.turn.superseded"
     user_id: str
@@ -183,6 +191,7 @@ AgentEvent = Annotated[
     | CliTextReceived
     | UserTextReceived
     | AgentTurnRequested
+    | AgentGenerationStarted
     | AgentTurnSuperseded
     | ToolCallRequested
     | ToolCallCompleted
