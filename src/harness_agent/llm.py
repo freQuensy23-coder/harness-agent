@@ -3,6 +3,7 @@ from typing import Annotated, Any, Literal
 
 from openai import AsyncOpenAI
 from pydantic import BaseModel, Field
+import tiktoken
 
 from harness_agent.content import ContentRef
 from harness_agent.tools import (
@@ -72,6 +73,19 @@ LlmResponse = AssistantText | LlmToolCall
 class LlmClient:
     async def respond(self, request: LlmRequest) -> LlmResponse:
         raise NotImplementedError
+
+
+def estimate_request_tokens(request: LlmRequest) -> int:
+    tokenizer = tiktoken.encoding_for_model("gpt-5")
+    tokenized_parts = [
+        request.system,
+        *[message.model_dump_json() for message in request.messages],
+        *[
+            json.dumps(tool_to_openai(tool), ensure_ascii=False, sort_keys=True)
+            for tool in request.tools
+        ],
+    ]
+    return sum(len(tokenizer.encode(part)) for part in tokenized_parts)
 
 
 class OpenAICompatibleChatClient(LlmClient):

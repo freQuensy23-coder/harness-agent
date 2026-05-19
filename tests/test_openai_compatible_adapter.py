@@ -1,7 +1,10 @@
 from harness_agent.llm import (
+    AssistantMessage,
     AssistantToolCallMessage,
+    LlmRequest,
     ToolResultMessage,
     UserMessage,
+    estimate_request_tokens,
     message_to_openai,
     parse_tool_input,
     tool_to_openai,
@@ -63,3 +66,34 @@ def test_message_to_openai_preserves_tool_call_history_shape() -> None:
         "tool_call_id": "call_1",
         "content": "ok",
     }
+
+
+def test_estimate_request_tokens_uses_gpt5_tokenizer_for_every_request(monkeypatch) -> None:
+    requested_models: list[str] = []
+
+    class RecordingTokenizer:
+        def encode(self, value: str) -> list[int]:
+            return list(range(len(value.split())))
+
+    def encoding_for_model(model: str) -> RecordingTokenizer:
+        requested_models.append(model)
+        return RecordingTokenizer()
+
+    monkeypatch.setattr(
+        "harness_agent.llm.tiktoken.encoding_for_model",
+        encoding_for_model,
+    )
+
+    tokens = estimate_request_tokens(
+        LlmRequest(
+            user_id="u:1",
+            conversation_id="cli:1",
+            generation=1,
+            system="system prompt",
+            messages=[UserMessage(text="hello user"), AssistantMessage(text="hi")],
+            tools=[default_tool_registry().by_name("shell.exec")],
+        )
+    )
+
+    assert requested_models == ["gpt-5"]
+    assert tokens > 0
