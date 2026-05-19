@@ -1,3 +1,5 @@
+import base64
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -7,8 +9,14 @@ from harness_agent.adapters.cli import event_from_cli_send
 from harness_agent.adapters.telegram import event_from_aiogram_message
 from harness_agent.config import load_config
 from harness_agent.context import Skill
-from harness_agent.runtime import DockerProcessResult, DockerUserRuntime
-from harness_agent.tools import FileWriteInput, ShellExecInput
+from harness_agent.runtime import DockerProcessResult, DockerUserRuntime, SQLiteSpawnedProcessStore
+from harness_agent.tools import (
+    FileWriteInput,
+    ShellExecInput,
+    ShellKillInput,
+    ShellReadInput,
+    ShellSpawnInput,
+)
 
 
 def test_yaml_config_rejects_unknown_fields(tmp_path: Path) -> None:
@@ -137,6 +145,72 @@ async def test_docker_runtime_loads_skills_from_markdown_frontmatter() -> None:
             body="Stay in /workspace.\n",
         )
     ]
+
+
+@pytest.mark.asyncio
+async def test_docker_runtime_recovers_spawned_processes_after_restart(tmp_path: Path) -> None:
+    store = SQLiteSpawnedProcessStore(tmp_path / "runtime.sqlite3")
+    spawn_runner = RecordingDockerRunner(
+        [DockerProcessResult(stdout="", stderr="", exit_code=0)]
+    )
+    runtime = DockerUserRuntime(runner=spawn_runner, spawned_process_store=store)
+
+    spawned = await runtime.shell_spawn(
+        "u:123",
+        ShellSpawnInput(command="while true; do echo alive; sleep 1; done"),
+    )
+
+    process_id = spawned.stdout
+    record = await store.get(process_id=process_id, user_id="u:123")
+    assert record is not None
+    assert record.command == "while true; do echo alive; sleep 1; done"
+    assert record.container_name == "harness-u-123"
+    assert record.stdout_offset == 0
+
+    read_payload = {
+        "stdout": base64.b64encode(b"alive\n").decode("ascii"),
+        "stderr": "",
+        "stdout_offset": len("alive\n"),
+        "stderr_offset": 0,
+        "exit_code": 0,
+    }
+    read_runner = RecordingDockerRunner(
+        [DockerProcessResult(stdout=json.dumps(read_payload), stderr="", exit_code=0)]
+    )
+    restarted_runtime = DockerUserRuntime(runner=read_runner, spawned_process_store=store)
+
+    read = await restarted_runtime.shell_read(
+        "u:123",
+        ShellReadInput(process_id=process_id),
+    )
+
+    assert read.stdout == "alive\n"
+    updated = await store.get(process_id=process_id, user_id="u:123")
+    assert updated is not None
+    assert updated.stdout_offset == len("alive\n")
+
+
+@pytest.mark.asyncio
+async def test_docker_runtime_removes_spawned_process_record_on_kill(tmp_path: Path) -> None:
+    store = SQLiteSpawnedProcessStore(tmp_path / "runtime.sqlite3")
+    spawn_runner = RecordingDockerRunner(
+        [DockerProcessResult(stdout="", stderr="", exit_code=0)]
+    )
+    runtime = DockerUserRuntime(runner=spawn_runner, spawned_process_store=store)
+    spawned = await runtime.shell_spawn("u:123", ShellSpawnInput(command="sleep 60"))
+
+    kill_runner = RecordingDockerRunner(
+        [DockerProcessResult(stdout="", stderr="", exit_code=0)]
+    )
+    restarted_runtime = DockerUserRuntime(runner=kill_runner, spawned_process_store=store)
+
+    killed = await restarted_runtime.shell_kill(
+        "u:123",
+        ShellKillInput(process_id=spawned.stdout),
+    )
+
+    assert killed.stdout == f"killed {spawned.stdout}\n"
+    assert await store.get(process_id=spawned.stdout, user_id="u:123") is None
 
 
 class RecordingDockerRunner:
