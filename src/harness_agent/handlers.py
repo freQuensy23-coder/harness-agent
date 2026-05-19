@@ -4,6 +4,7 @@ from harness_agent.bus import EventBus
 from harness_agent.content import content_ref_from_bytes
 from harness_agent.context import ContextBuilder
 from harness_agent.events import (
+    AgentGenerationStarted,
     AgentTurnRequested,
     AgentTurnSuperseded,
     AssistantTextProduced,
@@ -200,6 +201,16 @@ class AgentTurnHandler:
             tools = await self._tools_for_user(event.user_id)
 
             while True:
+                if await self._stop_if_superseded(event):
+                    return
+                await self._bus.publish(
+                    AgentGenerationStarted(
+                        user_id=event.user_id,
+                        conversation_id=event.conversation_id,
+                        generation=event.generation,
+                        reply_target=event.reply_target,
+                    )
+                )
                 if await self._stop_if_superseded(event):
                     return
                 response = await self._llm.respond(

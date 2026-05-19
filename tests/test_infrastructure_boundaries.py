@@ -2,12 +2,18 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from aiogram.enums import ChatAction, ParseMode
+from aiogram.exceptions import TelegramBadRequest
 
+from harness_agent import events as event_models
 from harness_agent.adapters.cli import event_from_cli_send
-from harness_agent.adapters.telegram import event_from_aiogram_message
+from harness_agent.adapters.telegram import AiogramTelegramAdapter, event_from_aiogram_message
+from harness_agent.bus import EventBus
 from harness_agent.config import load_config
 from harness_agent.context import Skill
+from harness_agent.events import AssistantTextProduced, TelegramReplyTarget
 from harness_agent.runtime import DockerProcessResult, DockerUserRuntime
+from harness_agent.turns import ConversationTurnCoordinator
 from harness_agent.tools import FileWriteInput, ShellExecInput
 
 
@@ -55,6 +61,99 @@ def test_cli_adapter_only_creates_event() -> None:
     assert event.cli_user_id == "123"
     assert event.conversation_id == "cli:123"
     assert event.text == "Say hi"
+
+
+@pytest.mark.asyncio
+async def test_telegram_adapter_sends_assistant_text_as_markdown() -> None:
+    coordinator = ConversationTurnCoordinator()
+    generation = await coordinator.request_generation("tg:456")
+    adapter = AiogramTelegramAdapter(
+        token="123:ABC",
+        bus=EventBus(RecordingEventStore()),
+        turn_coordinator=coordinator,
+    )
+    bot = RecordingTelegramBot()
+    adapter._bot = bot
+
+    await adapter.handle_assistant_text(
+        AssistantTextProduced(
+            user_id="user:123",
+            conversation_id="tg:456",
+            generation=generation,
+            text="*bold*",
+            reply_target=TelegramReplyTarget(chat_id=456),
+        )
+    )
+
+    assert bot.sent_messages == [
+        {"chat_id": 456, "text": "*bold*", "parse_mode": ParseMode.MARKDOWN}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_telegram_adapter_falls_back_to_plain_text_for_invalid_markdown() -> None:
+    coordinator = ConversationTurnCoordinator()
+    generation = await coordinator.request_generation("tg:456")
+    adapter = AiogramTelegramAdapter(
+        token="123:ABC",
+        bus=EventBus(RecordingEventStore()),
+        turn_coordinator=coordinator,
+    )
+    bot = RecordingTelegramBot(
+        message_errors=[
+            TelegramBadRequest(
+                method=None,
+                message="Bad Request: can't parse entities: Can't find end of entity",
+            )
+        ]
+    )
+    adapter._bot = bot
+
+    await adapter.handle_assistant_text(
+        AssistantTextProduced(
+            user_id="user:123",
+            conversation_id="tg:456",
+            generation=generation,
+            text="**broken",
+            reply_target=TelegramReplyTarget(chat_id=456),
+        )
+    )
+
+    assert bot.sent_messages == [
+        {"chat_id": 456, "text": "**broken", "parse_mode": ParseMode.MARKDOWN},
+        {"chat_id": 456, "text": "**broken"},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_telegram_adapter_sends_typing_when_generation_starts() -> None:
+    coordinator = ConversationTurnCoordinator()
+    generation = await coordinator.request_generation("tg:456")
+    adapter = AiogramTelegramAdapter(
+        token="123:ABC",
+        bus=EventBus(RecordingEventStore()),
+        turn_coordinator=coordinator,
+    )
+    bot = RecordingTelegramBot()
+    adapter._bot = bot
+    generation_started = event_models.AgentGenerationStarted(
+        user_id="user:123",
+        conversation_id="tg:456",
+        generation=generation,
+        reply_target=TelegramReplyTarget(chat_id=456),
+    )
+
+    await adapter.handle_agent_generation_started(generation_started)
+
+    assert bot.chat_actions == [{"chat_id": 456, "action": ChatAction.TYPING}]
+
+
+def test_harness_app_does_not_own_telegram_outbound_ux() -> None:
+    source = Path("src/harness_agent/app.py").read_text(encoding="utf-8")
+
+    assert "_send_telegram_reply" not in source
+    assert "send_assistant_text" not in source
+    assert "send_chat_action" not in source
 
 
 @pytest.mark.asyncio
@@ -153,3 +252,23 @@ class RecordingDockerRunner:
     ) -> DockerProcessResult:
         self.calls.append((argv, stdin))
         return self._results.pop(0)
+
+
+class RecordingEventStore:
+    async def append(self, event) -> None:
+        return None
+
+
+class RecordingTelegramBot:
+    def __init__(self, *, message_errors: list[Exception] | None = None) -> None:
+        self.sent_messages: list[dict] = []
+        self.chat_actions: list[dict] = []
+        self._message_errors = [] if message_errors is None else message_errors
+
+    async def send_message(self, **kwargs) -> None:
+        self.sent_messages.append(kwargs)
+        if self._message_errors:
+            raise self._message_errors.pop(0)
+
+    async def send_chat_action(self, **kwargs) -> None:
+        self.chat_actions.append(kwargs)
