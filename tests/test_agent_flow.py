@@ -6,11 +6,13 @@ import pytest
 
 from harness_agent.bus import EventBus
 from harness_agent.context import AgentFileSet, ContextBuilder, Skill
+from harness_agent.content import ContentRef
 from harness_agent.events import (
     AgentTurnRequested,
     AgentTurnSuperseded,
     AssistantTextProduced,
     CliTextReceived,
+    ContextCompacting,
     TelegramTextReceived,
     ToolCallCompleted,
     ToolCallRequested,
@@ -545,6 +547,123 @@ async def test_tool_history_bytes_are_identical_in_next_llm_request(tmp_path: Pa
         if json.loads(message)["kind"] in {"assistant_tool_call", "tool_result"}
     ]
     assert second_turn_tool_history == tool_history_bytes
+
+
+@pytest.mark.asyncio
+async def test_agent_turn_compacts_context_before_llm_request(tmp_path: Path) -> None:
+    store = SQLiteEventStore(tmp_path / "events.sqlite3")
+    projection = SQLiteConversationProjection(tmp_path / "messages.sqlite3")
+    runtime = FakeUserRuntime(
+        agent_files=AgentFileSet(soul="SOUL", agents="AGENTS", user="USER", tools="TOOLS"),
+    )
+    llm = FakeLlmClient([AssistantText(text="summary of old context"), AssistantText(text="done")])
+    bus = EventBus(store)
+    conversation_projector = ConversationProjector(projection)
+    agent_turn_handler = AgentTurnHandler(
+        bus=bus,
+        context_builder=ContextBuilder(runtime=runtime),
+        llm=llm,
+        tool_registry=default_tool_registry(),
+        projection=projection,
+        context_archive_runtime=runtime,
+        max_tokens_per_model=20,
+        compaction_reserved_tokens=19,
+        compaction_keep_last_messages=2,
+    )
+    bus.subscribe(UserTextReceived, conversation_projector.handle_user_text)
+    bus.subscribe(AssistantTextProduced, conversation_projector.handle_assistant_text)
+    bus.subscribe(UserTextReceived, agent_turn_handler.handle_user_text)
+    bus.subscribe(AgentTurnRequested, agent_turn_handler.handle_agent_turn)
+
+    await projection.append_user_message(
+        user_id="u:1",
+        conversation_id="cli:compact",
+        text="old user request",
+    )
+    await projection.append_assistant_message(
+        user_id="u:1",
+        conversation_id="cli:compact",
+        generation=1,
+        text="old assistant answer",
+    )
+    await projection.append_tool_exchange(
+        user_id="u:1",
+        conversation_id="cli:compact",
+        generation=1,
+        call_id="call_1",
+        tool_name="shell.exec",
+        input=ShellExecInput(command="pwd", cwd="/workspace"),
+        result=RuntimeToolResult(stdout="/workspace\n"),
+        attachments=[
+            ContentRef(
+                kind="image",
+                file_name="plot.png",
+                mime_type="image/png",
+                size_bytes=8,
+                sha256="sha",
+                workspace_path="/workspace/content/plot.png",
+                content_base64="aW1hZ2U=",
+            )
+        ],
+    )
+    await projection.append_user_message(
+        user_id="u:1",
+        conversation_id="cli:compact",
+        text="recent user context",
+    )
+    await projection.append_assistant_message(
+        user_id="u:1",
+        conversation_id="cli:compact",
+        generation=2,
+        text="recent assistant context",
+    )
+
+    await bus.publish(
+        UserTextReceived(
+            user_id="u:1",
+            conversation_id="cli:compact",
+            source="cli",
+            text="new request",
+        )
+    )
+
+    events = await store.list_events()
+    assert [event.type for event in events] == [
+        "user.text.received",
+        "agent.turn.requested",
+        "context.compacting",
+        "assistant.text.produced",
+    ]
+    compacting = [event for event in events if isinstance(event, ContextCompacting)][0]
+    assert compacting.archive_path.startswith("/workspace/.old-sessions/")
+    assert compacting.estimated_tokens >= compacting.threshold_tokens
+
+    archive_write = runtime.file_write_calls[0]
+    assert archive_write.path == compacting.archive_path
+    archived_kinds = [
+        json.loads(line)["item_kind"] for line in archive_write.content.splitlines()
+    ]
+    assert {
+        "user",
+        "assistant",
+        "assistant_tool_call",
+        "tool_result",
+        "tool_context",
+    }.issubset(archived_kinds)
+
+    final_request = llm.requests[-1]
+    assert final_request.messages == [
+        UserMessage(
+            text="Previous conversation summary:\nsummary of old context\n\n"
+            f"Archived raw session: {compacting.archive_path}"
+        ),
+        AssistantMessage(text="recent assistant context"),
+        UserMessage(text="new request"),
+    ]
+    assert await projection.list_llm_messages("cli:compact") == [
+        *final_request.messages,
+        AssistantMessage(text="done"),
+    ]
 
 
 @pytest.mark.asyncio
