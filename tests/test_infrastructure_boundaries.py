@@ -4,11 +4,16 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from aiogram.enums import ChatAction, ParseMode
+from aiogram.exceptions import TelegramBadRequest
 
+from harness_agent import events
 from harness_agent.adapters.cli import event_from_cli_send
-from harness_agent.adapters.telegram import event_from_aiogram_message
+from harness_agent.adapters.telegram import AiogramTelegramAdapter, event_from_aiogram_message
+from harness_agent.app import HarnessApp
 from harness_agent.config import load_config
 from harness_agent.context import Skill
+from harness_agent.events import AssistantTextProduced, TelegramReplyTarget
 from harness_agent.runtime import DockerProcessResult, DockerUserRuntime, SQLiteSpawnedProcessStore
 from harness_agent.tools import (
     FileWriteInput,
@@ -51,6 +56,68 @@ def test_telegram_adapter_only_creates_event() -> None:
     assert event.telegram_chat_id == 456
     assert event.telegram_message_id == 999
     assert event.text == "Say hi"
+
+
+@pytest.mark.asyncio
+async def test_telegram_adapter_sends_assistant_text_as_markdown() -> None:
+    bot = RecordingTelegramBot()
+    adapter = adapter_with_bot(bot)
+
+    await adapter.handle_assistant_text(
+        AssistantTextProduced(
+            user_id="u:123",
+            conversation_id="tg:456",
+            generation=1,
+            text="*bold*",
+            reply_target=TelegramReplyTarget(chat_id=456),
+        )
+    )
+
+    assert bot.messages == [
+        {"chat_id": 456, "text": "*bold*", "parse_mode": ParseMode.MARKDOWN}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_telegram_adapter_retries_plain_text_when_markdown_is_invalid() -> None:
+    bot = RecordingTelegramBot(fail_markdown=True)
+    adapter = adapter_with_bot(bot)
+
+    await adapter.handle_assistant_text(
+        AssistantTextProduced(
+            user_id="u:123",
+            conversation_id="tg:456",
+            generation=1,
+            text="*broken",
+            reply_target=TelegramReplyTarget(chat_id=456),
+        )
+    )
+
+    assert bot.messages == [
+        {"chat_id": 456, "text": "*broken", "parse_mode": ParseMode.MARKDOWN},
+        {"chat_id": 456, "text": "*broken"},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_telegram_adapter_shows_typing_when_generation_starts() -> None:
+    bot = RecordingTelegramBot()
+    adapter = adapter_with_bot(bot)
+
+    await adapter.handle_generation_started(
+        events.AgentGenerationStarted(
+            user_id="u:123",
+            conversation_id="tg:456",
+            generation=1,
+            reply_target=TelegramReplyTarget(chat_id=456),
+        )
+    )
+
+    assert bot.actions == [{"chat_id": 456, "action": ChatAction.TYPING}]
+
+
+def test_harness_app_does_not_own_telegram_outbound_reply_logic() -> None:
+    assert not hasattr(HarnessApp, "_send_telegram_reply")
 
 
 def test_cli_adapter_only_creates_event() -> None:
@@ -227,3 +294,33 @@ class RecordingDockerRunner:
     ) -> DockerProcessResult:
         self.calls.append((argv, stdin))
         return self._results.pop(0)
+
+
+class CurrentTurnCoordinator:
+    async def is_current(self, conversation_id: str, generation: int) -> bool:
+        return True
+
+
+class RecordingTelegramBot:
+    def __init__(self, *, fail_markdown: bool = False) -> None:
+        self._fail_markdown = fail_markdown
+        self.messages: list[dict[str, object]] = []
+        self.actions: list[dict[str, object]] = []
+
+    async def send_message(self, **kwargs) -> None:
+        self.messages.append(kwargs)
+        if self._fail_markdown and kwargs.get("parse_mode") is not None:
+            raise TelegramBadRequest(
+                method=SimpleNamespace(),
+                message="Bad Request: can't parse entities",
+            )
+
+    async def send_chat_action(self, **kwargs) -> None:
+        self.actions.append(kwargs)
+
+
+def adapter_with_bot(bot: RecordingTelegramBot) -> AiogramTelegramAdapter:
+    adapter = AiogramTelegramAdapter.__new__(AiogramTelegramAdapter)
+    adapter._bot = bot
+    adapter._turn_coordinator = CurrentTurnCoordinator()
+    return adapter
