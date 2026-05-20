@@ -107,7 +107,11 @@ async def test_every_exposed_tool_completes_through_agent_turn_handler(tmp_path:
         LlmToolCall(call_id="file-glob", name="file.glob", input=FileGlobInput(pattern="*.txt")),
         LlmToolCall(call_id="file-grep", name="file.grep", input=FileGrepInput(pattern="one", path="/workspace")),
         LlmToolCall(call_id="file-list", name="file.list", input=FileListInput(path="/workspace")),
-        LlmToolCall(call_id="web-fetch", name="web.fetch", input=WebFetchInput(url="http://local.test")),
+        LlmToolCall(
+            call_id="web-fetch",
+            name="web.fetch",
+            input=WebFetchInput(url="http://local.test", prompt="Extract the local test value."),
+        ),
         LlmToolCall(call_id="task-create", name="task.create", input=TaskCreateInput(title="new")),
         LlmToolCall(call_id="task-get", name="task.get", input=TaskGetInput(task_id=existing_task.id)),
         LlmToolCall(call_id="task-list", name="task.list", input=TaskListInput(include_stopped=True)),
@@ -217,8 +221,14 @@ async def test_every_exposed_tool_completes_through_agent_turn_handler(tmp_path:
 
 
 class FakeWebFetcher:
-    async def fetch(self, input: WebFetchInput) -> RuntimeToolResult:
-        return RuntimeToolResult(stdout=f"fetched:{input.url}")
+    async def fetch_markdown(self, input: WebFetchInput):
+        return FakeWebFetchedPage(url=input.url, markdown=f"fetched:{input.url}")
+
+
+class FakeWebFetchedPage:
+    def __init__(self, *, url: str, markdown: str) -> None:
+        self.url = url
+        self.markdown = markdown
 
 
 class FakeMcpManager:
