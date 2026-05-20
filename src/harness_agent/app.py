@@ -128,6 +128,7 @@ class HarnessApp:
             token=self._config.telegram.bot_token,
             bus=self.bus,
         )
+        self.telegram.register_outbound_handlers()
         self.scheduler_service = SchedulerService(
             pump=SchedulerPump(store=self.schedule_store, bus=self.bus),
             poll_seconds=self._config.scheduler.poll_seconds,
@@ -181,23 +182,7 @@ class HarnessApp:
             AgentTurnRequested,
             agent_turn_handler.handle_agent_turn,
         )
-        self.bus.subscribe(AssistantTextProduced, self._send_telegram_reply)
         self.bus.subscribe(AssistantTextProduced, self._send_cli_reply)
-
-    async def _send_telegram_reply(self, event: AssistantTextProduced) -> tuple:
-        if event.reply_target is None:
-            return ()
-        if event.reply_target.kind != "telegram":
-            return ()
-        if not await self.turn_coordinator.is_current(
-            event.conversation_id,
-            event.generation,
-        ):
-            return ()
-        if self.telegram is None:
-            raise RuntimeError("telegram adapter is not running")
-        await self.telegram.send_assistant_text(event)
-        return ()
 
     async def _send_cli_reply(self, event: AssistantTextProduced) -> tuple:
         if event.reply_target is None:
