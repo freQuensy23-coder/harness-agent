@@ -7,6 +7,7 @@ from uuid import uuid4
 import pytest
 
 from harness_agent.context import ContextBuilder
+from harness_agent.llm import AssistantText, FakeLlmClient
 from harness_agent.mcp import McpManager
 from harness_agent.runtime import DockerUserRuntime, SQLiteSpawnedProcessStore
 from harness_agent.tasks import SQLiteTaskStore
@@ -155,8 +156,12 @@ async def test_all_container_tools_skills_soul_and_mcp_work_in_docker(docker_run
 
 @pytest.mark.asyncio
 async def test_web_fetch_and_task_tools_work(local_http_server, tmp_path):
-    fetched = await HttpxWebFetcher().fetch(WebFetchInput(url=local_http_server))
+    llm = FakeLlmClient([AssistantText(text="web-fetch-ok")])
+    fetched = await HttpxWebFetcher(llm=llm).fetch(
+        WebFetchInput(url=local_http_server, prompt="Return the page text.")
+    )
     assert fetched.stdout == "web-fetch-ok"
+    assert "web-fetch-ok" in llm.requests[0].messages[0].text
 
     store = SQLiteTaskStore(tmp_path / "tasks.sqlite3")
     task = await store.create(

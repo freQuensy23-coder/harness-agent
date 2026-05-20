@@ -633,20 +633,22 @@ class DockerUserRuntime(UserRuntime):
         cwd = _workspace_path(input.cwd)
         code = (
             "import glob, sys;"
-            "pattern=sys.argv[1]; limit=int(sys.argv[2]);"
-            "print('\\n'.join(sorted(glob.glob(pattern, recursive=True))[:limit]))"
+            "pattern=sys.argv[1];"
+            "print('\\n'.join(sorted(glob.glob(pattern, recursive=True))))"
         )
         return await self._exec(
             user_id,
-            ["python", "-c", code, input.pattern, str(input.max_results)],
+            ["python", "-c", code, input.pattern],
             workdir=cwd,
         )
 
     async def file_grep(self, user_id: str, input: FileGrepInput) -> RuntimeToolResult:
         path = _workspace_path(input.path)
         command = (
-            f"grep -RIn -- {shlex.quote(input.pattern)} {shlex.quote(path)} "
-            f"| head -n {int(input.max_results)}"
+            f"grep -RIn -- {shlex.quote(input.pattern)} {shlex.quote(path)}; "
+            "code=$?; "
+            'if [ "$code" -eq 1 ]; then exit 0; fi; '
+            'exit "$code"'
         )
         return await self._exec(user_id, ["sh", "-lc", command])
 
@@ -654,7 +656,7 @@ class DockerUserRuntime(UserRuntime):
         path = _workspace_path(input.path)
         command = (
             f"find {shlex.quote(path)} -maxdepth 1 -mindepth 1 "
-            f"| sort | head -n {int(input.max_results)}"
+            "| sort"
         )
         return await self._exec(user_id, ["sh", "-lc", command])
 
@@ -912,7 +914,7 @@ class FakeUserRuntime(UserRuntime):
             for line_no, line in enumerate(content.splitlines(), start=1):
                 if input.pattern in line:
                     lines.append(f"{path}:{line_no}:{line}")
-        return RuntimeToolResult(stdout="\n".join(lines[: input.max_results]))
+        return RuntimeToolResult(stdout="\n".join(lines))
 
     async def file_list(self, user_id: str, input: FileListInput) -> RuntimeToolResult:
         return RuntimeToolResult(
