@@ -4,12 +4,19 @@ from pathlib import Path
 import aiosqlite
 import pytest
 
-from harness_agent.llm import AssistantMessage, UserMessage
+from harness_agent.config import LlmConfig, load_config
+from harness_agent.llm import (
+    AssistantMessage,
+    LlmRequest,
+    UserMessage,
+    estimate_request_tokens,
+)
 from harness_agent.projections import (
     CONTEXT_SUMMARY_KIND,
     ConversationItemRecord,
     SQLiteConversationProjection,
 )
+from harness_agent.tools import default_tool_registry
 
 
 async def _seed_conversation(
@@ -302,3 +309,80 @@ async def test_append_compacted_returns_false_when_max_sequence_changed(tmp_path
         row = await cursor.fetchone()
     assert row is not None
     assert row[0] == 0
+
+
+def test_estimate_request_tokens_counts_system_messages_and_tools(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    requested_models: list[str] = []
+    encoded_parts: list[str] = []
+
+    class RecordingTokenizer:
+        def encode(self, value: str) -> list[int]:
+            encoded_parts.append(value)
+            return list(range(len(value.split())))
+
+    def encoding_for_model(model: str) -> RecordingTokenizer:
+        requested_models.append(model)
+        return RecordingTokenizer()
+
+    monkeypatch.setattr(
+        "harness_agent.llm.tiktoken.encoding_for_model",
+        encoding_for_model,
+    )
+
+    shell_exec_tool = default_tool_registry().by_name("shell.exec")
+    request = LlmRequest(
+        user_id="u:1",
+        conversation_id="cli:1",
+        generation=1,
+        system="system prompt",
+        messages=[UserMessage(text="hello user"), AssistantMessage(text="hi there")],
+        tools=[shell_exec_tool],
+    )
+
+    tokens = estimate_request_tokens(request)
+
+    assert requested_models == ["gpt-5"]
+    # System prompt, each message (json-dumped), each tool (json-dumped) all tokenized.
+    assert "system prompt" in encoded_parts
+    assert any("hello user" in part for part in encoded_parts)
+    assert any("hi there" in part for part in encoded_parts)
+    assert any("shell__exec" in part for part in encoded_parts)
+    # 1 system + 2 messages + 1 tool = 4 parts encoded.
+    assert len(encoded_parts) == 4
+    assert tokens > 0
+
+
+def test_config_loads_compaction_knobs_with_defaults(tmp_path: Path) -> None:
+    config_path = tmp_path / "harness.yaml"
+    config_path.write_text("llm:\n  api_key: test-key\n", encoding="utf-8")
+
+    config = load_config(config_path)
+
+    assert config.llm.max_tokens_per_model == 128_000
+    assert config.llm.compaction_reserve_tokens == 15_000
+    assert config.llm.compaction_keep_last_user_messages == 2
+
+    override_path = tmp_path / "harness-override.yaml"
+    override_path.write_text(
+        """
+llm:
+  api_key: test-key
+  max_tokens_per_model: 50000
+  compaction_reserve_tokens: 5000
+  compaction_keep_last_user_messages: 5
+""",
+        encoding="utf-8",
+    )
+
+    override = load_config(override_path)
+    assert override.llm.max_tokens_per_model == 50_000
+    assert override.llm.compaction_reserve_tokens == 5_000
+    assert override.llm.compaction_keep_last_user_messages == 5
+
+    # Direct construction also exposes the defaults.
+    defaults = LlmConfig()
+    assert defaults.max_tokens_per_model == 128_000
+    assert defaults.compaction_reserve_tokens == 15_000
+    assert defaults.compaction_keep_last_user_messages == 2
