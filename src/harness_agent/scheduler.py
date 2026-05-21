@@ -3,7 +3,7 @@ import json
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any, Literal, cast
+from typing import Any, Literal
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
@@ -12,6 +12,7 @@ from croniter import croniter
 from pydantic import BaseModel, TypeAdapter
 
 from harness_agent.bus import EventBus
+from harness_agent.db import fetchall_rows
 from harness_agent.events import EventBase, ReplyTarget, ScheduledMessageDue, UserTextReceived
 
 
@@ -103,55 +104,51 @@ class SQLiteScheduleStore:
         await self._ensure_schema()
         status_clause = "" if include_stopped else "and status = 'active'"
         async with aiosqlite.connect(self._path) as db:
-            rows = cast(
-                list[tuple[Any, ...]],
-                await db.execute_fetchall(
-                    f"""
-                    select
-                        id,
-                        user_id,
-                        conversation_id,
-                        kind,
-                        status,
-                        message,
-                        next_run_at,
-                        reply_target_json,
-                        cron,
-                        timezone
-                    from scheduled_messages
-                    where user_id = ?
-                      and conversation_id = ?
-                      {status_clause}
-                    order by created_at asc
-                    """,
-                    (user_id, conversation_id),
-                ),
+            rows = await fetchall_rows(
+                db,
+                f"""
+                select
+                    id,
+                    user_id,
+                    conversation_id,
+                    kind,
+                    status,
+                    message,
+                    next_run_at,
+                    reply_target_json,
+                    cron,
+                    timezone
+                from scheduled_messages
+                where user_id = ?
+                  and conversation_id = ?
+                  {status_clause}
+                order by created_at asc
+                """,
+                (user_id, conversation_id),
             )
         return [self._row_to_schedule(row) for row in rows]
 
     async def get(self, schedule_id: str) -> ScheduledMessage:
         await self._ensure_schema()
         async with aiosqlite.connect(self._path) as db:
-            rows = cast(
-                list[tuple[Any, ...]],
-                await db.execute_fetchall(
-                    """
-                    select
-                        id,
-                        user_id,
-                        conversation_id,
-                        kind,
-                        status,
-                        message,
-                        next_run_at,
-                        reply_target_json,
-                        cron,
-                        timezone
-                    from scheduled_messages
-                    where id = ?
-                    """,
-                    (schedule_id,),
-                ),
+            rows = await fetchall_rows(
+                db,
+                """
+                select
+                    id,
+                    user_id,
+                    conversation_id,
+                    kind,
+                    status,
+                    message,
+                    next_run_at,
+                    reply_target_json,
+                    cron,
+                    timezone
+                from scheduled_messages
+                where id = ?
+                """,
+                (schedule_id,),
             )
         if not rows:
             raise KeyError(schedule_id)
@@ -184,28 +181,26 @@ class SQLiteScheduleStore:
         now = now.astimezone(UTC)
         async with aiosqlite.connect(self._path) as db:
             await db.execute("begin immediate")
-            rows = cast(
-                list[tuple[Any, ...]],
-                await db.execute_fetchall(
-                    """
-                    select
-                        id,
-                        user_id,
-                        conversation_id,
-                        kind,
-                        status,
-                        message,
-                        next_run_at,
-                        reply_target_json,
-                        cron,
-                        timezone
-                    from scheduled_messages
-                    where status = 'active'
-                      and next_run_at <= ?
-                    order by next_run_at asc
-                    """,
-                    (now.isoformat(),),
-                ),
+            rows = await fetchall_rows(
+                db,
+                """
+                select
+                    id,
+                    user_id,
+                    conversation_id,
+                    kind,
+                    status,
+                    message,
+                    next_run_at,
+                    reply_target_json,
+                    cron,
+                    timezone
+                from scheduled_messages
+                where status = 'active'
+                  and next_run_at <= ?
+                order by next_run_at asc
+                """,
+                (now.isoformat(),),
             )
             schedules = [self._row_to_schedule(row) for row in rows]
             for schedule in schedules:

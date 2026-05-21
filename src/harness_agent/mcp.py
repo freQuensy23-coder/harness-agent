@@ -2,7 +2,7 @@ import asyncio
 import json
 from typing import Any, cast
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from harness_agent.mcp_models import McpServerConfig
 from harness_agent.runtime import DockerUserRuntime, RuntimeToolResult
@@ -13,6 +13,25 @@ class McpToolDefinition(BaseModel):
     name: str
     description: str
     input_schema: dict[str, Any]
+
+
+class _McpToolPayload(BaseModel):
+    name: str
+    description: str
+    input_schema: dict[str, Any] = Field(alias="inputSchema")
+
+
+class _McpToolListResponse(BaseModel):
+    tools: list[_McpToolPayload]
+
+
+class _McpContentItem(BaseModel):
+    type: str
+    text: str | None = None
+
+
+class _McpCallToolResponse(BaseModel):
+    content: list[_McpContentItem]
 
 
 class McpStdioSession:
@@ -39,14 +58,14 @@ class McpStdioSession:
 
     async def list_tools(self) -> list[McpToolDefinition]:
         response = await self._request("tools/list", {})
-        tools = cast(list[dict[str, Any]], response["tools"])
+        parsed = _McpToolListResponse.model_validate(response)
         return [
             McpToolDefinition(
-                name=cast(str, tool["name"]),
-                description=cast(str, tool["description"]),
-                input_schema=cast(dict[str, Any], tool["inputSchema"]),
+                name=tool.name,
+                description=tool.description,
+                input_schema=tool.input_schema,
             )
-            for tool in tools
+            for tool in parsed.tools
         ]
 
     async def call_tool(self, name: str, arguments: dict[str, Any]) -> RuntimeToolResult:
@@ -54,12 +73,8 @@ class McpStdioSession:
             "tools/call",
             {"name": name, "arguments": arguments},
         )
-        content = cast(list[dict[str, Any]], response["content"])
-        text_parts: list[str] = [
-            cast(str, item["text"])
-            for item in content
-            if item["type"] == "text"
-        ]
+        parsed = _McpCallToolResponse.model_validate(response)
+        text_parts = [item.text for item in parsed.content if item.type == "text" and item.text is not None]
         return RuntimeToolResult(stdout="\n".join(text_parts))
 
     async def _request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:

@@ -1,13 +1,14 @@
 import asyncio
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Literal, cast
+from typing import Any, Literal
 from uuid import uuid4
 
 import aiosqlite
 from pydantic import BaseModel
 
 from harness_agent.bus import EventBus
+from harness_agent.db import fetchall_rows
 from harness_agent.events import (
     AssistantTextProduced,
     EventBase,
@@ -115,28 +116,26 @@ class SQLiteSubAgentStore:
     async def get(self, agent_id: str) -> SubAgentRecord | None:
         await self._ensure_schema()
         async with aiosqlite.connect(self._path) as db:
-            rows = cast(
-                list[tuple[Any, ...]],
-                await db.execute_fetchall(
-                    """
-                    select
-                        id,
-                        user_id,
-                        parent_conversation_id,
-                        child_conversation_id,
-                        parent_call_id,
-                        name,
-                        prompt,
-                        status,
-                        result,
-                        error,
-                        created_at,
-                        updated_at
-                    from sub_agents
-                    where id = ?
-                    """,
-                    (agent_id,),
-                ),
+            rows = await fetchall_rows(
+                db,
+                """
+                select
+                    id,
+                    user_id,
+                    parent_conversation_id,
+                    child_conversation_id,
+                    parent_call_id,
+                    name,
+                    prompt,
+                    status,
+                    result,
+                    error,
+                    created_at,
+                    updated_at
+                from sub_agents
+                where id = ?
+                """,
+                (agent_id,),
             )
         if not rows:
             return None
@@ -151,30 +150,28 @@ class SQLiteSubAgentStore:
     ) -> SubAgentRecord | None:
         await self._ensure_schema()
         async with aiosqlite.connect(self._path) as db:
-            rows = cast(
-                list[tuple[Any, ...]],
-                await db.execute_fetchall(
-                    """
-                    select
-                        id,
-                        user_id,
-                        parent_conversation_id,
-                        child_conversation_id,
-                        parent_call_id,
-                        name,
-                        prompt,
-                        status,
-                        result,
-                        error,
-                        created_at,
-                        updated_at
-                    from sub_agents
-                    where id = ?
-                      and user_id = ?
-                      and parent_conversation_id = ?
-                    """,
-                    (agent_id, user_id, parent_conversation_id),
-                ),
+            rows = await fetchall_rows(
+                db,
+                """
+                select
+                    id,
+                    user_id,
+                    parent_conversation_id,
+                    child_conversation_id,
+                    parent_call_id,
+                    name,
+                    prompt,
+                    status,
+                    result,
+                    error,
+                    created_at,
+                    updated_at
+                from sub_agents
+                where id = ?
+                  and user_id = ?
+                  and parent_conversation_id = ?
+                """,
+                (agent_id, user_id, parent_conversation_id),
             )
         if not rows:
             return None
@@ -205,30 +202,28 @@ class SQLiteSubAgentStore:
         parent_conversation_id: str,
     ) -> list[SubAgentRecord]:
         async with aiosqlite.connect(self._path) as db:
-            rows = cast(
-                list[tuple[Any, ...]],
-                await db.execute_fetchall(
-                    """
-                    select
-                        id,
-                        user_id,
-                        parent_conversation_id,
-                        child_conversation_id,
-                        parent_call_id,
-                        name,
-                        prompt,
-                        status,
-                        result,
-                        error,
-                        created_at,
-                        updated_at
-                    from sub_agents
-                    where user_id = ?
-                      and parent_conversation_id = ?
-                    order by created_at asc
-                    """,
-                    (user_id, parent_conversation_id),
-                ),
+            rows = await fetchall_rows(
+                db,
+                """
+                select
+                    id,
+                    user_id,
+                    parent_conversation_id,
+                    child_conversation_id,
+                    parent_call_id,
+                    name,
+                    prompt,
+                    status,
+                    result,
+                    error,
+                    created_at,
+                    updated_at
+                from sub_agents
+                where user_id = ?
+                  and parent_conversation_id = ?
+                order by created_at asc
+                """,
+                (user_id, parent_conversation_id),
             )
         return [_record_from_row(row) for row in rows]
 
@@ -239,31 +234,29 @@ class SQLiteSubAgentStore:
         parent_conversation_id: str,
     ) -> list[SubAgentRecord]:
         async with aiosqlite.connect(self._path) as db:
-            rows = cast(
-                list[tuple[Any, ...]],
-                await db.execute_fetchall(
-                    """
-                    select
-                        id,
-                        user_id,
-                        parent_conversation_id,
-                        child_conversation_id,
-                        parent_call_id,
-                        name,
-                        prompt,
-                        status,
-                        result,
-                        error,
-                        created_at,
-                        updated_at
-                    from sub_agents
-                    where user_id = ?
-                      and parent_conversation_id = ?
-                      and status = ?
-                    order by created_at asc
-                    """,
-                    (user_id, parent_conversation_id, "running"),
-                ),
+            rows = await fetchall_rows(
+                db,
+                """
+                select
+                    id,
+                    user_id,
+                    parent_conversation_id,
+                    child_conversation_id,
+                    parent_call_id,
+                    name,
+                    prompt,
+                    status,
+                    result,
+                    error,
+                    created_at,
+                    updated_at
+                from sub_agents
+                where user_id = ?
+                  and parent_conversation_id = ?
+                  and status = ?
+                order by created_at asc
+                """,
+                (user_id, parent_conversation_id, "running"),
             )
         return [_record_from_row(row) for row in rows]
 

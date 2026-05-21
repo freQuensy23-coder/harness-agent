@@ -1,10 +1,11 @@
 import json
 from pathlib import Path
-from typing import Any, cast
 from uuid import uuid4
 
 import aiosqlite
 from pydantic import BaseModel
+
+from harness_agent.db import fetchall_rows
 
 
 class Task(BaseModel):
@@ -49,16 +50,14 @@ class SQLiteTaskStore:
     async def get(self, *, task_id: str, user_id: str, conversation_id: str) -> Task | None:
         await self._ensure_schema()
         async with aiosqlite.connect(self._path) as db:
-            rows = cast(
-                list[tuple[Any, ...]],
-                await db.execute_fetchall(
-                    """
-                    select id, user_id, conversation_id, title, status
-                    from tasks
-                    where id = ? and user_id = ? and conversation_id = ?
-                    """,
-                    (task_id, user_id, conversation_id),
-                ),
+            rows = await fetchall_rows(
+                db,
+                """
+                select id, user_id, conversation_id, title, status
+                from tasks
+                where id = ? and user_id = ? and conversation_id = ?
+                """,
+                (task_id, user_id, conversation_id),
             )
         if not rows:
             return None
@@ -85,17 +84,15 @@ class SQLiteTaskStore:
             where += " and status != ?"
             params.append("stopped")
         async with aiosqlite.connect(self._path) as db:
-            rows = cast(
-                list[tuple[Any, ...]],
-                await db.execute_fetchall(
-                    f"""
-                    select id, user_id, conversation_id, title, status
-                    from tasks
-                    where {where}
-                    order by sequence asc
-                    """,
-                    params,
-                ),
+            rows = await fetchall_rows(
+                db,
+                f"""
+                select id, user_id, conversation_id, title, status
+                from tasks
+                where {where}
+                order by sequence asc
+                """,
+                params,
             )
         return [
             Task(

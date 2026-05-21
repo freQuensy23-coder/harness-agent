@@ -7,7 +7,7 @@ import shlex
 from collections.abc import Sequence
 from pathlib import Path
 from pathlib import PurePosixPath
-from typing import Any, Protocol, cast
+from typing import Any, Protocol
 from uuid import uuid4
 
 import aiosqlite
@@ -17,6 +17,7 @@ from pydantic import BaseModel, Field
 
 from harness_agent.context import AgentFileSet, Skill, UserContextRuntime
 from harness_agent.content import WorkspaceFile
+from harness_agent.db import fetchall_rows
 from harness_agent.mcp_models import McpServerConfig
 from harness_agent.text import as_str
 from harness_agent.tools import (
@@ -148,28 +149,26 @@ class SQLiteSpawnedProcessStore:
     async def get(self, *, process_id: str, user_id: str) -> SpawnedProcessRecord | None:
         await self._ensure_schema()
         async with aiosqlite.connect(self._path) as db:
-            rows = cast(
-                list[tuple[Any, ...]],
-                await db.execute_fetchall(
-                    """
-                    select
-                        process_id,
-                        user_id,
-                        container_name,
-                        command,
-                        cwd,
-                        base_path,
-                        stdout_path,
-                        stderr_path,
-                        pid_path,
-                        exit_code_path,
-                        stdout_offset,
-                        stderr_offset
-                    from spawned_processes
-                    where process_id = ? and user_id = ?
-                    """,
-                    (process_id, user_id),
-                ),
+            rows = await fetchall_rows(
+                db,
+                """
+                select
+                    process_id,
+                    user_id,
+                    container_name,
+                    command,
+                    cwd,
+                    base_path,
+                    stdout_path,
+                    stderr_path,
+                    pid_path,
+                    exit_code_path,
+                    stdout_offset,
+                    stderr_offset
+                from spawned_processes
+                where process_id = ? and user_id = ?
+                """,
+                (process_id, user_id),
             )
         if not rows:
             return None
@@ -872,10 +871,7 @@ class FakeUserRuntime(UserRuntime):
         return RuntimeToolResult()
 
     async def file_read(self, user_id: str, input: FileReadInput) -> RuntimeToolResult:
-        content = self._files[input.path]
-        if isinstance(content, bytes):
-            return RuntimeToolResult(stdout=content.decode("utf-8", errors="replace"))
-        return RuntimeToolResult(stdout=content)
+        return RuntimeToolResult(stdout=as_str(self._files[input.path]))
 
     async def file_write(self, user_id: str, input: FileWriteInput) -> RuntimeToolResult:
         self.file_write_calls.append(input)
