@@ -21,6 +21,8 @@ from harness_agent.events import (
 from harness_agent.handlers import (
     AgentTurnHandler,
     ConversationProjector,
+)
+from harness_agent.turn_runner import (
     SUB_AGENT_SYSTEM_PREFIX,
     SUB_AGENT_TASK_PREFIX,
 )

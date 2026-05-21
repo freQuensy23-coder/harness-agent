@@ -6,6 +6,7 @@ from loguru import logger
 from harness_agent.adapters.cli import event_from_cli_send
 from harness_agent.adapters.telegram import AiogramTelegramAdapter
 from harness_agent.bus import EventBus
+from harness_agent.compaction import ContextCompactionConfig, ContextCompactor
 from harness_agent.config import HarnessConfig
 from harness_agent.context import ContextBuilder
 from harness_agent.events import (
@@ -162,6 +163,16 @@ class HarnessApp:
             mcp_manager=self.mcp_manager,
             turn_coordinator=self.turn_coordinator,
             tool_results=self.tool_results,
+            compactor=ContextCompactor(
+                projection=self.projection,
+                runtime=self.runtime,
+                llm=self.llm,
+                config=ContextCompactionConfig(
+                    max_tokens_per_model=self._config.llm.max_tokens_per_model,
+                    reserve_tokens=self._config.llm.compaction_reserve_tokens,
+                    keep_last_messages=self._config.llm.compaction_keep_last_messages,
+                ),
+            ),
             sub_agent_lookup=self.sub_agents,
         )
         tool_call_executor = ToolCallExecutor(

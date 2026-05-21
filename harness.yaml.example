@@ -9,6 +9,9 @@ llm:
   base_url: https://openrouter.ai/api/v1
   api_key: replace-me
   model: z-ai/glm-5v-turbo
+  max_tokens_per_model: 128000
+  compaction_reserve_tokens: 15000
+  compaction_keep_last_messages: 2
 
 telegram:
   enabled: false

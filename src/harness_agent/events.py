@@ -93,6 +93,16 @@ class AgentGenerationStarted(EventBase):
     reply_target: ReplyTarget | None = None
 
 
+class ContextCompacting(EventBase):
+    type: Literal["context.compacting"] = "context.compacting"
+    user_id: str
+    conversation_id: str
+    generation: int
+    token_estimate: int
+    threshold: int
+    keep_last_messages: int
+
+
 class ToolCallRequested(EventBase):
     type: Literal["tool.call.requested"] = "tool.call.requested"
     user_id: str
@@ -234,6 +244,7 @@ AgentEvent = Annotated[
     | AgentTurnRequested
     | AgentTurnSuperseded
     | AgentGenerationStarted
+    | ContextCompacting
     | ToolCallRequested
     | ToolCallError
     | ToolCallCompleted

@@ -29,11 +29,13 @@ class FakeUserRuntime(UserRuntime):
         agent_files: AgentFileSet | None = None,
         skills: Sequence[Skill] = (),
         shell_results: Sequence[RuntimeToolResult] = (),
+        file_write_results: Sequence[RuntimeToolResult | Exception] = (),
     ) -> None:
         self._files = {} if files is None else files
         self._agent_files = agent_files
         self._skills = list(skills)
         self._shell_results = list(shell_results)
+        self._file_write_results: list[RuntimeToolResult | Exception] = list(file_write_results)
         self.read_agent_files_calls: list[str] = []
         self.list_skills_calls: list[str] = []
         self.shell_exec_calls: list[ShellExecInput] = []
@@ -116,6 +118,11 @@ class FakeUserRuntime(UserRuntime):
 
     async def file_write(self, user_id: str, input: FileWriteInput) -> RuntimeToolResult:
         self.file_write_calls.append(input)
+        if self._file_write_results:
+            next_result = self._file_write_results.pop(0)
+            if isinstance(next_result, Exception):
+                raise next_result
+            return next_result
         self._files[input.path] = input.content
         return RuntimeToolResult()
 
