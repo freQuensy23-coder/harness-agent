@@ -85,6 +85,14 @@ class AgentTurnSuperseded(EventBase):
     reason: Literal["newer_user_message"] = "newer_user_message"
 
 
+class AgentGenerationStarted(EventBase):
+    type: Literal["agent.generation.started"] = "agent.generation.started"
+    user_id: str
+    conversation_id: str
+    generation: int
+    reply_target: ReplyTarget | None = None
+
+
 class ToolCallRequested(EventBase):
     type: Literal["tool.call.requested"] = "tool.call.requested"
     user_id: str
@@ -203,6 +211,7 @@ AgentEvent = Annotated[
     | UserTextReceived
     | AgentTurnRequested
     | AgentTurnSuperseded
+    | AgentGenerationStarted
     | ToolCallRequested
     | ToolCallError
     | ToolCallCompleted
