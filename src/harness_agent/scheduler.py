@@ -3,7 +3,7 @@ import json
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
@@ -12,6 +12,7 @@ from croniter import croniter
 from pydantic import BaseModel, TypeAdapter
 
 from harness_agent.bus import EventBus
+from harness_agent.db import fetchall_rows
 from harness_agent.events import EventBase, ReplyTarget, ScheduledMessageDue, UserTextReceived
 
 
@@ -41,7 +42,7 @@ class SQLiteScheduleStore:
     ) -> None:
         self._path = path
         self._now = utc_now if now is None else now
-        self._reply_target_adapter = TypeAdapter(ReplyTarget)
+        self._reply_target_adapter: TypeAdapter[ReplyTarget] = TypeAdapter(ReplyTarget)
 
     async def create_once(
         self,
@@ -103,7 +104,8 @@ class SQLiteScheduleStore:
         await self._ensure_schema()
         status_clause = "" if include_stopped else "and status = 'active'"
         async with aiosqlite.connect(self._path) as db:
-            rows = await db.execute_fetchall(
+            rows = await fetchall_rows(
+                db,
                 f"""
                 select
                     id,
@@ -129,7 +131,8 @@ class SQLiteScheduleStore:
     async def get(self, schedule_id: str) -> ScheduledMessage:
         await self._ensure_schema()
         async with aiosqlite.connect(self._path) as db:
-            rows = await db.execute_fetchall(
+            rows = await fetchall_rows(
+                db,
                 """
                 select
                     id,
@@ -178,7 +181,8 @@ class SQLiteScheduleStore:
         now = now.astimezone(UTC)
         async with aiosqlite.connect(self._path) as db:
             await db.execute("begin immediate")
-            rows = await db.execute_fetchall(
+            rows = await fetchall_rows(
+                db,
                 """
                 select
                     id,
@@ -277,8 +281,8 @@ class SQLiteScheduleStore:
             await db.commit()
         return await self.get(schedule_id)
 
-    def _row_to_schedule(self, row) -> ScheduledMessage:
-        reply_target = None
+    def _row_to_schedule(self, row: tuple[Any, ...]) -> ScheduledMessage:
+        reply_target: ReplyTarget | None = None
         if row[7] is not None:
             reply_target = self._reply_target_adapter.validate_python(json.loads(row[7]))
         return ScheduledMessage(
@@ -360,7 +364,7 @@ class SchedulerService:
     def __init__(self, *, pump: SchedulerPump, poll_seconds: float) -> None:
         self._pump = pump
         self._poll_seconds = poll_seconds
-        self._task: asyncio.Task | None = None
+        self._task: asyncio.Task[None] | None = None
 
     async def start(self) -> None:
         self._task = asyncio.create_task(self._run())

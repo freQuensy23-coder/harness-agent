@@ -19,15 +19,13 @@ class AsyncioDockerRunner:
         )
         if timeout_seconds is None:
             stdout, stderr = await process.communicate(stdin)
-            return DockerProcessResult(
-                stdout=stdout.decode("utf-8", errors="replace"),
-                stderr=stderr.decode("utf-8", errors="replace"),
-                exit_code=process.returncode,
+        else:
+            stdout, stderr = await asyncio.wait_for(
+                process.communicate(stdin),
+                timeout=timeout_seconds,
             )
-        stdout, stderr = await asyncio.wait_for(
-            process.communicate(stdin),
-            timeout=timeout_seconds,
-        )
+        if process.returncode is None:
+            raise RuntimeError(f"subprocess {argv[0]} did not exit")
         return DockerProcessResult(
             stdout=stdout.decode("utf-8", errors="replace"),
             stderr=stderr.decode("utf-8", errors="replace"),

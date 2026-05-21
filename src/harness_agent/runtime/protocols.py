@@ -29,16 +29,13 @@ class DockerRunner(Protocol):
         *,
         stdin: bytes | None = None,
         timeout_seconds: int | None = None,
-    ) -> DockerProcessResult:
-        pass
+    ) -> DockerProcessResult: ...
 
 
 class SpawnedProcessStore(Protocol):
-    async def create(self, record: SpawnedProcessRecord) -> SpawnedProcessRecord:
-        pass
+    async def create(self, record: SpawnedProcessRecord) -> SpawnedProcessRecord: ...
 
-    async def get(self, *, process_id: str, user_id: str) -> SpawnedProcessRecord | None:
-        pass
+    async def get(self, *, process_id: str, user_id: str) -> SpawnedProcessRecord | None: ...
 
     async def update_offsets(
         self,
@@ -47,11 +44,9 @@ class SpawnedProcessStore(Protocol):
         user_id: str,
         stdout_offset: int,
         stderr_offset: int,
-    ) -> None:
-        pass
+    ) -> None: ...
 
-    async def delete(self, *, process_id: str, user_id: str) -> None:
-        pass
+    async def delete(self, *, process_id: str, user_id: str) -> None: ...
 
 
 class UserRuntime(UserContextRuntime):

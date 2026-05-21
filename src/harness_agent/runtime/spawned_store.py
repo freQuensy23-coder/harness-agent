@@ -1,7 +1,9 @@
 from pathlib import Path
+from typing import Any
 
 import aiosqlite
 
+from harness_agent.db import fetchall_rows
 from harness_agent.runtime.models import SpawnedProcessRecord
 
 
@@ -38,7 +40,8 @@ class SQLiteSpawnedProcessStore:
     async def get(self, *, process_id: str, user_id: str) -> SpawnedProcessRecord | None:
         await self._ensure_schema()
         async with aiosqlite.connect(self._path) as db:
-            rows = await db.execute_fetchall(
+            rows = await fetchall_rows(
+                db,
                 """
                 select
                     process_id,
@@ -119,7 +122,7 @@ class SQLiteSpawnedProcessStore:
             await db.commit()
 
 
-def _spawned_process_row(record: SpawnedProcessRecord) -> tuple:
+def _spawned_process_row(record: SpawnedProcessRecord) -> tuple[Any, ...]:
     return (
         record.process_id,
         record.user_id,
@@ -136,7 +139,7 @@ def _spawned_process_row(record: SpawnedProcessRecord) -> tuple:
     )
 
 
-def _spawned_process_from_row(row: tuple) -> SpawnedProcessRecord:
+def _spawned_process_from_row(row: tuple[Any, ...]) -> SpawnedProcessRecord:
     return SpawnedProcessRecord(
         process_id=row[0],
         user_id=row[1],

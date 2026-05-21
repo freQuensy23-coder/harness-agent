@@ -23,6 +23,7 @@ from harness_agent.handlers import (
     AgentTurnHandler,
     ContentIngestionHandler,
     ConversationProjector,
+    EventBatch,
     IdentityHandler,
 )
 from harness_agent.identity import StaticIdentityResolver
@@ -138,8 +139,7 @@ class HarnessApp:
         try:
             await self.telegram.start_polling()
         finally:
-            if self.scheduler_service is not None:
-                await self.scheduler_service.stop()
+            await self.scheduler_service.stop()
 
     def _wire(self) -> None:
         identity_handler = IdentityHandler(StaticIdentityResolver())
@@ -184,7 +184,7 @@ class HarnessApp:
         )
         self.bus.subscribe(AssistantTextProduced, self._send_cli_reply)
 
-    async def _send_cli_reply(self, event: AssistantTextProduced) -> tuple:
+    async def _send_cli_reply(self, event: AssistantTextProduced) -> EventBatch:
         if event.reply_target is None:
             return ()
         if event.reply_target.kind != "cli":

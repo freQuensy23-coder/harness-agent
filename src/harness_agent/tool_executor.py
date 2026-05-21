@@ -57,7 +57,7 @@ ToolCallKey = tuple[str, int, str]
 
 class ToolExecutionResult(BaseModel):
     result: RuntimeToolResult
-    attachments: list[ContentRef] = Field(default_factory=list)
+    attachments: list[ContentRef] = Field(default_factory=list[ContentRef])
 
 
 class ToolCallResultWaiter:

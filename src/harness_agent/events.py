@@ -1,5 +1,5 @@
 from datetime import UTC, datetime
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 from uuid import uuid4
 
 from pydantic import BaseModel, Field, ValidationInfo, field_validator
@@ -46,7 +46,7 @@ class TelegramTextReceived(EventBase):
     telegram_chat_id: int
     telegram_message_id: int
     text: str
-    attachments: list[InboundAttachment] = Field(default_factory=list)
+    attachments: list[InboundAttachment] = Field(default_factory=list[InboundAttachment])
 
 
 class CliTextReceived(EventBase):
@@ -63,7 +63,7 @@ class UserTextReceived(EventBase):
     conversation_id: str
     source: Literal["telegram", "cli", "api", "scheduler", "subagent"]
     text: str
-    attachments: list[InboundAttachment] = Field(default_factory=list)
+    attachments: list[InboundAttachment] = Field(default_factory=list[InboundAttachment])
     reply_target: ReplyTarget | None = None
 
 
@@ -105,7 +105,7 @@ class ToolCallRequested(EventBase):
 
     @field_validator("input", mode="before")
     @classmethod
-    def parse_input_for_tool(cls, value, info: ValidationInfo):
+    def parse_input_for_tool(cls, value: Any, info: ValidationInfo) -> Any:
         tool_name = info.data.get("tool_name")
         if tool_name is None:
             return value
@@ -124,7 +124,7 @@ class ToolCallError(EventBase):
 
     @field_validator("input", mode="before")
     @classmethod
-    def parse_input_for_tool(cls, value, info: ValidationInfo):
+    def parse_input_for_tool(cls, value: Any, info: ValidationInfo) -> Any:
         tool_name = info.data.get("tool_name")
         if tool_name is None:
             return value
@@ -140,11 +140,11 @@ class ToolCallCompleted(EventBase):
     tool_name: str
     input: ToolInput
     result: RuntimeToolResult
-    attachments: list[ContentRef] = Field(default_factory=list)
+    attachments: list[ContentRef] = Field(default_factory=list[ContentRef])
 
     @field_validator("input", mode="before")
     @classmethod
-    def parse_input_for_tool(cls, value, info: ValidationInfo):
+    def parse_input_for_tool(cls, value: Any, info: ValidationInfo) -> Any:
         tool_name = info.data.get("tool_name")
         if tool_name is None:
             return value

@@ -1,4 +1,4 @@
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 from pydantic import BaseModel, Field
 
@@ -297,7 +297,7 @@ def parse_known_tool_input(name: str, payload: Any) -> ToolInput:
     input_model = TOOL_INPUT_MODELS.get(name)
     if input_model is None:
         raise ValueError(f"unknown tool: {name}")
-    return input_model.model_validate(payload)
+    return cast(ToolInput, input_model.model_validate(payload))
 
 
 def default_tool_registry() -> ToolRegistry:

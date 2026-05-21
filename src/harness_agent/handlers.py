@@ -300,7 +300,8 @@ class TelegramReplyHandler:
         self._replies = replies
 
     async def handle_assistant_text(self, event: AssistantTextProduced) -> EventBatch:
-        if event.reply_target is None:
+        target = event.reply_target
+        if not isinstance(target, TelegramReplyTarget):
             return ()
-        self._replies.append((event.reply_target.chat_id, event.text))
+        self._replies.append((target.chat_id, event.text))
         return ()

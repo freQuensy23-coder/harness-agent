@@ -5,6 +5,7 @@ from harness_agent.context import AgentFileSet, Skill
 from harness_agent.mcp_models import McpServerConfig
 from harness_agent.runtime.models import RuntimeFileRead, RuntimeToolResult
 from harness_agent.runtime.protocols import UserRuntime
+from harness_agent.text import as_str
 from harness_agent.tools import (
     FileEditInput,
     FileGlobInput,
@@ -53,10 +54,10 @@ class FakeUserRuntime(UserRuntime):
         if missing:
             raise FileNotFoundError(", ".join(missing))
         return AgentFileSet(
-            soul=self._files["/workspace/agent/SOUL.md"],
-            agents=self._files["/workspace/agent/AGENTS.md"],
-            user=self._files["/workspace/agent/USER.md"],
-            tools=self._files["/workspace/agent/TOOLS.md"],
+            soul=as_str(self._files["/workspace/agent/SOUL.md"]),
+            agents=as_str(self._files["/workspace/agent/AGENTS.md"]),
+            user=as_str(self._files["/workspace/agent/USER.md"]),
+            tools=as_str(self._files["/workspace/agent/TOOLS.md"]),
         )
 
     async def list_skills(self, user_id: str) -> list[Skill]:
@@ -90,10 +91,7 @@ class FakeUserRuntime(UserRuntime):
                 )
             )
         content = self._files[path]
-        try:
-            data = content.encode("latin1")
-        except AttributeError:
-            data = content
+        data = content.encode("latin1") if isinstance(content, str) else content
         if max_bytes is None:
             return RuntimeFileRead(file=WorkspaceFile(path=path, content=data))
         return RuntimeFileRead(file=WorkspaceFile(path=path, content=data[:max_bytes]))
@@ -114,12 +112,7 @@ class FakeUserRuntime(UserRuntime):
         return RuntimeToolResult()
 
     async def file_read(self, user_id: str, input: FileReadInput) -> RuntimeToolResult:
-        content = self._files[input.path]
-        try:
-            return RuntimeToolResult(stdout=content.decode("utf-8", errors="replace"))
-        except AttributeError:
-            pass
-        return RuntimeToolResult(stdout=content)
+        return RuntimeToolResult(stdout=as_str(self._files[input.path]))
 
     async def file_write(self, user_id: str, input: FileWriteInput) -> RuntimeToolResult:
         self.file_write_calls.append(input)
@@ -127,7 +120,7 @@ class FakeUserRuntime(UserRuntime):
         return RuntimeToolResult()
 
     async def file_edit(self, user_id: str, input: FileEditInput) -> RuntimeToolResult:
-        content = self._files[input.path]
+        content = as_str(self._files[input.path])
         count = -1 if input.replace_all else 1
         self._files[input.path] = content.replace(input.old, input.new, count)
         return RuntimeToolResult()
@@ -137,7 +130,7 @@ class FakeUserRuntime(UserRuntime):
         user_id: str,
         input: FileMultiEditInput,
     ) -> RuntimeToolResult:
-        content = self._files[input.path]
+        content = as_str(self._files[input.path])
         for edit in input.edits:
             count = -1 if edit.replace_all else 1
             content = content.replace(edit.old, edit.new, count)
@@ -154,7 +147,7 @@ class FakeUserRuntime(UserRuntime):
         for path, content in sorted(self._files.items()):
             if not path.startswith(input.path):
                 continue
-            for line_no, line in enumerate(content.splitlines(), start=1):
+            for line_no, line in enumerate(as_str(content).splitlines(), start=1):
                 if input.pattern in line:
                     lines.append(f"{path}:{line_no}:{line}")
         return RuntimeToolResult(stdout="\n".join(lines))

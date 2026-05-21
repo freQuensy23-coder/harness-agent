@@ -1,5 +1,6 @@
 import base64
 import re
+from typing import Literal
 
 from aiogram import Bot, Dispatcher, Router
 from aiogram.exceptions import TelegramBadRequest
@@ -14,6 +15,7 @@ from harness_agent.events import (
     ReplyTarget,
     TelegramTextReceived,
 )
+from harness_agent.handlers import EventBatch
 
 
 def event_from_aiogram_message(
@@ -57,7 +59,9 @@ async def event_from_aiogram_message_with_files(
     if message.document:
         document = message.document
         mime_type = document.mime_type
-        kind = "image" if mime_type is not None and mime_type.startswith("image/") else "file"
+        kind: Literal["image", "file"] = (
+            "image" if mime_type is not None and mime_type.startswith("image/") else "file"
+        )
         attachments.append(
             await download_attachment(
                 bot=bot,
@@ -79,7 +83,7 @@ async def download_attachment(
     bot: Bot,
     file_id: str,
     file_unique_id: str,
-    kind: str,
+    kind: Literal["image", "file"],
     file_name: str,
     mime_type: str | None,
     size_bytes: int,
@@ -87,7 +91,11 @@ async def download_attachment(
     message_id: int,
 ) -> InboundAttachment:
     telegram_file = await bot.get_file(file_id)
+    if telegram_file.file_path is None:
+        raise RuntimeError(f"Telegram file has no file_path: {file_id}")
     content = await bot.download_file(telegram_file.file_path)
+    if content is None:
+        raise RuntimeError(f"Telegram download_file returned no content: {file_id}")
     data = content.read()
     safe_name = safe_file_name(file_name)
     return InboundAttachment(
@@ -119,20 +127,20 @@ class AiogramTelegramAdapter:
         self._dispatcher.include_router(self._router)
 
     async def start_polling(self) -> None:
-        await self._dispatcher.start_polling(self._bot)
+        await self._dispatcher.start_polling(self._bot)  # pyright: ignore[reportUnknownMemberType]
 
     def register_outbound_handlers(self) -> None:
         self._bus.subscribe(AgentGenerationStarted, self.handle_generation_started)
         self._bus.subscribe(AssistantTextProduced, self.handle_assistant_text)
 
-    async def handle_generation_started(self, event: AgentGenerationStarted) -> tuple:
+    async def handle_generation_started(self, event: AgentGenerationStarted) -> EventBatch:
         chat_id = telegram_chat_id(event.reply_target)
         if chat_id is None:
             return ()
         await self._bot.send_chat_action(chat_id=chat_id, action="typing")
         return ()
 
-    async def handle_assistant_text(self, event: AssistantTextProduced) -> tuple:
+    async def handle_assistant_text(self, event: AssistantTextProduced) -> EventBatch:
         chat_id = telegram_chat_id(event.reply_target)
         if chat_id is None:
             return ()
