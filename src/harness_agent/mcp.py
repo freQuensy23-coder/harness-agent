@@ -125,8 +125,10 @@ class McpManager:
         self,
         *,
         runtime: DockerUserRuntime,
+        global_servers: list[McpServerConfig] | None = None,
     ) -> None:
         self._runtime = runtime
+        self._global_servers = [] if global_servers is None else list(global_servers)
         self._sessions: dict[tuple[str, str], McpStdioSession] = {}
         self._tool_cache: dict[tuple[str, str], list[McpToolDefinition]] = {}
         self._server_cache: dict[tuple[str, str], McpServerConfig] = {}
@@ -184,10 +186,16 @@ class McpManager:
         return self._sessions[key]
 
     async def _servers_for_user(self, user_id: str) -> list[McpServerConfig]:
-        servers = await self._runtime.list_mcp_servers(user_id)
-        for server in servers:
+        user_servers = await self._runtime.list_mcp_servers(user_id)
+        global_names = {server.name for server in self._global_servers}
+        merged: list[McpServerConfig] = list(self._global_servers)
+        for server in user_servers:
+            if server.name in global_names:
+                continue
+            merged.append(server)
+        for server in merged:
             self._server_cache[(user_id, server.name)] = server
-        return servers
+        return merged
 
     async def _server_for_user(
         self,

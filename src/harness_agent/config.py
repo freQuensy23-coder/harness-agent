@@ -3,6 +3,8 @@ from pathlib import Path
 import yaml
 from pydantic import BaseModel, ConfigDict, Field
 
+from harness_agent.mcp_models import McpServerConfig
+
 
 class ServerConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -57,6 +59,12 @@ class SchedulerConfig(BaseModel):
     poll_seconds: float = 5
 
 
+class McpConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    servers: list[McpServerConfig] = Field(default_factory=list[McpServerConfig])
+
+
 class HarnessConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -66,6 +74,7 @@ class HarnessConfig(BaseModel):
     telegram: TelegramConfig = Field(default_factory=TelegramConfig)
     runtime: RuntimeConfig = Field(default_factory=RuntimeConfig)
     scheduler: SchedulerConfig = Field(default_factory=SchedulerConfig)
+    mcp: McpConfig = Field(default_factory=McpConfig)
 
 
 def load_config(path: Path) -> HarnessConfig:
