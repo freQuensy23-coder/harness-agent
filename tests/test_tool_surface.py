@@ -274,6 +274,8 @@ async def test_web_fetch_converts_html_to_markdown_and_filters_with_secondary_mo
     assert "[docs](https://example.test/docs)" in request.messages[0].text
     assert "<script>" not in request.messages[0].text
     assert "<h1>" not in request.messages[0].text
+    assert "Ignored chrome" not in request.messages[0].text
+    assert "Navigation chrome" not in request.messages[0].text
 
 
 @pytest.mark.asyncio
