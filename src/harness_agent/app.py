@@ -15,6 +15,12 @@ from harness_agent.events import (
     AssistantTextProduced,
     CliTextReceived,
     ScheduledMessageDue,
+    SubAgentCancelled,
+    SubAgentCompleted,
+    SubAgentFailed,
+    SubAgentRequested,
+    SubAgentStarted,
+    SubAgentTimedOut,
     TelegramTextReceived,
     ToolCallCompleted,
     ToolCallRequested,
@@ -40,7 +46,7 @@ from harness_agent.scheduler import (
     SQLiteScheduleStore,
 )
 from harness_agent.store import SQLiteEventStore
-from harness_agent.subagents import SQLiteSubAgentStore, SubAgentResultWaiter, SubAgentService
+from harness_agent.subagents import SQLiteSubAgentStore, SubAgentService
 from harness_agent.tasks import SQLiteTaskStore
 from harness_agent.tool_executor import ToolCallExecutor, ToolCallResultWaiter
 from harness_agent.turns import ConversationTurnCoordinator
@@ -69,7 +75,6 @@ class HarnessApp:
         self.bus = EventBus(self.event_store)
         self.turn_coordinator = ConversationTurnCoordinator()
         self.tool_results = ToolCallResultWaiter()
-        self.sub_agent_results = SubAgentResultWaiter()
         self.runtime = DockerUserRuntime(
             image=config.runtime.docker.image,
             container_prefix=config.runtime.docker.container_prefix,
@@ -93,7 +98,6 @@ class HarnessApp:
         self.sub_agents = SubAgentService(
             bus=self.bus,
             store=self.sub_agent_store,
-            result_waiter=self.sub_agent_results,
         )
         self.telegram: AiogramTelegramAdapter | None = None
         self.scheduler_service: SchedulerService | None = None
@@ -168,6 +172,7 @@ class HarnessApp:
                     keep_last_messages=self._config.llm.compaction_keep_last_messages,
                 ),
             ),
+            sub_agent_lookup=self.sub_agents,
         )
         tool_call_executor = ToolCallExecutor(
             runtime=self.runtime,
@@ -184,7 +189,13 @@ class HarnessApp:
         self.bus.subscribe(UserTextReceived, content_ingestion_handler.handle_user_text)
         self.bus.subscribe(UserTextReceived, conversation_projector.handle_user_text)
         self.bus.subscribe(AssistantTextProduced, conversation_projector.handle_assistant_text)
-        self.bus.subscribe(AssistantTextProduced, self.sub_agent_results.handle_assistant_text)
+        self.bus.subscribe(AssistantTextProduced, self.sub_agents.handle_assistant_text)
+        self.bus.subscribe(SubAgentRequested, self.sub_agents.handle_requested)
+        self.bus.subscribe(SubAgentStarted, self.sub_agents.handle_started)
+        self.bus.subscribe(SubAgentTimedOut, self.sub_agents.handle_timed_out)
+        self.bus.subscribe(SubAgentCompleted, self.sub_agents.handle_completed)
+        self.bus.subscribe(SubAgentFailed, self.sub_agents.handle_failed)
+        self.bus.subscribe(SubAgentCancelled, self.sub_agents.handle_cancelled)
         self.bus.subscribe(ToolCallRequested, tool_call_executor.handle_tool_call_requested)
         self.bus.subscribe(ToolCallCompleted, self.tool_results.handle_tool_call_completed)
         self.bus.subscribe(ToolCallCompleted, conversation_projector.handle_tool_call_completed)

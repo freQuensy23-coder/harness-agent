@@ -20,9 +20,19 @@ from harness_agent.llm import (
 )
 from harness_agent.mcp import McpManager
 from harness_agent.projections import SQLiteConversationProjection
+from harness_agent.subagents import SubAgentLookup, SubAgentRecord
 from harness_agent.tool_executor import ToolCallResultWaiter
 from harness_agent.tools import ToolRegistry, ToolSpec
 from harness_agent.turns import ConversationTurnCoordinator
+
+
+SUB_AGENT_SYSTEM_PREFIX = (
+    "You are a sub-agent named '{name}'. A parent agent delegated a single "
+    "task to you and will read only your final assistant message as the "
+    "result. Complete the task, then place the result in your last message. "
+    "You cannot spawn further sub-agents."
+)
+SUB_AGENT_TASK_PREFIX = "Task delegated by the parent agent:"
 
 
 class AgentTurnRunner:
@@ -38,6 +48,7 @@ class AgentTurnRunner:
         tool_results: ToolCallResultWaiter,
         mcp_manager: McpManager | None = None,
         compactor: ContextCompactor | None = None,
+        sub_agent_lookup: SubAgentLookup | None = None,
     ) -> None:
         self._bus = bus
         self._context_builder = context_builder
@@ -48,6 +59,7 @@ class AgentTurnRunner:
         self._turn_coordinator = turn_coordinator
         self._tool_results = tool_results
         self._compactor = compactor
+        self._sub_agent_lookup = sub_agent_lookup
 
     async def run(self, event: AgentTurnRequested) -> None:
         async with self._turn_coordinator.run_slot(event.conversation_id):
@@ -57,10 +69,15 @@ class AgentTurnRunner:
             if await self._stop_if_superseded(event):
                 return
             messages = await self._projection.list_llm_messages(event.conversation_id)
-            tools = await self._tools_for_user(event.user_id)
+            sub_agent_record = await self._sub_agent_for_conversation(
+                user_id=event.user_id,
+                conversation_id=event.conversation_id,
+            )
+            tools = await self._tools_for_user(event.user_id, sub_agent_record)
+            system_prompt = _system_prompt_for_turn(context.system, sub_agent_record)
 
             while True:
-                messages = await self._prepare_messages(event, context.system, messages, tools)
+                messages = await self._prepare_messages(event, system_prompt, messages, tools)
                 if messages is None:
                     return
                 await self._bus.publish(
@@ -76,7 +93,7 @@ class AgentTurnRunner:
                         user_id=event.user_id,
                         conversation_id=event.conversation_id,
                         generation=event.generation,
-                        system=context.system,
+                        system=system_prompt,
                         messages=messages,
                         tools=tools,
                     )
@@ -202,11 +219,30 @@ class AgentTurnRunner:
             )
         return next_messages
 
-    async def _tools_for_user(self, user_id: str) -> list[ToolSpec]:
+    async def _tools_for_user(
+        self,
+        user_id: str,
+        sub_agent_record: SubAgentRecord | None,
+    ) -> list[ToolSpec]:
         tools: list[ToolSpec] = list(self._tool_registry.list_for_model())
         if self._mcp_manager is not None:
             tools.extend(await self._mcp_manager.list_tool_specs(user_id))
+        if sub_agent_record is not None:
+            tools = [tool for tool in tools if not tool.name.startswith("agent.")]
         return tools
+
+    async def _sub_agent_for_conversation(
+        self,
+        *,
+        user_id: str,
+        conversation_id: str,
+    ) -> SubAgentRecord | None:
+        if self._sub_agent_lookup is None:
+            return None
+        return await self._sub_agent_lookup.get_by_child_conversation_id(
+            user_id=user_id,
+            conversation_id=conversation_id,
+        )
 
     async def _stop_if_superseded(self, event: AgentTurnRequested) -> bool:
         current_generation = await self._turn_coordinator.current_generation(
@@ -223,3 +259,14 @@ class AgentTurnRunner:
             )
         )
         return True
+
+
+def _system_prompt_for_turn(
+    base_system: str,
+    sub_agent_record: SubAgentRecord | None,
+) -> str:
+    if sub_agent_record is None:
+        return base_system
+    header = SUB_AGENT_SYSTEM_PREFIX.format(name=sub_agent_record.name)
+    task_block = f"{SUB_AGENT_TASK_PREFIX}\n{sub_agent_record.prompt}"
+    return "\n\n".join(block for block in (header, task_block, base_system) if block)

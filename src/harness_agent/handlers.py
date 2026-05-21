@@ -20,12 +20,11 @@ from harness_agent.llm import LlmClient
 from harness_agent.mcp import McpManager
 from harness_agent.projections import SQLiteConversationProjection
 from harness_agent.runtime import UserRuntime
+from harness_agent.subagents import SubAgentLookup
 from harness_agent.tool_executor import ToolCallResultWaiter
 from harness_agent.turn_runner import AgentTurnRunner
 from harness_agent.turns import ConversationTurnCoordinator
-from harness_agent.tools import (
-    ToolRegistry,
-)
+from harness_agent.tools import ToolRegistry
 
 
 EventBatch = tuple[EventBase, ...]
@@ -154,6 +153,7 @@ class AgentTurnHandler:
         turn_coordinator: ConversationTurnCoordinator | None = None,
         tool_results: ToolCallResultWaiter | None = None,
         compactor: ContextCompactor | None = None,
+        sub_agent_lookup: SubAgentLookup | None = None,
     ) -> None:
         if turn_coordinator is None:
             turn_coordinator = ConversationTurnCoordinator()
@@ -170,6 +170,7 @@ class AgentTurnHandler:
             turn_coordinator=turn_coordinator,
             tool_results=tool_results,
             compactor=compactor,
+            sub_agent_lookup=sub_agent_lookup,
         )
 
     async def handle_user_text(self, event: UserTextReceived) -> EventBatch:

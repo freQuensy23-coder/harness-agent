@@ -1,7 +1,7 @@
 import asyncio
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, Protocol
 from uuid import uuid4
 
 import aiosqlite
@@ -15,13 +15,18 @@ from harness_agent.events import (
     SubAgentCancelled,
     SubAgentCompleted,
     SubAgentFailed,
+    SubAgentRequested,
     SubAgentStarted,
+    SubAgentTimedOut,
     UserTextReceived,
 )
 from harness_agent.tools import AgentRunInput, AgentSpawnInput
 
 
 SubAgentStatus = Literal["running", "completed", "failed", "cancelled"]
+
+
+EventBatch = tuple[EventBase, ...]
 
 
 class SubAgentRecord(BaseModel):
@@ -39,26 +44,36 @@ class SubAgentRecord(BaseModel):
     updated_at: datetime
 
 
+class SubAgentLookup(Protocol):
+    async def get_by_child_conversation_id(
+        self,
+        *,
+        user_id: str,
+        conversation_id: str,
+    ) -> SubAgentRecord | None: ...
+
+
 class SQLiteSubAgentStore:
     def __init__(self, path: Path) -> None:
         self._path = path
 
-    async def create(
+    async def insert(
         self,
         *,
+        agent_id: str,
         user_id: str,
         parent_conversation_id: str,
+        child_conversation_id: str,
         parent_call_id: str,
         name: str,
         prompt: str,
     ) -> SubAgentRecord:
         now = datetime.now(UTC)
-        agent_id = uuid4().hex
         record = SubAgentRecord(
             id=agent_id,
             user_id=user_id,
             parent_conversation_id=parent_conversation_id,
-            child_conversation_id=f"{parent_conversation_id}:subagent:{agent_id}",
+            child_conversation_id=child_conversation_id,
             parent_call_id=parent_call_id,
             name=name,
             prompt=prompt,
@@ -118,23 +133,7 @@ class SQLiteSubAgentStore:
         async with aiosqlite.connect(self._path) as db:
             rows = await fetchall_rows(
                 db,
-                """
-                select
-                    id,
-                    user_id,
-                    parent_conversation_id,
-                    child_conversation_id,
-                    parent_call_id,
-                    name,
-                    prompt,
-                    status,
-                    result,
-                    error,
-                    created_at,
-                    updated_at
-                from sub_agents
-                where id = ?
-                """,
+                _SELECT_BASE + " where id = ?",
                 (agent_id,),
             )
         if not rows:
@@ -152,26 +151,25 @@ class SQLiteSubAgentStore:
         async with aiosqlite.connect(self._path) as db:
             rows = await fetchall_rows(
                 db,
-                """
-                select
-                    id,
-                    user_id,
-                    parent_conversation_id,
-                    child_conversation_id,
-                    parent_call_id,
-                    name,
-                    prompt,
-                    status,
-                    result,
-                    error,
-                    created_at,
-                    updated_at
-                from sub_agents
-                where id = ?
-                  and user_id = ?
-                  and parent_conversation_id = ?
-                """,
+                _SELECT_BASE + " where id = ? and user_id = ? and parent_conversation_id = ?",
                 (agent_id, user_id, parent_conversation_id),
+            )
+        if not rows:
+            return None
+        return _record_from_row(rows[0])
+
+    async def get_by_child_conversation_id(
+        self,
+        *,
+        user_id: str,
+        conversation_id: str,
+    ) -> SubAgentRecord | None:
+        await self._ensure_schema()
+        async with aiosqlite.connect(self._path) as db:
+            rows = await fetchall_rows(
+                db,
+                _SELECT_BASE + " where user_id = ? and child_conversation_id = ?",
+                (user_id, conversation_id),
             )
         if not rows:
             return None
@@ -185,79 +183,14 @@ class SQLiteSubAgentStore:
         include_completed: bool,
     ) -> list[SubAgentRecord]:
         await self._ensure_schema()
-        if include_completed:
-            return await self._list_for_parent(
-                user_id=user_id,
-                parent_conversation_id=parent_conversation_id,
-            )
-        return await self._list_running_for_parent(
-            user_id=user_id,
-            parent_conversation_id=parent_conversation_id,
-        )
-
-    async def _list_for_parent(
-        self,
-        *,
-        user_id: str,
-        parent_conversation_id: str,
-    ) -> list[SubAgentRecord]:
+        query = _SELECT_BASE + " where user_id = ? and parent_conversation_id = ?"
+        params: tuple[Any, ...] = (user_id, parent_conversation_id)
+        if not include_completed:
+            query += " and status = ?"
+            params = (*params, "running")
+        query += " order by created_at asc"
         async with aiosqlite.connect(self._path) as db:
-            rows = await fetchall_rows(
-                db,
-                """
-                select
-                    id,
-                    user_id,
-                    parent_conversation_id,
-                    child_conversation_id,
-                    parent_call_id,
-                    name,
-                    prompt,
-                    status,
-                    result,
-                    error,
-                    created_at,
-                    updated_at
-                from sub_agents
-                where user_id = ?
-                  and parent_conversation_id = ?
-                order by created_at asc
-                """,
-                (user_id, parent_conversation_id),
-            )
-        return [_record_from_row(row) for row in rows]
-
-    async def _list_running_for_parent(
-        self,
-        *,
-        user_id: str,
-        parent_conversation_id: str,
-    ) -> list[SubAgentRecord]:
-        async with aiosqlite.connect(self._path) as db:
-            rows = await fetchall_rows(
-                db,
-                """
-                select
-                    id,
-                    user_id,
-                    parent_conversation_id,
-                    child_conversation_id,
-                    parent_call_id,
-                    name,
-                    prompt,
-                    status,
-                    result,
-                    error,
-                    created_at,
-                    updated_at
-                from sub_agents
-                where user_id = ?
-                  and parent_conversation_id = ?
-                  and status = ?
-                order by created_at asc
-                """,
-                (user_id, parent_conversation_id, "running"),
-            )
+            rows = await fetchall_rows(db, query, params)
         return [_record_from_row(row) for row in rows]
 
     async def _transition(
@@ -290,11 +223,11 @@ class SQLiteSubAgentStore:
     ) -> SubAgentRecord | None:
         return await self._transition_row(
             agent_id=agent_id,
-            user_id=user_id,
-            parent_conversation_id=parent_conversation_id,
             status=status,
             result=result,
             error=error,
+            user_id=user_id,
+            parent_conversation_id=parent_conversation_id,
         )
 
     async def _transition_row(
@@ -316,12 +249,8 @@ class SQLiteSubAgentStore:
                 await db.execute(
                     """
                     update sub_agents
-                    set status = ?,
-                        result = ?,
-                        error = ?,
-                        updated_at = ?
-                    where id = ?
-                      and status = ?
+                    set status = ?, result = ?, error = ?, updated_at = ?
+                    where id = ? and status = ?
                     """,
                     (status, result, error, now.isoformat(), agent_id, "running"),
                 )
@@ -329,10 +258,7 @@ class SQLiteSubAgentStore:
                 await db.execute(
                     """
                     update sub_agents
-                    set status = ?,
-                        result = ?,
-                        error = ?,
-                        updated_at = ?
+                    set status = ?, result = ?, error = ?, updated_at = ?
                     where id = ?
                       and user_id = ?
                       and parent_conversation_id = ?
@@ -383,41 +309,22 @@ class SQLiteSubAgentStore:
             await db.commit()
 
 
-class SubAgentResultWaiter:
-    def __init__(self) -> None:
-        self._pending: dict[str, asyncio.Future[str]] = {}
-
-    def expect(self, conversation_id: str) -> None:
-        self._pending[conversation_id] = asyncio.get_running_loop().create_future()
-
-    async def wait(self, conversation_id: str) -> str:
-        return await self._pending[conversation_id]
-
-    def forget(self, conversation_id: str) -> None:
-        self._pending.pop(conversation_id, None)
-
-    async def handle_assistant_text(self, event: AssistantTextProduced) -> tuple[EventBase, ...]:
-        future = self._pending.get(event.conversation_id)
-        if future is not None and not future.done():
-            future.set_result(event.text)
-        return ()
-
-
 class SubAgentService:
+    """Event-driven sub-agent lifecycle coordinator."""
+
     def __init__(
         self,
         *,
         bus: EventBus,
         store: SQLiteSubAgentStore,
-        result_waiter: SubAgentResultWaiter,
     ) -> None:
         self._bus = bus
         self._store = store
-        self._result_waiter = result_waiter
-        self._tasks: dict[str, asyncio.Task[SubAgentRecord]] = {}
+        self._child_tasks: dict[str, asyncio.Task[Any]] = {}
+        self._timeout_tasks: dict[str, asyncio.Task[Any]] = {}
+        self._pending_records: dict[str, asyncio.Future[SubAgentRecord]] = {}
 
-    def _forget_task(self, agent_id: str) -> None:
-        self._tasks.pop(agent_id, None)
+    # ------------------------- tool API -------------------------
 
     async def run(
         self,
@@ -427,14 +334,27 @@ class SubAgentService:
         parent_call_id: str,
         input: AgentRunInput,
     ) -> SubAgentRecord:
-        record = await self._store.create(
-            user_id=user_id,
-            parent_conversation_id=parent_conversation_id,
-            parent_call_id=parent_call_id,
-            name=input.name,
-            prompt=input.prompt,
+        agent_id, child_conversation_id = self._mint_ids(parent_conversation_id)
+        future: asyncio.Future[SubAgentRecord] = (
+            asyncio.get_running_loop().create_future()
         )
-        return await self._execute(record, timeout_seconds=input.timeout_seconds)
+        self._pending_records[agent_id] = future
+        try:
+            await self._bus.publish(
+                SubAgentRequested(
+                    agent_id=agent_id,
+                    user_id=user_id,
+                    parent_conversation_id=parent_conversation_id,
+                    child_conversation_id=child_conversation_id,
+                    parent_call_id=parent_call_id,
+                    name=input.name,
+                    prompt=input.prompt,
+                    timeout_seconds=input.timeout_seconds,
+                )
+            )
+            return await future
+        finally:
+            self._pending_records.pop(agent_id, None)
 
     async def spawn(
         self,
@@ -444,21 +364,33 @@ class SubAgentService:
         parent_call_id: str,
         input: AgentSpawnInput,
     ) -> SubAgentRecord:
-        record = await self._store.create(
+        agent_id, child_conversation_id = self._mint_ids(parent_conversation_id)
+        now = datetime.now(UTC)
+        snapshot = SubAgentRecord(
+            id=agent_id,
             user_id=user_id,
             parent_conversation_id=parent_conversation_id,
+            child_conversation_id=child_conversation_id,
             parent_call_id=parent_call_id,
             name=input.name,
             prompt=input.prompt,
+            status="running",
+            created_at=now,
+            updated_at=now,
         )
-        task = asyncio.create_task(
-            self._execute(record, timeout_seconds=input.timeout_seconds)
+        await self._bus.publish(
+            SubAgentRequested(
+                agent_id=agent_id,
+                user_id=user_id,
+                parent_conversation_id=parent_conversation_id,
+                child_conversation_id=child_conversation_id,
+                parent_call_id=parent_call_id,
+                name=input.name,
+                prompt=input.prompt,
+                timeout_seconds=input.timeout_seconds,
+            )
         )
-        self._tasks[record.id] = task
-        task.add_done_callback(
-            lambda completed, agent_id=record.id: self._forget_task(agent_id)
-        )
-        return record
+        return snapshot
 
     async def result(
         self,
@@ -493,7 +425,7 @@ class SubAgentService:
         user_id: str,
         parent_conversation_id: str,
     ) -> SubAgentRecord | None:
-        record = await self.result(
+        record = await self._store.get_for_parent(
             agent_id=agent_id,
             user_id=user_id,
             parent_conversation_id=parent_conversation_id,
@@ -507,14 +439,10 @@ class SubAgentService:
             user_id=user_id,
             parent_conversation_id=parent_conversation_id,
         )
-        if cancelled is None:
-            return None
-        if cancelled.status != "cancelled":
+        if cancelled is None or cancelled.status != "cancelled":
             return cancelled
-        task = self._tasks.pop(agent_id, None)
-        if task is not None:
-            task.cancel()
-            await self._await_cancelled_task(task)
+        self._cancel_timeout(agent_id)
+        await self._kill_child(agent_id)
         await self._bus.publish(
             SubAgentCancelled(
                 agent_id=cancelled.id,
@@ -525,54 +453,148 @@ class SubAgentService:
         )
         return cancelled
 
-    async def _await_cancelled_task(self, task: asyncio.Task[Any]) -> None:
-        try:
-            await task
-        except asyncio.CancelledError:
-            return
+    # ------------------------- event handlers -------------------------
 
-    async def _execute(
+    async def handle_requested(self, event: SubAgentRequested) -> EventBatch:
+        record = await self._store.insert(
+            agent_id=event.agent_id,
+            user_id=event.user_id,
+            parent_conversation_id=event.parent_conversation_id,
+            child_conversation_id=event.child_conversation_id,
+            parent_call_id=event.parent_call_id,
+            name=event.name,
+            prompt=event.prompt,
+        )
+        return (
+            SubAgentStarted(
+                agent_id=record.id,
+                user_id=record.user_id,
+                parent_conversation_id=record.parent_conversation_id,
+                child_conversation_id=record.child_conversation_id,
+                parent_call_id=record.parent_call_id,
+                name=record.name,
+                prompt=record.prompt,
+                timeout_seconds=event.timeout_seconds,
+            ),
+        )
+
+    async def handle_started(self, event: SubAgentStarted) -> EventBatch:
+        self._child_tasks[event.agent_id] = asyncio.create_task(
+            self._run_child_turn(event)
+        )
+        self._timeout_tasks[event.agent_id] = asyncio.create_task(
+            self._timeout_watchdog(event)
+        )
+        return ()
+
+    async def handle_assistant_text(self, event: AssistantTextProduced) -> EventBatch:
+        record = await self._store.get_by_child_conversation_id(
+            user_id=event.user_id,
+            conversation_id=event.conversation_id,
+        )
+        if record is None or record.status != "running":
+            return ()
+        completed = await self._store.complete(record.id, event.text)
+        if completed.status != "completed":
+            return ()
+        self._cancel_timeout(record.id)
+        self._forget_child(record.id)
+        return (
+            SubAgentCompleted(
+                agent_id=completed.id,
+                user_id=completed.user_id,
+                parent_conversation_id=completed.parent_conversation_id,
+                child_conversation_id=completed.child_conversation_id,
+                result=event.text,
+            ),
+        )
+
+    async def handle_timed_out(self, event: SubAgentTimedOut) -> EventBatch:
+        record = await self._store.get(event.agent_id)
+        if record is None or record.status != "running":
+            return ()
+        error = f"sub-agent {record.id} timed out"
+        failed = await self._store.fail(record.id, error)
+        if failed.status != "failed":
+            return ()
+        self._forget_timeout(record.id)
+        await self._kill_child(record.id)
+        return (
+            SubAgentFailed(
+                agent_id=failed.id,
+                user_id=failed.user_id,
+                parent_conversation_id=failed.parent_conversation_id,
+                child_conversation_id=failed.child_conversation_id,
+                error=error,
+            ),
+        )
+
+    async def handle_completed(self, event: SubAgentCompleted) -> EventBatch:
+        await self._resolve_pending(event.agent_id)
+        return ()
+
+    async def handle_failed(self, event: SubAgentFailed) -> EventBatch:
+        await self._resolve_pending(event.agent_id)
+        return ()
+
+    async def handle_cancelled(self, event: SubAgentCancelled) -> EventBatch:
+        await self._resolve_pending(event.agent_id)
+        return ()
+
+    # ------------------------- lookup -------------------------
+
+    async def get_by_child_conversation_id(
         self,
-        record: SubAgentRecord,
         *,
-        timeout_seconds: float,
-    ) -> SubAgentRecord:
-        self._result_waiter.expect(record.child_conversation_id)
+        user_id: str,
+        conversation_id: str,
+    ) -> SubAgentRecord | None:
+        return await self._store.get_by_child_conversation_id(
+            user_id=user_id,
+            conversation_id=conversation_id,
+        )
+
+    # ------------------------- internals -------------------------
+
+    def _mint_ids(self, parent_conversation_id: str) -> tuple[str, str]:
+        agent_id = uuid4().hex
+        child_conversation_id = f"{parent_conversation_id}:subagent:{agent_id}"
+        return agent_id, child_conversation_id
+
+    async def _resolve_pending(self, agent_id: str) -> None:
+        future = self._pending_records.get(agent_id)
+        if future is None or future.done():
+            return
+        record = await self._store.get(agent_id)
+        if record is None:
+            future.set_exception(RuntimeError(f"sub-agent {agent_id} disappeared"))
+            return
+        future.set_result(record)
+
+    async def _run_child_turn(self, event: SubAgentStarted) -> None:
         try:
             await self._bus.publish(
-                SubAgentStarted(
-                    agent_id=record.id,
-                    user_id=record.user_id,
-                    parent_conversation_id=record.parent_conversation_id,
-                    child_conversation_id=record.child_conversation_id,
-                    parent_call_id=record.parent_call_id,
-                    name=record.name,
+                UserTextReceived(
+                    user_id=event.user_id,
+                    conversation_id=event.child_conversation_id,
+                    source="subagent",
+                    text=event.prompt,
                 )
             )
-            result = await asyncio.wait_for(
-                self._publish_child_turn_and_wait_result(record),
-                timeout=timeout_seconds,
-            )
-            completed = await self._store.complete(record.id, result)
-            if completed.status != "completed":
-                return completed
-            await self._bus.publish(
-                SubAgentCompleted(
-                    agent_id=completed.id,
-                    user_id=completed.user_id,
-                    parent_conversation_id=completed.parent_conversation_id,
-                    child_conversation_id=completed.child_conversation_id,
-                    result=result,
-                )
-            )
-            return completed
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             error = str(exc) or exc.__class__.__name__
+            record = await self._store.get(event.agent_id)
+            if record is None or record.status != "running":
+                self._forget_child(event.agent_id)
+                return
             failed = await self._store.fail(record.id, error)
             if failed.status != "failed":
-                return failed
+                self._forget_child(event.agent_id)
+                return
+            self._cancel_timeout(record.id)
+            self._forget_child(record.id)
             await self._bus.publish(
                 SubAgentFailed(
                     agent_id=failed.id,
@@ -582,40 +604,46 @@ class SubAgentService:
                     error=error,
                 )
             )
-            return failed
-        finally:
-            self._result_waiter.forget(record.child_conversation_id)
 
-    async def _publish_child_turn_and_wait_result(self, record: SubAgentRecord) -> str:
-        publish_task = asyncio.create_task(
-            self._bus.publish(
-                UserTextReceived(
-                    user_id=record.user_id,
-                    conversation_id=record.child_conversation_id,
-                    source="subagent",
-                    text=record.prompt,
+    async def _timeout_watchdog(self, event: SubAgentStarted) -> None:
+        try:
+            await asyncio.sleep(event.timeout_seconds)
+        except asyncio.CancelledError:
+            return
+        try:
+            await self._bus.publish(
+                SubAgentTimedOut(
+                    agent_id=event.agent_id,
+                    user_id=event.user_id,
+                    parent_conversation_id=event.parent_conversation_id,
+                    child_conversation_id=event.child_conversation_id,
                 )
             )
-        )
-        wait_task = asyncio.create_task(
-            self._result_waiter.wait(record.child_conversation_id)
-        )
+        except asyncio.CancelledError:
+            return
+
+    def _cancel_timeout(self, agent_id: str) -> None:
+        task = self._timeout_tasks.pop(agent_id, None)
+        if task is not None and not task.done():
+            task.cancel()
+
+    def _forget_timeout(self, agent_id: str) -> None:
+        self._timeout_tasks.pop(agent_id, None)
+
+    def _forget_child(self, agent_id: str) -> None:
+        self._child_tasks.pop(agent_id, None)
+
+    async def _kill_child(self, agent_id: str) -> None:
+        task = self._child_tasks.pop(agent_id, None)
+        if task is None or task.done():
+            return
+        task.cancel()
         try:
-            done, _ = await asyncio.wait(
-                {publish_task, wait_task},
-                return_when=asyncio.FIRST_COMPLETED,
-            )
-            if publish_task in done:
-                await publish_task
-                return await wait_task
-            result = await wait_task
-            await publish_task
-            return result
-        finally:
-            for task in (publish_task, wait_task):
-                if not task.done():
-                    task.cancel()
-                    await self._await_cancelled_task(task)
+            await task
+        except asyncio.CancelledError:
+            return
+        except Exception:
+            return
 
 
 def render_sub_agent_record(record: SubAgentRecord) -> str:
@@ -624,6 +652,14 @@ def render_sub_agent_record(record: SubAgentRecord) -> str:
 
 def render_sub_agent_records(records: list[SubAgentRecord]) -> str:
     return "[\n" + ",\n".join(record.model_dump_json(indent=2) for record in records) + "\n]"
+
+
+_SELECT_BASE = (
+    "select "
+    "id, user_id, parent_conversation_id, child_conversation_id, parent_call_id, "
+    "name, prompt, status, result, error, created_at, updated_at "
+    "from sub_agents"
+)
 
 
 def _record_row(record: SubAgentRecord) -> tuple[Any, ...]:
