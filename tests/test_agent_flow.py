@@ -630,7 +630,14 @@ async def test_context_compaction_archives_summary_and_keeps_last_two_messages(
     runtime = FakeUserRuntime(
         agent_files=AgentFileSet(soul="SOUL", agents="AGENTS", user="USER", tools="TOOLS"),
     )
-    llm = FakeLlmClient([AssistantText(text="compact summary"), AssistantText(text="done")])
+    llm = FakeLlmClient(
+        [
+            AssistantText(
+                text="<analysis>scratch thoughts</analysis>\n<summary>compact summary</summary>"
+            ),
+            AssistantText(text="done"),
+        ]
+    )
     await projection.append_user_message(
         user_id="u:1",
         conversation_id="cli:compact",
@@ -696,15 +703,20 @@ async def test_context_compaction_archives_summary_and_keeps_last_two_messages(
         occurred_at=compacting.occurred_at,
     )
     assert llm.requests[0].tools == []
-    assert "old user" in llm.requests[0].messages[0].text
-    assert "old assistant" in llm.requests[0].messages[0].text
-    assert "recent user" not in llm.requests[0].messages[0].text
-    assert "latest user" not in llm.requests[0].messages[0].text
+    assert llm.requests[0].messages == [
+        UserMessage(text="old user"),
+        AssistantMessage(text="old assistant"),
+    ]
     assert llm.requests[1].messages == [
         UserMessage(text="Previous conversation summary:\ncompact summary"),
         UserMessage(text="recent user"),
         UserMessage(text="latest user"),
     ]
+    assert all(
+        "scratch thoughts" not in message.text
+        for message in llm.requests[1].messages
+        if hasattr(message, "text")
+    )
     assert runtime.file_write_calls[0].path.startswith("/workspace/.old-sessions/")
     archive_lines = runtime.file_write_calls[0].content.splitlines()
     assert [json.loads(line)["item_kind"] for line in archive_lines] == [
@@ -747,7 +759,7 @@ async def test_context_compaction_runs_between_tool_calls_and_keeps_tools_availa
                 name="shell.exec",
                 input=ShellExecInput(command="printf two", cwd="/workspace"),
             ),
-            AssistantText(text="tool summary"),
+            AssistantText(text="<summary>tool summary</summary>"),
             AssistantText(text="done"),
         ]
     )
@@ -770,7 +782,11 @@ async def test_context_compaction_runs_between_tool_calls_and_keeps_tools_availa
             projection=projection,
             runtime=runtime,
             llm=llm,
-            config=ContextCompactionConfig(max_tokens_per_model=20, reserve_tokens=0),
+            config=ContextCompactionConfig(
+                max_tokens_per_model=20,
+                reserve_tokens=0,
+                keep_last_messages=1,
+            ),
             estimate_tokens=estimator,
         ),
     )
@@ -781,6 +797,27 @@ async def test_context_compaction_runs_between_tool_calls_and_keeps_tools_availa
     bus.subscribe(ToolCallCompleted, conversation_projector.handle_tool_call_completed)
     bus.subscribe(UserTextReceived, agent_turn_handler.handle_user_text)
     bus.subscribe(AgentTurnRequested, agent_turn_handler.handle_agent_turn)
+
+    await projection.append_user_message(
+        user_id="u:1",
+        conversation_id="cli:compact-tools",
+        text="prior task",
+    )
+    await projection.append_tool_exchange(
+        user_id="u:1",
+        conversation_id="cli:compact-tools",
+        generation=1,
+        call_id="prior_call",
+        tool_name="shell.exec",
+        input=ShellExecInput(command="prep", cwd="/workspace"),
+        result=RuntimeToolResult(stdout="ready\n"),
+    )
+    await projection.append_assistant_message(
+        user_id="u:1",
+        conversation_id="cli:compact-tools",
+        generation=1,
+        text="prior done",
+    )
 
     await bus.publish(
         UserTextReceived(
@@ -797,8 +834,12 @@ async def test_context_compaction_runs_between_tool_calls_and_keeps_tools_availa
         True,
         False,
     ]
-    assert "assistant_tool_call" in llm.requests[2].messages[0].text
-    assert "tool_result" in llm.requests[2].messages[0].text
+    assert [m.kind for m in llm.requests[2].messages] == [
+        "user",
+        "assistant_tool_call",
+        "tool_result",
+        "assistant",
+    ]
     assert llm.requests[3].messages[-2:] == [
         AssistantToolCallMessage(
             call_id="call_2",
@@ -854,6 +895,17 @@ async def test_new_user_message_during_compaction_uses_fresh_history_without_sta
     await projection.append_user_message(
         user_id="u:1",
         conversation_id="cli:compact-race",
+        text="ancient user",
+    )
+    await projection.append_assistant_message(
+        user_id="u:1",
+        conversation_id="cli:compact-race",
+        generation=1,
+        text="ancient assistant",
+    )
+    await projection.append_user_message(
+        user_id="u:1",
+        conversation_id="cli:compact-race",
         text="old user",
     )
     await projection.append_assistant_message(
@@ -898,6 +950,8 @@ async def test_new_user_message_during_compaction_uses_fresh_history_without_sta
         message.text for message in llm.requests[1].messages if message.kind == "user"
     ]
     assert llm.requests[1].messages == [
+        UserMessage(text="ancient user"),
+        AssistantMessage(text="ancient assistant"),
         UserMessage(text="old user"),
         AssistantMessage(text="old assistant"),
         UserMessage(text="stale user"),
@@ -907,10 +961,392 @@ async def test_new_user_message_during_compaction_uses_fresh_history_without_sta
         "user",
         "assistant",
         "user",
+        "assistant",
+        "user",
         "user",
         "assistant",
     ]
     assert [event.type for event in await store.list_events()].count("agent.turn.superseded") == 1
+
+
+@pytest.mark.asyncio
+async def test_compaction_skipped_when_exactly_n_user_messages_with_first_at_index_zero(
+    tmp_path: Path,
+) -> None:
+    projection = SQLiteConversationProjection(tmp_path / "messages.sqlite3")
+    await projection.append_user_message(user_id="u:1", conversation_id="c", text="first user")
+    await projection.append_tool_exchange(
+        user_id="u:1",
+        conversation_id="c",
+        generation=1,
+        call_id="a",
+        tool_name="shell.exec",
+        input=ShellExecInput(command="ls", cwd="/workspace"),
+        result=RuntimeToolResult(stdout="ok\n"),
+    )
+    await projection.append_user_message(user_id="u:1", conversation_id="c", text="second user")
+    runtime = FakeUserRuntime()
+    llm = FakeLlmClient([])
+    compactor = ContextCompactor(
+        projection=projection,
+        runtime=runtime,
+        llm=llm,
+        config=ContextCompactionConfig(
+            max_tokens_per_model=10,
+            reserve_tokens=0,
+            keep_last_messages=2,
+        ),
+    )
+
+    snapshot = await compactor.create_snapshot(conversation_id="c")
+    assert snapshot is None
+    assert llm.requests == []
+
+
+@pytest.mark.asyncio
+async def test_compaction_falls_back_to_safe_boundary_when_user_messages_are_too_few(
+    tmp_path: Path,
+) -> None:
+    projection = SQLiteConversationProjection(tmp_path / "messages.sqlite3")
+    await projection.append_user_message(user_id="u:1", conversation_id="c", text="only user")
+    await projection.append_tool_exchange(
+        user_id="u:1",
+        conversation_id="c",
+        generation=1,
+        call_id="a",
+        tool_name="shell.exec",
+        input=ShellExecInput(command="ls", cwd="/workspace"),
+        result=RuntimeToolResult(stdout="ok\n"),
+    )
+    await projection.append_tool_exchange(
+        user_id="u:1",
+        conversation_id="c",
+        generation=1,
+        call_id="b",
+        tool_name="shell.exec",
+        input=ShellExecInput(command="pwd", cwd="/workspace"),
+        result=RuntimeToolResult(stdout="/workspace\n"),
+    )
+    runtime = FakeUserRuntime()
+    llm = FakeLlmClient([AssistantText(text="<summary>tool churn summary</summary>")])
+    compactor = ContextCompactor(
+        projection=projection,
+        runtime=runtime,
+        llm=llm,
+        config=ContextCompactionConfig(
+            max_tokens_per_model=10,
+            reserve_tokens=0,
+            keep_last_messages=2,
+        ),
+    )
+
+    snapshot = await compactor.create_snapshot(conversation_id="c")
+    assert snapshot is not None
+    assert [r.item_kind for r in snapshot.compacted_records] == [
+        "user",
+        "assistant_tool_call",
+        "tool_result",
+    ]
+    assert [r.item_kind for r in snapshot.tail_records] == [
+        "assistant_tool_call",
+        "tool_result",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_compaction_retries_when_model_omits_summary_tag(tmp_path: Path) -> None:
+    projection = SQLiteConversationProjection(tmp_path / "messages.sqlite3")
+    await projection.append_user_message(user_id="u:1", conversation_id="c", text="first")
+    await projection.append_user_message(user_id="u:1", conversation_id="c", text="second")
+    runtime = FakeUserRuntime()
+    llm = FakeLlmClient(
+        [
+            AssistantText(text="<analysis>forgot the summary tag</analysis>"),
+            AssistantText(
+                text="<analysis>retry</analysis>\n<summary>retry summary</summary>"
+            ),
+        ]
+    )
+    compactor = ContextCompactor(
+        projection=projection,
+        runtime=runtime,
+        llm=llm,
+        config=ContextCompactionConfig(
+            max_tokens_per_model=10,
+            reserve_tokens=0,
+            keep_last_messages=1,
+        ),
+    )
+
+    snapshot = await compactor.create_snapshot(conversation_id="c")
+    assert snapshot is not None
+    draft = await compactor.create_draft(
+        user_id="u:1",
+        conversation_id="c",
+        generation=1,
+        snapshot=snapshot,
+    )
+
+    assert draft.summary == "retry summary"
+    assert len(llm.requests) == 2
+
+
+@pytest.mark.asyncio
+async def test_compaction_strips_analysis_from_fallback_when_summary_tag_missing(
+    tmp_path: Path,
+) -> None:
+    projection = SQLiteConversationProjection(tmp_path / "messages.sqlite3")
+    await projection.append_user_message(user_id="u:1", conversation_id="c", text="first")
+    await projection.append_user_message(user_id="u:1", conversation_id="c", text="second")
+    runtime = FakeUserRuntime()
+    llm = FakeLlmClient(
+        [
+            AssistantText(text="<analysis>noise A</analysis> body one"),
+            AssistantText(text="<analysis>noise B</analysis> body two"),
+        ]
+    )
+    compactor = ContextCompactor(
+        projection=projection,
+        runtime=runtime,
+        llm=llm,
+        config=ContextCompactionConfig(
+            max_tokens_per_model=10,
+            reserve_tokens=0,
+            keep_last_messages=1,
+        ),
+    )
+
+    snapshot = await compactor.create_snapshot(conversation_id="c")
+    assert snapshot is not None
+    draft = await compactor.create_draft(
+        user_id="u:1",
+        conversation_id="c",
+        generation=1,
+        snapshot=snapshot,
+    )
+
+    assert draft.summary == "body two"
+    assert "noise" not in draft.summary
+    assert len(llm.requests) == 2
+
+
+@pytest.mark.asyncio
+async def test_compaction_fallback_uses_raw_text_when_strip_leaves_nothing(
+    tmp_path: Path,
+) -> None:
+    projection = SQLiteConversationProjection(tmp_path / "messages.sqlite3")
+    await projection.append_user_message(user_id="u:1", conversation_id="c", text="first")
+    await projection.append_user_message(user_id="u:1", conversation_id="c", text="second")
+    runtime = FakeUserRuntime()
+    llm = FakeLlmClient(
+        [
+            AssistantText(text="<analysis>only this</analysis>"),
+            AssistantText(text="<analysis>still only this</analysis>"),
+        ]
+    )
+    compactor = ContextCompactor(
+        projection=projection,
+        runtime=runtime,
+        llm=llm,
+        config=ContextCompactionConfig(
+            max_tokens_per_model=10,
+            reserve_tokens=0,
+            keep_last_messages=1,
+        ),
+    )
+
+    snapshot = await compactor.create_snapshot(conversation_id="c")
+    assert snapshot is not None
+    draft = await compactor.create_draft(
+        user_id="u:1",
+        conversation_id="c",
+        generation=1,
+        snapshot=snapshot,
+    )
+
+    assert draft.summary == "<analysis>still only this</analysis>"
+
+
+@pytest.mark.asyncio
+async def test_compaction_preserves_literal_summary_tag_inside_summary_body(
+    tmp_path: Path,
+) -> None:
+    projection = SQLiteConversationProjection(tmp_path / "messages.sqlite3")
+    await projection.append_user_message(user_id="u:1", conversation_id="c", text="first")
+    await projection.append_user_message(user_id="u:1", conversation_id="c", text="second")
+    runtime = FakeUserRuntime()
+    llm = FakeLlmClient(
+        [
+            AssistantText(
+                text=(
+                    "<analysis>thinking</analysis>\n"
+                    "<summary>kept code: <summary>literal</summary> remains</summary>"
+                )
+            ),
+        ]
+    )
+    compactor = ContextCompactor(
+        projection=projection,
+        runtime=runtime,
+        llm=llm,
+        config=ContextCompactionConfig(
+            max_tokens_per_model=10,
+            reserve_tokens=0,
+            keep_last_messages=1,
+        ),
+    )
+
+    snapshot = await compactor.create_snapshot(conversation_id="c")
+    assert snapshot is not None
+    draft = await compactor.create_draft(
+        user_id="u:1",
+        conversation_id="c",
+        generation=1,
+        snapshot=snapshot,
+    )
+
+    assert draft.summary == "kept code: <summary>literal</summary> remains"
+
+
+@pytest.mark.asyncio
+async def test_compaction_picks_trailing_summary_when_analysis_quotes_a_summary_tag(
+    tmp_path: Path,
+) -> None:
+    projection = SQLiteConversationProjection(tmp_path / "messages.sqlite3")
+    await projection.append_user_message(user_id="u:1", conversation_id="c", text="first")
+    await projection.append_user_message(user_id="u:1", conversation_id="c", text="second")
+    runtime = FakeUserRuntime()
+    llm = FakeLlmClient(
+        [
+            AssistantText(
+                text=(
+                    "<analysis>user quoted &lt;summary&gt;fake nested&lt;/summary&gt; "
+                    "and also a literal <summary>fake nested</summary> inside analysis"
+                    "</analysis>\n<summary>real trailing summary</summary>"
+                )
+            ),
+        ]
+    )
+    compactor = ContextCompactor(
+        projection=projection,
+        runtime=runtime,
+        llm=llm,
+        config=ContextCompactionConfig(
+            max_tokens_per_model=10,
+            reserve_tokens=0,
+            keep_last_messages=1,
+        ),
+    )
+
+    snapshot = await compactor.create_snapshot(conversation_id="c")
+    assert snapshot is not None
+    draft = await compactor.create_draft(
+        user_id="u:1",
+        conversation_id="c",
+        generation=1,
+        snapshot=snapshot,
+    )
+
+    assert draft.summary == "real trailing summary"
+
+
+@pytest.mark.asyncio
+async def test_compaction_retries_archive_write_on_transient_failure(tmp_path: Path) -> None:
+    projection = SQLiteConversationProjection(tmp_path / "messages.sqlite3")
+    await projection.append_user_message(user_id="u:1", conversation_id="c", text="first")
+    await projection.append_user_message(user_id="u:1", conversation_id="c", text="second")
+    runtime = FakeUserRuntime(
+        file_write_results=[
+            RuntimeToolResult(stderr="disk pressure", exit_code=1),
+            RuntimeToolResult(stderr="disk pressure", exit_code=1),
+            RuntimeToolResult(),
+        ],
+    )
+    llm = FakeLlmClient([AssistantText(text="<summary>archive me</summary>")])
+    compactor = ContextCompactor(
+        projection=projection,
+        runtime=runtime,
+        llm=llm,
+        config=ContextCompactionConfig(
+            max_tokens_per_model=10,
+            reserve_tokens=0,
+            keep_last_messages=1,
+        ),
+    )
+
+    snapshot = await compactor.create_snapshot(conversation_id="c")
+    assert snapshot is not None
+    draft = await compactor.create_draft(
+        user_id="u:1",
+        conversation_id="c",
+        generation=1,
+        snapshot=snapshot,
+    )
+    await compactor.commit_draft(
+        user_id="u:1",
+        conversation_id="c",
+        generation=1,
+        draft=draft,
+    )
+
+    assert [call.path for call in runtime.file_write_calls] == [draft.archive_path] * 3
+    summary_rows = [
+        record
+        for record in await projection.list_all_context_items("c")
+        if record.item_kind == "context_summary"
+    ]
+    assert len(summary_rows) == 1
+
+
+@pytest.mark.asyncio
+async def test_compaction_commits_summary_when_archive_write_persistently_fails(
+    tmp_path: Path,
+) -> None:
+    projection = SQLiteConversationProjection(tmp_path / "messages.sqlite3")
+    await projection.append_user_message(user_id="u:1", conversation_id="c", text="first")
+    await projection.append_user_message(user_id="u:1", conversation_id="c", text="second")
+    runtime = FakeUserRuntime(
+        file_write_results=[
+            RuntimeError("docker exec failed"),
+            RuntimeToolResult(stderr="still failing", exit_code=1),
+            RuntimeError("docker exec failed"),
+        ],
+    )
+    llm = FakeLlmClient([AssistantText(text="<summary>archive me</summary>")])
+    compactor = ContextCompactor(
+        projection=projection,
+        runtime=runtime,
+        llm=llm,
+        config=ContextCompactionConfig(
+            max_tokens_per_model=10,
+            reserve_tokens=0,
+            keep_last_messages=1,
+        ),
+    )
+
+    snapshot = await compactor.create_snapshot(conversation_id="c")
+    assert snapshot is not None
+    draft = await compactor.create_draft(
+        user_id="u:1",
+        conversation_id="c",
+        generation=1,
+        snapshot=snapshot,
+    )
+    await compactor.commit_draft(
+        user_id="u:1",
+        conversation_id="c",
+        generation=1,
+        draft=draft,
+    )
+
+    assert len(runtime.file_write_calls) == 3
+    summary_rows = [
+        record
+        for record in await projection.list_all_context_items("c")
+        if record.item_kind == "context_summary"
+    ]
+    assert len(summary_rows) == 1
+    assert summary_rows[0].text == "archive me"
 
 
 class BlockingToolThenTextLlm(LlmClient):
@@ -943,7 +1379,7 @@ class BlockingSummaryLlm(LlmClient):
         if request.tools == []:
             self.summary_started.set()
             await self.release_summary.wait()
-            return AssistantText(text="stale summary")
+            return AssistantText(text="<summary>stale summary</summary>")
         return AssistantText(text="latest")
 
 
