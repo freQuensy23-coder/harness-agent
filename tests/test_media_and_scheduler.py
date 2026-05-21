@@ -49,8 +49,9 @@ from harness_agent.tools import (
 
 
 def test_runtime_layer_has_no_llm_context_import() -> None:
-    runtime_source = Path("src/harness_agent/runtime.py").read_text(encoding="utf-8")
-    assert "harness_agent.llm" not in runtime_source
+    runtime_package = Path("src/harness_agent/runtime")
+    for module in sorted(runtime_package.glob("*.py")):
+        assert "harness_agent.llm" not in module.read_text(encoding="utf-8"), module
 
 
 @pytest.mark.asyncio
