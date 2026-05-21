@@ -24,3 +24,16 @@ runtime:
 
 scheduler:
   poll_seconds: 5
+
+mcp:
+  servers: []
+  # Global MCP servers exposed to every user. The user cannot edit or disable
+  # them from their workspace. Each entry runs inside the user's container via
+  # the same stdio transport as user-defined servers at /workspace/mcp/*.yaml.
+  # On name conflict, the global entry wins.
+  #
+  # Example:
+  # servers:
+  #   - name: local
+  #     command: ["python", "/workspace/mcp_server.py"]
+  #     cwd: /workspace

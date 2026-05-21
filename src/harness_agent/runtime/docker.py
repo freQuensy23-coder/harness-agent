@@ -8,12 +8,11 @@ from pathlib import Path
 from pathlib import PurePosixPath
 from uuid import uuid4
 
-import yaml
 from loguru import logger
 
 from harness_agent.content import WorkspaceFile
 from harness_agent.context import AgentFileSet, Skill
-from harness_agent.mcp_models import McpServerConfig
+from harness_agent.mcp_models import McpServerConfig, parse_mcp_server_yaml
 from harness_agent.runtime.docker_runner import AsyncioDockerRunner
 from harness_agent.runtime.models import (
     DockerProcessResult,
@@ -148,7 +147,9 @@ class DockerUserRuntime(UserRuntime):
         servers: list[McpServerConfig] = []
         for path in [line for line in result.stdout.splitlines() if line.strip()]:
             text = await self._read_text(user_id, path)
-            servers.append(McpServerConfig.model_validate(yaml.safe_load(text)))
+            server = parse_mcp_server_yaml(text, path=path)
+            if server is not None:
+                servers.append(server)
         return servers
 
     async def shell_exec(self, user_id: str, input: ShellExecInput) -> RuntimeToolResult:
