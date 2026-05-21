@@ -2,6 +2,7 @@ from pathlib import Path
 
 import pytest
 
+from harness_agent import events
 from harness_agent.bus import EventBus
 from harness_agent.context import AgentFileSet, ContextBuilder
 from harness_agent.events import (
@@ -107,6 +108,45 @@ async def test_file_write_read_edit_and_shell_exec_are_routed(tmp_path: Path) ->
         "file.edit",
         "file.read",
         "shell.exec",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_agent_turn_publishes_generation_started_before_llm_request(tmp_path: Path) -> None:
+    assert hasattr(events, "AgentGenerationStarted")
+    store = SQLiteEventStore(tmp_path / "events.sqlite3")
+    projection = SQLiteConversationProjection(tmp_path / "messages.sqlite3")
+    runtime = FakeUserRuntime(
+        agent_files=AgentFileSet(soul="S", agents="A", user="U", tools="T"),
+    )
+    llm = FakeLlmClient([AssistantText(text="done")])
+    bus = EventBus(store)
+    agent_turn_handler = AgentTurnHandler(
+        bus=bus,
+        context_builder=ContextBuilder(runtime=runtime),
+        llm=llm,
+        tool_registry=default_tool_registry(),
+        projection=projection,
+    )
+    bus.subscribe(UserTextReceived, ConversationProjector(projection).handle_user_text)
+    bus.subscribe(UserTextReceived, agent_turn_handler.handle_user_text)
+    bus.subscribe(AgentTurnRequested, agent_turn_handler.handle_agent_turn)
+
+    await bus.publish(
+        UserTextReceived(
+            user_id="u:1",
+            conversation_id="cli:1",
+            source="cli",
+            text="hello",
+        )
+    )
+
+    event_types = [event.type for event in await store.list_events()]
+    assert event_types == [
+        "user.text.received",
+        "agent.turn.requested",
+        "agent.generation.started",
+        "assistant.text.produced",
     ]
 
 

@@ -102,6 +102,7 @@ async def test_telegram_say_hi_builds_context_from_runtime_and_replies(tmp_path:
         "telegram.text.received",
         "user.text.received",
         "agent.turn.requested",
+        "agent.generation.started",
         "assistant.text.produced",
     ]
     assert await projection.list_messages("tg:456") == [
@@ -247,11 +248,13 @@ async def test_tool_call_executes_in_runtime_without_exposing_docker(tmp_path: P
     assert [event.type for event in await store.list_events()] == [
         "user.text.received",
         "agent.turn.requested",
+        "agent.generation.started",
         "tool.call.requested",
         "tool.call.completed",
+        "agent.generation.started",
         "assistant.text.produced",
     ]
-    assert (await store.list_events())[2].type == "tool.call.requested"
+    assert (await store.list_events())[3].type == "tool.call.requested"
     assert runtime.shell_exec_calls == [ShellExecInput(command="pwd", cwd="/workspace")]
     assert llm.requests[0].tools[0].name == "shell.exec"
     assert not any("docker" in request.system.lower() for request in llm.requests)

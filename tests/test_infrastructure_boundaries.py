@@ -4,11 +4,15 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from aiogram.exceptions import TelegramBadRequest
+from aiogram.methods import SendMessage
 
+from harness_agent import events
 from harness_agent.adapters.cli import event_from_cli_send
-from harness_agent.adapters.telegram import event_from_aiogram_message
+from harness_agent.adapters.telegram import AiogramTelegramAdapter, event_from_aiogram_message
 from harness_agent.config import load_config
 from harness_agent.context import Skill
+from harness_agent.events import AssistantTextProduced, TelegramReplyTarget
 from harness_agent.runtime import DockerProcessResult, DockerUserRuntime, SQLiteSpawnedProcessStore
 from harness_agent.tools import (
     FileWriteInput,
@@ -63,6 +67,85 @@ def test_cli_adapter_only_creates_event() -> None:
     assert event.cli_user_id == "123"
     assert event.conversation_id == "cli:123"
     assert event.text == "Say hi"
+
+
+@pytest.mark.asyncio
+async def test_telegram_adapter_sends_assistant_text_as_markdown() -> None:
+    adapter = AiogramTelegramAdapter(token="123:test", bus=RecordingBus())
+    bot = RecordingTelegramBot()
+    adapter._bot = bot
+
+    await adapter.handle_assistant_text(
+        AssistantTextProduced(
+            user_id="u:123",
+            conversation_id="tg:456",
+            generation=1,
+            text="*bold*",
+            reply_target=TelegramReplyTarget(chat_id=456),
+        )
+    )
+
+    assert bot.messages == [
+        {
+            "chat_id": 456,
+            "text": "*bold*",
+            "parse_mode": "Markdown",
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_telegram_adapter_falls_back_to_plain_text_for_invalid_markdown() -> None:
+    adapter = AiogramTelegramAdapter(token="123:test", bus=RecordingBus())
+    bot = RecordingTelegramBot(fail_markdown=True)
+    adapter._bot = bot
+
+    await adapter.handle_assistant_text(
+        AssistantTextProduced(
+            user_id="u:123",
+            conversation_id="tg:456",
+            generation=1,
+            text="Broken *markdown",
+            reply_target=TelegramReplyTarget(chat_id=456),
+        )
+    )
+
+    assert bot.messages == [
+        {
+            "chat_id": 456,
+            "text": "Broken *markdown",
+            "parse_mode": "Markdown",
+        },
+        {
+            "chat_id": 456,
+            "text": "Broken *markdown",
+            "parse_mode": None,
+        },
+    ]
+
+
+@pytest.mark.asyncio
+async def test_telegram_adapter_shows_typing_on_generation_start() -> None:
+    assert hasattr(events, "AgentGenerationStarted")
+    adapter = AiogramTelegramAdapter(token="123:test", bus=RecordingBus())
+    bot = RecordingTelegramBot()
+    adapter._bot = bot
+
+    await adapter.handle_generation_started(
+        events.AgentGenerationStarted(
+            user_id="u:123",
+            conversation_id="tg:456",
+            generation=1,
+            reply_target=TelegramReplyTarget(chat_id=456),
+        )
+    )
+
+    assert bot.chat_actions == [
+        {
+            "chat_id": 456,
+            "action": "typing",
+        }
+    ]
 
 
 @pytest.mark.asyncio
@@ -227,3 +310,43 @@ class RecordingDockerRunner:
     ) -> DockerProcessResult:
         self.calls.append((argv, stdin))
         return self._results.pop(0)
+
+
+class RecordingBus:
+    async def publish(self, event) -> None:
+        self.event = event
+
+
+class RecordingTelegramBot:
+    def __init__(self, *, fail_markdown: bool = False) -> None:
+        self._fail_markdown = fail_markdown
+        self.messages: list[dict] = []
+        self.chat_actions: list[dict] = []
+
+    async def send_message(
+        self,
+        *,
+        chat_id: int,
+        text: str,
+        parse_mode: str | None = None,
+    ) -> None:
+        self.messages.append(
+            {
+                "chat_id": chat_id,
+                "text": text,
+                "parse_mode": parse_mode,
+            }
+        )
+        if self._fail_markdown and parse_mode == "Markdown":
+            raise TelegramBadRequest(
+                method=SendMessage(chat_id=chat_id, text=text),
+                message="can't parse entities",
+            )
+
+    async def send_chat_action(self, *, chat_id: int, action: str) -> None:
+        self.chat_actions.append(
+            {
+                "chat_id": chat_id,
+                "action": action,
+            }
+        )

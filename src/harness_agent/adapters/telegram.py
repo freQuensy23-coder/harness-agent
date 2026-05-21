@@ -3,16 +3,19 @@ import re
 from typing import Literal
 
 from aiogram import Bot, Dispatcher, Router
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import CommandStart
 from aiogram.types import Message
 
 from harness_agent.bus import EventBus
 from harness_agent.events import (
+    AgentGenerationStarted,
     AssistantTextProduced,
     InboundAttachment,
-    TelegramReplyTarget,
+    ReplyTarget,
     TelegramTextReceived,
 )
+from harness_agent.handlers import EventBatch
 
 
 def event_from_aiogram_message(
@@ -126,14 +129,46 @@ class AiogramTelegramAdapter:
     async def start_polling(self) -> None:
         await self._dispatcher.start_polling(self._bot)  # pyright: ignore[reportUnknownMemberType]
 
+    def register_outbound_handlers(self) -> None:
+        self._bus.subscribe(AgentGenerationStarted, self.handle_generation_started)
+        self._bus.subscribe(AssistantTextProduced, self.handle_assistant_text)
+
+    async def handle_generation_started(self, event: AgentGenerationStarted) -> EventBatch:
+        chat_id = telegram_chat_id(event.reply_target)
+        if chat_id is None:
+            return ()
+        await self._bot.send_chat_action(chat_id=chat_id, action="typing")
+        return ()
+
+    async def handle_assistant_text(self, event: AssistantTextProduced) -> EventBatch:
+        chat_id = telegram_chat_id(event.reply_target)
+        if chat_id is None:
+            return ()
+        await self._send_markdown_or_plain(chat_id=chat_id, text=event.text)
+        return ()
+
     async def send_assistant_text(self, event: AssistantTextProduced) -> None:
-        reply_target = event.reply_target
-        if not isinstance(reply_target, TelegramReplyTarget):
+        chat_id = telegram_chat_id(event.reply_target)
+        if chat_id is None:
             raise ValueError("Assistant text has no Telegram reply target")
-        await self._bot.send_message(chat_id=reply_target.chat_id, text=event.text)
+        await self._send_markdown_or_plain(chat_id=chat_id, text=event.text)
+
+    async def _send_markdown_or_plain(self, *, chat_id: int, text: str) -> None:
+        try:
+            await self._bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown")
+        except TelegramBadRequest:
+            await self._bot.send_message(chat_id=chat_id, text=text)
 
     async def _on_start(self, message: Message) -> None:
         await self._on_message(message)
 
     async def _on_message(self, message: Message) -> None:
         await self._bus.publish(await event_from_aiogram_message_with_files(message, self._bot))
+
+
+def telegram_chat_id(reply_target: ReplyTarget | None) -> int | None:
+    if reply_target is None:
+        return None
+    if reply_target.kind != "telegram":
+        return None
+    return reply_target.chat_id

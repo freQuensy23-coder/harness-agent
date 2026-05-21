@@ -110,6 +110,15 @@ uv run harness-agent --config harness.yaml telegram
 Tests
 -----
 
+Unit tests — no Docker, no network, no external APIs:
+
 ```bash
 uv run pytest
+```
+
+Integration tests — require a running Docker daemon, and the OpenRouter
+config at `~/.config/harness-agent/openrouter.yaml` for the real-LLM cases:
+
+```bash
+uv run pytest tests/integration
 ```
