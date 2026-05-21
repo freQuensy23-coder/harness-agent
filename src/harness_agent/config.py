@@ -54,6 +54,18 @@ class SchedulerConfig(BaseModel):
     poll_seconds: float = 5
 
 
+class BrowserUseConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    api_key: str
+    base_url: str = "https://api.browser-use.com/api/v3"
+    default_model: str = "bu-mini"
+    profile_cap: int = 5
+    poll_interval_seconds: float = 3.0
+    run_timeout_seconds: float = 600.0
+    request_timeout_seconds: float = 30.0
+
+
 class HarnessConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -63,6 +75,7 @@ class HarnessConfig(BaseModel):
     telegram: TelegramConfig = Field(default_factory=TelegramConfig)
     runtime: RuntimeConfig = Field(default_factory=RuntimeConfig)
     scheduler: SchedulerConfig = Field(default_factory=SchedulerConfig)
+    browser_use: BrowserUseConfig
 
 
 def load_config(path: Path) -> HarnessConfig:

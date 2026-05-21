@@ -1,10 +1,21 @@
-from pathlib import Path
+import asyncio
 from asyncio import Queue
+from pathlib import Path
 
 from loguru import logger
 
 from harness_agent.adapters.cli import event_from_cli_send
 from harness_agent.adapters.telegram import AiogramTelegramAdapter
+from harness_agent.browser_use import (
+    BrowserSessionPollHandler,
+    BrowserSessionPump,
+    BrowserSessionPumpService,
+    BrowserSessionResultWaiter,
+    BrowserUseService,
+    HttpxBrowserUseClient,
+    SQLiteBrowserProfileStore,
+    SQLiteBrowserSessionStore,
+)
 from harness_agent.bus import EventBus
 from harness_agent.config import HarnessConfig
 from harness_agent.context import ContextBuilder
@@ -12,6 +23,10 @@ from harness_agent.events import (
     AgentEvent,
     AgentTurnRequested,
     AssistantTextProduced,
+    BrowserSessionCompleted,
+    BrowserSessionFailed,
+    BrowserSessionPollDue,
+    BrowserSessionStopped,
     CliTextReceived,
     ScheduledMessageDue,
     TelegramTextReceived,
@@ -56,6 +71,8 @@ class HarnessApp:
         schedules_path = _derived_db_path(db_path, "schedules")
         sub_agents_path = _derived_db_path(db_path, "subagents")
         tasks_path = _derived_db_path(db_path, "tasks")
+        browser_profiles_path = _derived_db_path(db_path, "browser_profiles")
+        browser_sessions_path = _derived_db_path(db_path, "browser_sessions")
 
         self.event_store = SQLiteEventStore(events_path)
         self.llm_audit_store = SQLiteLlmAuditStore(llm_path)
@@ -63,6 +80,8 @@ class HarnessApp:
         self.schedule_store = SQLiteScheduleStore(schedules_path)
         self.sub_agent_store = SQLiteSubAgentStore(sub_agents_path)
         self.task_store = SQLiteTaskStore(tasks_path)
+        self.browser_profile_store = SQLiteBrowserProfileStore(browser_profiles_path)
+        self.browser_session_store = SQLiteBrowserSessionStore(browser_sessions_path)
         self.bus = EventBus(self.event_store)
         self.turn_coordinator = ConversationTurnCoordinator()
         self.tool_results = ToolCallResultWaiter()
@@ -91,13 +110,61 @@ class HarnessApp:
             store=self.sub_agent_store,
             result_waiter=self.sub_agent_results,
         )
+        self.browser_use_results = BrowserSessionResultWaiter()
+        self.browser_use_client = HttpxBrowserUseClient(
+            api_key=config.browser_use.api_key,
+            base_url=config.browser_use.base_url,
+            timeout_seconds=config.browser_use.request_timeout_seconds,
+        )
+        self.browser_use_service = BrowserUseService(
+            bus=self.bus,
+            client=self.browser_use_client,
+            profile_store=self.browser_profile_store,
+            session_store=self.browser_session_store,
+            result_waiter=self.browser_use_results,
+            profile_cap=config.browser_use.profile_cap,
+            default_model=config.browser_use.default_model,
+            default_run_timeout_seconds=config.browser_use.run_timeout_seconds,
+        )
+        self.browser_use_poll_handler = BrowserSessionPollHandler(
+            client=self.browser_use_client,
+            session_store=self.browser_session_store,
+        )
+        self.browser_use_pump_service = BrowserSessionPumpService(
+            pump=BrowserSessionPump(
+                session_store=self.browser_session_store,
+                bus=self.bus,
+            ),
+            poll_seconds=config.browser_use.poll_interval_seconds,
+        )
+        self.scheduler_service = SchedulerService(
+            pump=SchedulerPump(store=self.schedule_store, bus=self.bus),
+            poll_seconds=self._config.scheduler.poll_seconds,
+        )
         self.telegram: AiogramTelegramAdapter | None = None
-        self.scheduler_service: SchedulerService | None = None
         self._cli_replies: dict[str, Queue[str]] = {}
+        self._background_uses = 0
+        self._background_lock = asyncio.Lock()
         self._wire()
 
     async def publish(self, event: AgentEvent) -> None:
         await self.bus.publish(event)
+
+    async def start_background_services(self) -> None:
+        async with self._background_lock:
+            if self._background_uses == 0:
+                await self.scheduler_service.start()
+                await self.browser_use_pump_service.start()
+            self._background_uses += 1
+
+    async def stop_background_services(self) -> None:
+        async with self._background_lock:
+            self._background_uses -= 1
+            if self._background_uses > 0:
+                return
+            await self.browser_use_pump_service.stop()
+            await self.scheduler_service.stop()
+            await self.browser_use_client.aclose()
 
     async def send_cli(
         self,
@@ -112,9 +179,13 @@ class HarnessApp:
             conversation_id=conversation_id,
         )
         self._cli_replies[event.request_id] = Queue(maxsize=1)
-        await self.bus.publish(event)
-        reply = await self._cli_replies[event.request_id].get()
-        del self._cli_replies[event.request_id]
+        await self.start_background_services()
+        try:
+            await self.bus.publish(event)
+            reply = await self._cli_replies[event.request_id].get()
+        finally:
+            del self._cli_replies[event.request_id]
+            await self.stop_background_services()
         return reply
 
     async def run_telegram(self) -> None:
@@ -126,17 +197,12 @@ class HarnessApp:
             token=self._config.telegram.bot_token,
             bus=self.bus,
         )
-        self.scheduler_service = SchedulerService(
-            pump=SchedulerPump(store=self.schedule_store, bus=self.bus),
-            poll_seconds=self._config.scheduler.poll_seconds,
-        )
-        await self.scheduler_service.start()
+        await self.start_background_services()
         logger.info("Starting Telegram polling")
         try:
             await self.telegram.start_polling()
         finally:
-            if self.scheduler_service is not None:
-                await self.scheduler_service.stop()
+            await self.stop_background_services()
 
     def _wire(self) -> None:
         identity_handler = IdentityHandler(StaticIdentityResolver())
@@ -162,6 +228,7 @@ class HarnessApp:
             web_fetcher=HttpxWebFetcher(),
             mcp_manager=self.mcp_manager,
             sub_agents=self.sub_agents,
+            browser_use_service=self.browser_use_service,
         )
         scheduler_due_handler = SchedulerDueHandler()
         self.bus.subscribe(TelegramTextReceived, identity_handler.handle_telegram_text)
@@ -181,6 +248,22 @@ class HarnessApp:
         )
         self.bus.subscribe(AssistantTextProduced, self._send_telegram_reply)
         self.bus.subscribe(AssistantTextProduced, self._send_cli_reply)
+        self.bus.subscribe(
+            BrowserSessionPollDue,
+            self.browser_use_poll_handler.handle_poll_due,
+        )
+        self.bus.subscribe(
+            BrowserSessionCompleted,
+            self.browser_use_results.handle_completed,
+        )
+        self.bus.subscribe(
+            BrowserSessionFailed,
+            self.browser_use_results.handle_failed,
+        )
+        self.bus.subscribe(
+            BrowserSessionStopped,
+            self.browser_use_results.handle_stopped,
+        )
 
     async def _send_telegram_reply(self, event: AssistantTextProduced) -> tuple:
         if event.reply_target is None:

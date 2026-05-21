@@ -24,3 +24,12 @@ runtime:
 
 scheduler:
   poll_seconds: 5
+
+browser_use:
+  api_key: replace-me
+  base_url: https://api.browser-use.com/api/v3
+  default_model: bu-mini
+  profile_cap: 5
+  poll_interval_seconds: 3.0
+  run_timeout_seconds: 600.0
+  request_timeout_seconds: 30.0

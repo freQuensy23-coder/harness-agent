@@ -11,6 +11,9 @@ import pytest
 import yaml
 
 
+pytestmark = pytest.mark.integration
+
+
 def test_cli_real_e2e_openrouter_docker_sqlite(tmp_path: Path) -> None:
     openrouter_config_path = Path.home() / ".config" / "harness-agent" / "openrouter.yaml"
     if not openrouter_config_path.exists():
@@ -40,6 +43,8 @@ def test_cli_real_e2e_openrouter_docker_sqlite(tmp_path: Path) -> None:
                 "    network: bridge",
                 "    memory: 1g",
                 "    cpus: \"1\"",
+                "browser_use:",
+                "  api_key: test-bu-key",
             ]
         ),
         encoding="utf-8",
@@ -184,6 +189,8 @@ def test_cli_real_e2e_openrouter_docker_image_file_read(tmp_path: Path) -> None:
                 "    network: bridge",
                 "    memory: 1g",
                 "    cpus: \"1\"",
+                "browser_use:",
+                "  api_key: test-bu-key",
             ]
         ),
         encoding="utf-8",
@@ -323,6 +330,8 @@ def test_cli_real_e2e_openrouter_docker_subagent_file_work(tmp_path: Path) -> No
                 "    network: bridge",
                 "    memory: 1g",
                 "    cpus: \"1\"",
+                "browser_use:",
+                "  api_key: test-bu-key",
             ]
         ),
         encoding="utf-8",

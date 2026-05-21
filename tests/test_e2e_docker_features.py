@@ -33,6 +33,9 @@ from harness_agent.tools import (
 from harness_agent.web_fetch import HttpxWebFetcher
 
 
+pytestmark = pytest.mark.integration
+
+
 @pytest.fixture
 def docker_runtime():
     prefix = f"harness-e2e-{uuid4().hex[:8]}"

@@ -175,6 +175,12 @@ async def test_telegram_say_hi_builds_context_from_runtime_and_replies(tmp_path:
         "agent.result",
         "agent.list",
         "agent.cancel",
+        "browser.run",
+        "browser.spawn",
+        "browser.get",
+        "browser.send",
+        "browser.stop",
+        "browser.list",
     ]
     assert not any("docker" in tool.name for tool in request.tools)
     assert runtime.read_agent_files_calls == ["u:123"]

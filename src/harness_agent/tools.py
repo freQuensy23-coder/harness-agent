@@ -152,6 +152,40 @@ class AgentListInput(BaseModel):
     include_completed: bool = True
 
 
+class BrowserRunInput(BaseModel):
+    task: str = Field(min_length=1)
+    model: str | None = None
+    proxy_country_code: str | None = None
+    timeout_seconds: float | None = None
+
+
+class BrowserSpawnInput(BaseModel):
+    task: str = Field(min_length=1)
+    model: str | None = None
+    proxy_country_code: str | None = None
+
+
+class BrowserGetInput(BaseModel):
+    session_id: str
+    include_messages: bool = False
+    messages_limit: int = Field(default=20, ge=1, le=100)
+
+
+class BrowserSendInput(BaseModel):
+    session_id: str
+    task: str = Field(min_length=1)
+
+
+class BrowserStopInput(BaseModel):
+    session_id: str
+    strategy: Literal["task", "session"] = "session"
+
+
+class BrowserListInput(BaseModel):
+    include_terminal: bool = False
+    limit: int = Field(default=20, ge=1, le=100)
+
+
 ToolInputModel = type[BaseModel]
 
 
@@ -184,6 +218,12 @@ TOOL_INPUT_MODELS: dict[str, ToolInputModel] = {
     "agent.result": AgentResultInput,
     "agent.list": AgentListInput,
     "agent.cancel": AgentCancelInput,
+    "browser.run": BrowserRunInput,
+    "browser.spawn": BrowserSpawnInput,
+    "browser.get": BrowserGetInput,
+    "browser.send": BrowserSendInput,
+    "browser.stop": BrowserStopInput,
+    "browser.list": BrowserListInput,
 }
 
 
@@ -249,6 +289,12 @@ ToolName = Literal[
     "agent.result",
     "agent.list",
     "agent.cancel",
+    "browser.run",
+    "browser.spawn",
+    "browser.get",
+    "browser.send",
+    "browser.stop",
+    "browser.list",
 ]
 ToolInput = (
     ShellExecInput
@@ -279,6 +325,12 @@ ToolInput = (
     | AgentResultInput
     | AgentListInput
     | AgentCancelInput
+    | BrowserRunInput
+    | BrowserSpawnInput
+    | BrowserGetInput
+    | BrowserSendInput
+    | BrowserStopInput
+    | BrowserListInput
     | McpToolInput
 )
 
@@ -303,8 +355,11 @@ def parse_known_tool_input(name: str, payload: Any) -> ToolInput:
 
 
 def default_tool_registry() -> ToolRegistry:
-    return ToolRegistry(
-        tools=[
+    return ToolRegistry(tools=_base_tool_specs() + _browser_tool_specs())
+
+
+def _base_tool_specs() -> list["ToolSpec"]:
+    return [
             ToolSpec(
                 name="shell.exec",
                 description="Run a shell command in the user's workspace.",
@@ -457,5 +512,57 @@ def default_tool_registry() -> ToolRegistry:
                 description="Cancel a running background sub-agent.",
                 input_model=AgentCancelInput,
             ),
-        ]
-    )
+    ]
+
+
+def _browser_tool_specs() -> list["ToolSpec"]:
+    return [
+        ToolSpec(
+            name="browser.run",
+            description=(
+                "Run a browser-use cloud task to completion and return its final "
+                "output. Creates a browser profile for this user on first use; "
+                "the profile persists cookies and logins across sessions."
+            ),
+            input_model=BrowserRunInput,
+        ),
+        ToolSpec(
+            name="browser.spawn",
+            description=(
+                "Start a keep-alive browser-use cloud session and return its id. "
+                "Use browser.send to submit follow-up tasks, browser.get for "
+                "status, and browser.stop to terminate."
+            ),
+            input_model=BrowserSpawnInput,
+        ),
+        ToolSpec(
+            name="browser.get",
+            description=(
+                "Read status, step count, output, and (optionally) recent "
+                "messages of a browser session owned by the current user."
+            ),
+            input_model=BrowserGetInput,
+        ),
+        ToolSpec(
+            name="browser.send",
+            description=(
+                "Submit a follow-up task to a keep-alive browser session owned "
+                "by the current user; the session must be idle."
+            ),
+            input_model=BrowserSendInput,
+        ),
+        ToolSpec(
+            name="browser.stop",
+            description=(
+                "Stop a browser session owned by the current user. "
+                "strategy='task' halts only the current task; "
+                "strategy='session' tears down the entire sandbox."
+            ),
+            input_model=BrowserStopInput,
+        ),
+        ToolSpec(
+            name="browser.list",
+            description="List browser sessions owned by the current user.",
+            input_model=BrowserListInput,
+        ),
+    ]

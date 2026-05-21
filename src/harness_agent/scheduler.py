@@ -363,6 +363,8 @@ class SchedulerService:
         self._task: asyncio.Task | None = None
 
     async def start(self) -> None:
+        if self._task is not None:
+            return
         self._task = asyncio.create_task(self._run())
 
     async def stop(self) -> None:
@@ -373,6 +375,7 @@ class SchedulerService:
             await self._task
         except asyncio.CancelledError:
             pass
+        self._task = None
 
     async def _run(self) -> None:
         while True:

@@ -4,6 +4,11 @@ from datetime import UTC, datetime
 
 from pydantic import BaseModel, Field
 
+from harness_agent.browser_use import (
+    BrowserUseService,
+    render_browser_session,
+    render_browser_sessions,
+)
 from harness_agent.content import ContentRef, content_ref_from_workspace_file
 from harness_agent.events import EventBase, ToolCallCompleted, ToolCallRequested
 from harness_agent.mcp import McpManager
@@ -21,6 +26,12 @@ from harness_agent.tools import (
     AgentResultInput,
     AgentRunInput,
     AgentSpawnInput,
+    BrowserGetInput,
+    BrowserListInput,
+    BrowserRunInput,
+    BrowserSendInput,
+    BrowserSpawnInput,
+    BrowserStopInput,
     FileEditInput,
     FileGlobInput,
     FileGrepInput,
@@ -92,6 +103,7 @@ class ToolCallExecutor:
         web_fetcher: WebFetcher | None = None,
         mcp_manager: McpManager | None = None,
         sub_agents: SubAgentService | None = None,
+        browser_use_service: BrowserUseService | None = None,
     ) -> None:
         self._runtime = runtime
         self._task_store = task_store
@@ -99,6 +111,7 @@ class ToolCallExecutor:
         self._web_fetcher = web_fetcher
         self._mcp_manager = mcp_manager
         self._sub_agents = sub_agents
+        self._browser_use = browser_use_service
         self._tool_executors: dict[str, ToolExecutor] = {
             "shell.exec": self._shell_exec,
             "shell.spawn": self._shell_spawn,
@@ -127,6 +140,12 @@ class ToolCallExecutor:
             "agent.result": self._agent_result,
             "agent.list": self._agent_list,
             "agent.cancel": self._agent_cancel,
+            "browser.run": self._browser_run,
+            "browser.spawn": self._browser_spawn,
+            "browser.get": self._browser_get,
+            "browser.send": self._browser_send,
+            "browser.stop": self._browser_stop,
+            "browser.list": self._browser_list,
         }
 
     async def handle_tool_call_requested(self, event: ToolCallRequested) -> EventBatch:
@@ -529,6 +548,85 @@ class ToolCallExecutor:
             return RuntimeToolResult(stderr=f"Unknown sub-agent: {input.agent_id}\n", exit_code=1)
         return self._text_result(render_sub_agent_record(record))
 
+    async def _browser_run(
+        self,
+        user_id: str,
+        event: ToolCallRequested,
+    ) -> RuntimeToolResult:
+        input = BrowserRunInput.model_validate(event.input)
+        record = await self._require_browser_use().run(
+            user_id=user_id,
+            conversation_id=event.conversation_id,
+            generation=event.generation,
+            parent_call_id=event.call_id,
+            input=input,
+        )
+        exit_code = 0 if record.status == "completed" and record.error is None else 1
+        return RuntimeToolResult(
+            stdout=render_browser_session(record),
+            stderr="" if record.error is None else record.error,
+            exit_code=exit_code,
+        )
+
+    async def _browser_spawn(
+        self,
+        user_id: str,
+        event: ToolCallRequested,
+    ) -> RuntimeToolResult:
+        input = BrowserSpawnInput.model_validate(event.input)
+        record = await self._require_browser_use().spawn(
+            user_id=user_id,
+            conversation_id=event.conversation_id,
+            generation=event.generation,
+            parent_call_id=event.call_id,
+            input=input,
+        )
+        return self._text_result(render_browser_session(record))
+
+    async def _browser_get(
+        self,
+        user_id: str,
+        event: ToolCallRequested,
+    ) -> RuntimeToolResult:
+        input = BrowserGetInput.model_validate(event.input)
+        record, messages = await self._require_browser_use().get(
+            user_id=user_id,
+            input=input,
+        )
+        return self._text_result(
+            render_browser_session(record, messages=messages if input.include_messages else None)
+        )
+
+    async def _browser_send(
+        self,
+        user_id: str,
+        event: ToolCallRequested,
+    ) -> RuntimeToolResult:
+        input = BrowserSendInput.model_validate(event.input)
+        record = await self._require_browser_use().send(user_id=user_id, input=input)
+        return self._text_result(render_browser_session(record))
+
+    async def _browser_stop(
+        self,
+        user_id: str,
+        event: ToolCallRequested,
+    ) -> RuntimeToolResult:
+        input = BrowserStopInput.model_validate(event.input)
+        record = await self._require_browser_use().stop(user_id=user_id, input=input)
+        return self._text_result(render_browser_session(record))
+
+    async def _browser_list(
+        self,
+        user_id: str,
+        event: ToolCallRequested,
+    ) -> RuntimeToolResult:
+        input = BrowserListInput.model_validate(event.input)
+        records = await self._require_browser_use().list_for_user(
+            user_id=user_id,
+            input=input,
+        )
+        return self._text_result(render_browser_sessions(records))
+
     def _require_task_store(self) -> SQLiteTaskStore:
         if self._task_store is None:
             raise RuntimeError("task store is not configured")
@@ -543,6 +641,11 @@ class ToolCallExecutor:
         if self._sub_agents is None:
             raise RuntimeError("sub-agent service is not configured")
         return self._sub_agents
+
+    def _require_browser_use(self) -> BrowserUseService:
+        if self._browser_use is None:
+            raise RuntimeError("browser-use service is not configured")
+        return self._browser_use
 
     def _text_result(self, text: str) -> RuntimeToolResult:
         return RuntimeToolResult(stdout=text)

@@ -20,6 +20,8 @@ server:
   port: 8080
 llm:
   api_key: test-key
+browser_use:
+  api_key: test-bu-key
 unexpected: true
 """,
         encoding="utf-8",

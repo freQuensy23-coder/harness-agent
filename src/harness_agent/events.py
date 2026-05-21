@@ -178,6 +178,78 @@ class SubAgentCancelled(EventBase):
     child_conversation_id: str
 
 
+class BrowserProfileCreated(EventBase):
+    type: Literal["browser.profile.created"] = "browser.profile.created"
+    user_id: str
+    cloud_profile_id: str
+
+
+class BrowserProfileEvicted(EventBase):
+    type: Literal["browser.profile.evicted"] = "browser.profile.evicted"
+    evicted_user_id: str
+    cloud_profile_id: str
+    requested_by_user_id: str
+
+
+class BrowserSessionStarted(EventBase):
+    type: Literal["browser.session.started"] = "browser.session.started"
+    session_id: str
+    user_id: str
+    conversation_id: str
+    generation: int
+    parent_call_id: str
+    cloud_session_id: str
+    cloud_profile_id: str
+    live_url: str | None = None
+
+
+class BrowserSessionPollDue(EventBase):
+    type: Literal["browser.session.poll_due"] = "browser.session.poll_due"
+    session_id: str
+    user_id: str
+
+
+class BrowserSessionMessageReceived(EventBase):
+    type: Literal["browser.session.message_received"] = "browser.session.message_received"
+    session_id: str
+    user_id: str
+    conversation_id: str
+    cloud_session_id: str
+    cloud_message_id: str
+    role: str
+    summary: str | None = None
+    data: str
+
+
+class BrowserSessionCompleted(EventBase):
+    type: Literal["browser.session.completed"] = "browser.session.completed"
+    session_id: str
+    user_id: str
+    conversation_id: str
+    cloud_session_id: str
+    output: str | None = None
+    step_count: int = 0
+
+
+class BrowserSessionFailed(EventBase):
+    type: Literal["browser.session.failed"] = "browser.session.failed"
+    session_id: str
+    user_id: str
+    conversation_id: str
+    cloud_session_id: str
+    status: str
+    error: str | None = None
+
+
+class BrowserSessionStopped(EventBase):
+    type: Literal["browser.session.stopped"] = "browser.session.stopped"
+    session_id: str
+    user_id: str
+    conversation_id: str
+    cloud_session_id: str
+    requested_by_user_id: str
+
+
 AgentEvent = Annotated[
     TelegramTextReceived
     | CliTextReceived
@@ -191,6 +263,14 @@ AgentEvent = Annotated[
     | SubAgentStarted
     | SubAgentCompleted
     | SubAgentFailed
-    | SubAgentCancelled,
+    | SubAgentCancelled
+    | BrowserProfileCreated
+    | BrowserProfileEvicted
+    | BrowserSessionStarted
+    | BrowserSessionPollDue
+    | BrowserSessionMessageReceived
+    | BrowserSessionCompleted
+    | BrowserSessionFailed
+    | BrowserSessionStopped,
     Field(discriminator="type"),
 ]
