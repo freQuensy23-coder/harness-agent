@@ -655,6 +655,35 @@ async def test_different_users_cannot_see_each_others_sessions_or_runs(tmp_path:
 
 
 @pytest.mark.asyncio
+async def test_stopped_with_task_success_emits_completed(tmp_path: Path) -> None:
+    sequence = [
+        CloudSessionState.model_validate({
+            "id": "x",
+            "status": "stopped",
+            "stepCount": 3,
+            "output": "Example Domain",
+            "isTaskSuccessful": True,
+        }),
+    ]
+    service, _, _, _, pump, _, published = _build(tmp_path, status_sequence=sequence)
+    record = await _run_with_ticker(
+        pump,
+        service.run(
+            user_id="alice",
+            conversation_id="c1",
+            generation=1,
+            parent_call_id="p1",
+            input=BrowserRunInput(task="open example.com", timeout_seconds=10.0),
+        ),
+    )
+    assert record.status == "completed"
+    assert record.output == "Example Domain"
+    completions = [e for e in published if isinstance(e, BrowserSessionCompleted)]
+    assert len(completions) == 1
+    assert completions[0].output == "Example Domain"
+
+
+@pytest.mark.asyncio
 async def test_cloud_stop_emits_stopped_not_failed(tmp_path: Path) -> None:
     sequence = [CloudSessionState(id="x", status="stopped", step_count=2)]
     service, _, _, _, pump, _, published = _build(tmp_path, status_sequence=sequence)

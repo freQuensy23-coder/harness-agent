@@ -672,6 +672,30 @@ class BrowserSessionPollHandler:
                 )
             )
 
+        if _is_success_terminal(state, record):
+            output_text = _render_output(state.output)
+            local_status = (
+                "idle"
+                if record.keep_alive and state.status == "idle"
+                else LOCAL_STATUS_COMPLETED
+            )
+            await self._sessions.update_status(
+                session_id=record.session_id,
+                status=local_status,
+                output=output_text,
+            )
+            emitted.append(
+                BrowserSessionCompleted(
+                    session_id=record.session_id,
+                    user_id=record.user_id,
+                    conversation_id=record.conversation_id,
+                    cloud_session_id=record.cloud_session_id,
+                    output=output_text,
+                    step_count=state.step_count,
+                )
+            )
+            return tuple(emitted)
+
         if state.status == "stopped":
             await self._sessions.update_status(
                 session_id=record.session_id,
@@ -701,26 +725,6 @@ class BrowserSessionPollHandler:
                     cloud_session_id=record.cloud_session_id,
                     status=state.status,
                     error=None,
-                )
-            )
-            return tuple(emitted)
-
-        if state.status == "idle" and record.status != "idle":
-            output_text = _render_output(state.output)
-            local_status = "idle" if record.keep_alive else LOCAL_STATUS_COMPLETED
-            await self._sessions.update_status(
-                session_id=record.session_id,
-                status=local_status,
-                output=output_text,
-            )
-            emitted.append(
-                BrowserSessionCompleted(
-                    session_id=record.session_id,
-                    user_id=record.user_id,
-                    conversation_id=record.conversation_id,
-                    cloud_session_id=record.cloud_session_id,
-                    output=output_text,
-                    step_count=state.step_count,
                 )
             )
             return tuple(emitted)
@@ -1195,6 +1199,17 @@ def render_browser_sessions(records: list[BrowserSessionRecord]) -> str:
             for r in records
         ]
     )
+
+
+def _is_success_terminal(
+    state: CloudSessionState,
+    record: BrowserSessionRecord,
+) -> bool:
+    if state.status == "idle" and record.status != "idle":
+        return True
+    if state.status == "stopped" and state.is_task_successful is True:
+        return True
+    return False
 
 
 def _render_output(output: Any) -> str | None:
