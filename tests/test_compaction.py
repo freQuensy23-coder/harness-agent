@@ -5,6 +5,7 @@ import aiosqlite
 import pytest
 
 from harness_agent.compaction import (
+    CompactionArchiveHandler,
     CompactionConfig,
     CompactionService,
     _strip_analysis,
@@ -35,6 +36,7 @@ from harness_agent.projections import (
     ConversationItemRecord,
     SQLiteConversationProjection,
 )
+from harness_agent.runtime import FakeUserRuntime, RuntimeToolResult
 from harness_agent.tools import default_tool_registry
 
 
@@ -891,3 +893,213 @@ async def test_handle_summary_ready_emits_conflicted_when_max_sequence_advanced(
     # No context_summary row should have been written.
     rows = await projection.list_all_context_items("c")
     assert all(r.item_kind != CONTEXT_SUMMARY_KIND for r in rows)
+
+
+def _make_committed(
+    *,
+    compaction_id: str = "cid:test",
+    conversation_id: str = "c",
+    user_id: str = "u:1",
+    generation: int = 1,
+    archive_path: str = "/workspace/.old-sessions/cid:test.jsonl",
+    compacted_sequences: list[int],
+) -> CompactionCommitted:
+    return CompactionCommitted(
+        compaction_id=compaction_id,
+        user_id=user_id,
+        conversation_id=conversation_id,
+        generation=generation,
+        archive_path=archive_path,
+        compacted_sequences=compacted_sequences,
+    )
+
+
+@pytest.mark.asyncio
+async def test_archive_handler_writes_jsonl_for_committed_sequences(
+    tmp_path: Path,
+) -> None:
+    projection = SQLiteConversationProjection(tmp_path / "messages.sqlite3")
+    await _seed_conversation(
+        projection,
+        conversation_id="c",
+        texts=[
+            ("user", "u1"),
+            ("assistant", "a1"),
+            ("user", "u2"),
+        ],
+    )
+    all_records = await projection.list_all_context_items("c")
+    compacted_seq = [r.sequence for r in all_records[:2]]
+
+    runtime = FakeUserRuntime()
+    handler = CompactionArchiveHandler(projection=projection, runtime=runtime)
+
+    event = _make_committed(
+        compaction_id="cid:write",
+        archive_path="/workspace/.old-sessions/cid:write.jsonl",
+        compacted_sequences=compacted_seq,
+    )
+    batch = await handler.handle_committed(event)
+
+    # Handler is terminal in the cascade.
+    assert batch == ()
+
+    # Exactly one successful write attempt.
+    assert len(runtime.file_write_calls) == 1
+    written = runtime.file_write_calls[0]
+    assert written.path == "/workspace/.old-sessions/cid:write.jsonl"
+
+    # Content is JSONL — one record per compacted sequence, in order.
+    lines = written.content.split("\n")
+    assert len(lines) == 2
+    payloads = [json.loads(line) for line in lines]
+    assert [p["sequence"] for p in payloads] == compacted_seq
+    assert payloads[0]["item_kind"] == "user"
+    assert payloads[0]["text"] == "u1"
+    assert payloads[1]["item_kind"] == "assistant"
+    assert payloads[1]["text"] == "a1"
+
+
+@pytest.mark.asyncio
+async def test_archive_handler_retries_on_transient_failure(
+    tmp_path: Path,
+) -> None:
+    projection = SQLiteConversationProjection(tmp_path / "messages.sqlite3")
+    await _seed_conversation(
+        projection,
+        conversation_id="c",
+        texts=[
+            ("user", "u1"),
+            ("assistant", "a1"),
+            ("user", "u2"),
+        ],
+    )
+    all_records = await projection.list_all_context_items("c")
+    compacted_seq = [r.sequence for r in all_records[:2]]
+
+    # First attempt raises (transient I/O), second returns non-zero exit (also
+    # treated as failure), third succeeds. Total = 3 attempts.
+    runtime = FakeUserRuntime(
+        file_write_results=[
+            OSError("disk hiccup"),
+            RuntimeToolResult(stderr="EBUSY\n", exit_code=1),
+            RuntimeToolResult(),
+        ]
+    )
+    handler = CompactionArchiveHandler(projection=projection, runtime=runtime)
+
+    event = _make_committed(
+        compaction_id="cid:retry",
+        archive_path="/workspace/.old-sessions/cid:retry.jsonl",
+        compacted_sequences=compacted_seq,
+    )
+    batch = await handler.handle_committed(event)
+
+    assert batch == ()
+    # All three attempts consumed.
+    assert len(runtime.file_write_calls) == 3
+    assert all(
+        call.path == "/workspace/.old-sessions/cid:retry.jsonl"
+        for call in runtime.file_write_calls
+    )
+
+
+@pytest.mark.asyncio
+async def test_archive_handler_swallows_persistent_failure_and_logs(
+    tmp_path: Path,
+) -> None:
+    projection = SQLiteConversationProjection(tmp_path / "messages.sqlite3")
+    await _seed_conversation(
+        projection,
+        conversation_id="c",
+        texts=[
+            ("user", "u1"),
+            ("assistant", "a1"),
+            ("user", "u2"),
+        ],
+    )
+    all_records = await projection.list_all_context_items("c")
+    compacted_seq = [r.sequence for r in all_records[:2]]
+
+    # Every attempt fails — either by exception or by non-zero exit code.
+    runtime = FakeUserRuntime(
+        file_write_results=[
+            OSError("nope"),
+            RuntimeToolResult(stderr="still busted\n", exit_code=2),
+            OSError("nope again"),
+        ]
+    )
+    handler = CompactionArchiveHandler(projection=projection, runtime=runtime)
+
+    log_messages: list[str] = []
+    handler_id = None
+    try:
+        from loguru import logger as _logger
+
+        handler_id = _logger.add(
+            lambda message: log_messages.append(str(message)),
+            level="WARNING",
+        )
+
+        event = _make_committed(
+            compaction_id="cid:dead",
+            archive_path="/workspace/.old-sessions/cid:dead.jsonl",
+            compacted_sequences=compacted_seq,
+        )
+        batch = await handler.handle_committed(event)
+    finally:
+        if handler_id is not None:
+            from loguru import logger as _logger
+
+            _logger.remove(handler_id)
+
+    # Handler does not propagate the failure and returns no follow-up event.
+    assert batch == ()
+    # All three attempts consumed.
+    assert len(runtime.file_write_calls) == 3
+    # A warning was logged about archive write failure.
+    assert any(
+        "/workspace/.old-sessions/cid:dead.jsonl" in line for line in log_messages
+    )
+
+
+@pytest.mark.asyncio
+async def test_archive_handler_skips_records_not_in_compacted_sequences(
+    tmp_path: Path,
+) -> None:
+    projection = SQLiteConversationProjection(tmp_path / "messages.sqlite3")
+    await _seed_conversation(
+        projection,
+        conversation_id="c",
+        texts=[
+            ("user", "u1"),
+            ("assistant", "a1"),
+            ("user", "u2"),
+            ("assistant", "a2"),
+            ("user", "u3"),
+        ],
+    )
+    all_records = await projection.list_all_context_items("c")
+    # Compact only the first two sequences; the projection contains five rows.
+    compacted_seq = [all_records[0].sequence, all_records[1].sequence]
+
+    runtime = FakeUserRuntime()
+    handler = CompactionArchiveHandler(projection=projection, runtime=runtime)
+
+    event = _make_committed(
+        compaction_id="cid:partial",
+        archive_path="/workspace/.old-sessions/cid:partial.jsonl",
+        compacted_sequences=compacted_seq,
+    )
+    batch = await handler.handle_committed(event)
+
+    assert batch == ()
+    assert len(runtime.file_write_calls) == 1
+    written = runtime.file_write_calls[0]
+    lines = written.content.split("\n")
+    # Only the two named sequences end up in JSONL; the other three rows are
+    # skipped even though they exist in the projection.
+    assert len(lines) == 2
+    payloads = [json.loads(line) for line in lines]
+    assert [p["sequence"] for p in payloads] == compacted_seq
+    assert [p["text"] for p in payloads] == ["u1", "a1"]

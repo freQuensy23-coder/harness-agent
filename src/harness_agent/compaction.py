@@ -2,6 +2,8 @@ import json
 import re
 from dataclasses import dataclass
 
+from loguru import logger
+
 from harness_agent.events import (
     CompactionCommitted,
     CompactionConflicted,
@@ -16,15 +18,19 @@ from harness_agent.projections import (
     ConversationItemRecord,
     SQLiteConversationProjection,
 )
+from harness_agent.runtime.protocols import UserRuntime
+from harness_agent.tools import FileWriteInput
 
 
 EventBatch = tuple[EventBase, ...]
 
 
 _SUMMARY_ATTEMPTS = 2
+_ARCHIVE_WRITE_ATTEMPTS = 3
 
 
 __all__ = [
+    "CompactionArchiveHandler",
     "CompactionConfig",
     "CompactionService",
     "EventBatch",
@@ -340,3 +346,42 @@ class CompactionService:
                 compacted_sequences=list(event.compacted_sequences),
             ),
         )
+
+
+class CompactionArchiveHandler:
+    def __init__(
+        self,
+        *,
+        projection: SQLiteConversationProjection,
+        runtime: UserRuntime,
+    ) -> None:
+        self._projection = projection
+        self._runtime = runtime
+
+    async def handle_committed(self, event: CompactionCommitted) -> EventBatch:
+        all_records = await self._projection.list_all_context_items(
+            event.conversation_id
+        )
+        by_seq = {record.sequence: record for record in all_records}
+        compacted = [
+            by_seq[sequence]
+            for sequence in event.compacted_sequences
+            if sequence in by_seq
+        ]
+        jsonl = _records_to_jsonl(compacted)
+        for _ in range(_ARCHIVE_WRITE_ATTEMPTS):
+            try:
+                result = await self._runtime.file_write(
+                    event.user_id,
+                    FileWriteInput(path=event.archive_path, content=jsonl),
+                )
+            except Exception:
+                continue
+            if result.exit_code == 0:
+                return ()
+        logger.warning(
+            "compaction archive write failed after {} attempts: {}",
+            _ARCHIVE_WRITE_ATTEMPTS,
+            event.archive_path,
+        )
+        return ()
