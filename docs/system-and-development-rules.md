@@ -45,8 +45,15 @@ run there, including:
 - Short-lived and spawned shell commands.
 - Long-lived MCP stdio server processes.
 
-MCP server configuration is user workspace data. The host reads those configs
-through the runtime and starts the server processes inside the user's container.
+MCP server configuration exists at two scopes. User-scope configs live in the
+user's workspace at `/workspace/mcp/*.yaml` and the user owns them. Global-scope
+configs live in `harness.yaml` under `mcp.servers` and apply to every user; the
+user cannot edit or disable them from the workspace. The host merges both lists
+with global entries winning on name conflict, then starts each server process
+inside the user's container via the same stdio transport.
+
+User MCP YAML parsing is per-file: a single malformed file is skipped with a
+warning so it cannot suppress other user servers or globals.
 
 ## Event Flow
 

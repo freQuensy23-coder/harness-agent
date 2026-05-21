@@ -79,6 +79,7 @@ class HarnessApp:
         )
         self.mcp_manager = McpManager(
             runtime=self.runtime,
+            global_servers=config.mcp.servers,
         )
         self.llm = AuditedLlmClient(
             inner=OpenAIResponsesClient(
