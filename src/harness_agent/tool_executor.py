@@ -1,11 +1,12 @@
 import asyncio
+import re
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 
 from pydantic import BaseModel, Field
 
 from harness_agent.content import ContentRef, content_ref_from_workspace_file
-from harness_agent.events import EventBase, ToolCallCompleted, ToolCallRequested
+from harness_agent.events import EventBase, ToolCallCompleted, ToolCallError, ToolCallRequested
 from harness_agent.mcp import McpManager
 from harness_agent.runtime import RuntimeToolResult, UserRuntime
 from harness_agent.scheduler import SQLiteScheduleStore
@@ -92,6 +93,7 @@ class ToolCallExecutor:
         web_fetcher: WebFetcher | None = None,
         mcp_manager: McpManager | None = None,
         sub_agents: SubAgentService | None = None,
+        max_model_output_chars: int = 20_000,
     ) -> None:
         self._runtime = runtime
         self._task_store = task_store
@@ -99,6 +101,7 @@ class ToolCallExecutor:
         self._web_fetcher = web_fetcher
         self._mcp_manager = mcp_manager
         self._sub_agents = sub_agents
+        self._max_model_output_chars = max_model_output_chars
         self._tool_executors: dict[str, ToolExecutor] = {
             "shell.exec": self._shell_exec,
             "shell.spawn": self._shell_spawn,
@@ -130,7 +133,35 @@ class ToolCallExecutor:
         }
 
     async def handle_tool_call_requested(self, event: ToolCallRequested) -> EventBatch:
-        execution = await self._execute_tool(event)
+        try:
+            execution = await self._execute_tool(event)
+            execution = await self._spill_oversized_result(event, execution)
+        except Exception as exc:
+            error = str(exc)
+            execution = ToolExecutionResult(
+                result=RuntimeToolResult(stderr=error, exit_code=1)
+            )
+            return (
+                ToolCallError(
+                    user_id=event.user_id,
+                    conversation_id=event.conversation_id,
+                    generation=event.generation,
+                    call_id=event.call_id,
+                    tool_name=event.tool_name,
+                    input=event.input,
+                    error=error,
+                ),
+                ToolCallCompleted(
+                    user_id=event.user_id,
+                    conversation_id=event.conversation_id,
+                    generation=event.generation,
+                    call_id=event.call_id,
+                    tool_name=event.tool_name,
+                    input=event.input,
+                    result=execution.result,
+                    attachments=execution.attachments,
+                ),
+            )
         return (
             ToolCallCompleted(
                 user_id=event.user_id,
@@ -142,6 +173,34 @@ class ToolCallExecutor:
                 result=execution.result,
                 attachments=execution.attachments,
             ),
+        )
+
+    async def _spill_oversized_result(
+        self,
+        event: ToolCallRequested,
+        execution: ToolExecutionResult,
+    ) -> ToolExecutionResult:
+        rendered = execution.result.render_for_llm(event.tool_name)
+        if len(rendered) <= self._max_model_output_chars:
+            return execution
+        path = _tool_result_path(event)
+        write = await self._runtime.write_content_file(
+            event.user_id,
+            path,
+            rendered.encode("utf-8"),
+        )
+        if write.exit_code != 0:
+            raise RuntimeError(write.stderr or f"failed to save oversized tool result to {path}")
+        return ToolExecutionResult(
+            result=RuntimeToolResult(
+                stdout=(
+                    "truncated, because it is too long. "
+                    f"Full result saved to {path}. "
+                    "You can read it in chunks with file.read."
+                ),
+                exit_code=execution.result.exit_code,
+            ),
+            attachments=execution.attachments,
         )
 
     async def _execute_tool(self, event: ToolCallRequested) -> ToolExecutionResult:
@@ -550,3 +609,17 @@ class ToolCallExecutor:
 
 def _tool_call_key(event: ToolCallRequested | ToolCallCompleted) -> ToolCallKey:
     return (event.conversation_id, event.generation, event.call_id)
+
+
+def _tool_result_path(event: ToolCallRequested) -> str:
+    return (
+        "/workspace/content/tool-results/"
+        f"{_safe_path_part(event.conversation_id)}-"
+        f"{event.generation}-"
+        f"{_safe_path_part(event.call_id)}.txt"
+    )
+
+
+def _safe_path_part(value: str) -> str:
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "-", value).strip("-")
+    return safe or "tool-call"

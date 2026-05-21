@@ -161,7 +161,7 @@ class HarnessApp:
             runtime=self.runtime,
             task_store=self.task_store,
             schedule_store=self.schedule_store,
-            web_fetcher=HttpxWebFetcher(),
+            web_fetcher=HttpxWebFetcher(llm=self.llm),
             mcp_manager=self.mcp_manager,
             sub_agents=self.sub_agents,
         )
