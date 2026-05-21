@@ -429,8 +429,10 @@ def default_tool_registry() -> ToolRegistry:
             ToolSpec(
                 name="agent.run",
                 description=(
-                    "Run a sub-agent to completion. The sub-agent can use workspace "
-                    "file, shell, web, task, schedule, skill, MCP, and agent tools."
+                    "Run a sub-agent to completion and return its final assistant "
+                    "message. The sub-agent can use workspace file, shell, web, "
+                    "task, schedule, skill, and MCP tools but cannot spawn further "
+                    "sub-agents."
                 ),
                 input_model=AgentRunInput,
             ),
@@ -438,7 +440,8 @@ def default_tool_registry() -> ToolRegistry:
                 name="agent.spawn",
                 description=(
                     "Start a background sub-agent. The sub-agent can use workspace "
-                    "file, shell, web, task, schedule, skill, MCP, and agent tools."
+                    "file, shell, web, task, schedule, skill, and MCP tools but "
+                    "cannot spawn further sub-agents."
                 ),
                 input_model=AgentSpawnInput,
             ),

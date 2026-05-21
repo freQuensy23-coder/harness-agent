@@ -138,7 +138,7 @@ async def test_telegram_say_hi_builds_context_from_runtime_and_replies(tmp_path:
                     "- schedule.cron schedules recurring synthetic user messages.",
                     "- schedule.list and schedule.cancel manage scheduled messages.",
                     "- skill.* reads enabled markdown skills.",
-                    "- agent.* runs sub-agents that can use workspace file and shell tools.",
+                    "- agent.* runs sub-agents that can use workspace, web, task, schedule, skill, and MCP tools but cannot spawn further sub-agents.",
                 ]
             ),
             "Runtime: tools run in the user's workspace. Container details are not part of the model context.",
