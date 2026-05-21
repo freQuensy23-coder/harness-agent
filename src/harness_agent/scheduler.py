@@ -3,7 +3,7 @@ import json
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal, cast
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
@@ -41,7 +41,7 @@ class SQLiteScheduleStore:
     ) -> None:
         self._path = path
         self._now = utc_now if now is None else now
-        self._reply_target_adapter = TypeAdapter(ReplyTarget)
+        self._reply_target_adapter: TypeAdapter[ReplyTarget] = TypeAdapter(ReplyTarget)
 
     async def create_once(
         self,
@@ -103,49 +103,55 @@ class SQLiteScheduleStore:
         await self._ensure_schema()
         status_clause = "" if include_stopped else "and status = 'active'"
         async with aiosqlite.connect(self._path) as db:
-            rows = await db.execute_fetchall(
-                f"""
-                select
-                    id,
-                    user_id,
-                    conversation_id,
-                    kind,
-                    status,
-                    message,
-                    next_run_at,
-                    reply_target_json,
-                    cron,
-                    timezone
-                from scheduled_messages
-                where user_id = ?
-                  and conversation_id = ?
-                  {status_clause}
-                order by created_at asc
-                """,
-                (user_id, conversation_id),
+            rows = cast(
+                list[tuple[Any, ...]],
+                await db.execute_fetchall(
+                    f"""
+                    select
+                        id,
+                        user_id,
+                        conversation_id,
+                        kind,
+                        status,
+                        message,
+                        next_run_at,
+                        reply_target_json,
+                        cron,
+                        timezone
+                    from scheduled_messages
+                    where user_id = ?
+                      and conversation_id = ?
+                      {status_clause}
+                    order by created_at asc
+                    """,
+                    (user_id, conversation_id),
+                ),
             )
         return [self._row_to_schedule(row) for row in rows]
 
     async def get(self, schedule_id: str) -> ScheduledMessage:
         await self._ensure_schema()
         async with aiosqlite.connect(self._path) as db:
-            rows = await db.execute_fetchall(
-                """
-                select
-                    id,
-                    user_id,
-                    conversation_id,
-                    kind,
-                    status,
-                    message,
-                    next_run_at,
-                    reply_target_json,
-                    cron,
-                    timezone
-                from scheduled_messages
-                where id = ?
-                """,
-                (schedule_id,),
+            rows = cast(
+                list[tuple[Any, ...]],
+                await db.execute_fetchall(
+                    """
+                    select
+                        id,
+                        user_id,
+                        conversation_id,
+                        kind,
+                        status,
+                        message,
+                        next_run_at,
+                        reply_target_json,
+                        cron,
+                        timezone
+                    from scheduled_messages
+                    where id = ?
+                    """,
+                    (schedule_id,),
+                ),
             )
         if not rows:
             raise KeyError(schedule_id)
@@ -178,25 +184,28 @@ class SQLiteScheduleStore:
         now = now.astimezone(UTC)
         async with aiosqlite.connect(self._path) as db:
             await db.execute("begin immediate")
-            rows = await db.execute_fetchall(
-                """
-                select
-                    id,
-                    user_id,
-                    conversation_id,
-                    kind,
-                    status,
-                    message,
-                    next_run_at,
-                    reply_target_json,
-                    cron,
-                    timezone
-                from scheduled_messages
-                where status = 'active'
-                  and next_run_at <= ?
-                order by next_run_at asc
-                """,
-                (now.isoformat(),),
+            rows = cast(
+                list[tuple[Any, ...]],
+                await db.execute_fetchall(
+                    """
+                    select
+                        id,
+                        user_id,
+                        conversation_id,
+                        kind,
+                        status,
+                        message,
+                        next_run_at,
+                        reply_target_json,
+                        cron,
+                        timezone
+                    from scheduled_messages
+                    where status = 'active'
+                      and next_run_at <= ?
+                    order by next_run_at asc
+                    """,
+                    (now.isoformat(),),
+                ),
             )
             schedules = [self._row_to_schedule(row) for row in rows]
             for schedule in schedules:
@@ -277,8 +286,8 @@ class SQLiteScheduleStore:
             await db.commit()
         return await self.get(schedule_id)
 
-    def _row_to_schedule(self, row) -> ScheduledMessage:
-        reply_target = None
+    def _row_to_schedule(self, row: tuple[Any, ...]) -> ScheduledMessage:
+        reply_target: ReplyTarget | None = None
         if row[7] is not None:
             reply_target = self._reply_target_adapter.validate_python(json.loads(row[7]))
         return ScheduledMessage(
@@ -360,7 +369,7 @@ class SchedulerService:
     def __init__(self, *, pump: SchedulerPump, poll_seconds: float) -> None:
         self._pump = pump
         self._poll_seconds = poll_seconds
-        self._task: asyncio.Task | None = None
+        self._task: asyncio.Task[None] | None = None
 
     async def start(self) -> None:
         self._task = asyncio.create_task(self._run())

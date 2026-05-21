@@ -7,7 +7,7 @@ import shlex
 from collections.abc import Sequence
 from pathlib import Path
 from pathlib import PurePosixPath
-from typing import Protocol
+from typing import Any, Protocol, cast
 from uuid import uuid4
 
 import aiosqlite
@@ -68,7 +68,7 @@ class DockerRunner(Protocol):
         stdin: bytes | None = None,
         timeout_seconds: int | None = None,
     ) -> DockerProcessResult:
-        pass
+        ...
 
 
 class SpawnedProcessRecord(BaseModel):
@@ -95,10 +95,10 @@ class SpawnedProcessRecord(BaseModel):
 
 class SpawnedProcessStore(Protocol):
     async def create(self, record: SpawnedProcessRecord) -> SpawnedProcessRecord:
-        pass
+        ...
 
     async def get(self, *, process_id: str, user_id: str) -> SpawnedProcessRecord | None:
-        pass
+        ...
 
     async def update_offsets(
         self,
@@ -108,10 +108,10 @@ class SpawnedProcessStore(Protocol):
         stdout_offset: int,
         stderr_offset: int,
     ) -> None:
-        pass
+        ...
 
     async def delete(self, *, process_id: str, user_id: str) -> None:
-        pass
+        ...
 
 
 class SQLiteSpawnedProcessStore:
@@ -147,25 +147,28 @@ class SQLiteSpawnedProcessStore:
     async def get(self, *, process_id: str, user_id: str) -> SpawnedProcessRecord | None:
         await self._ensure_schema()
         async with aiosqlite.connect(self._path) as db:
-            rows = await db.execute_fetchall(
-                """
-                select
-                    process_id,
-                    user_id,
-                    container_name,
-                    command,
-                    cwd,
-                    base_path,
-                    stdout_path,
-                    stderr_path,
-                    pid_path,
-                    exit_code_path,
-                    stdout_offset,
-                    stderr_offset
-                from spawned_processes
-                where process_id = ? and user_id = ?
-                """,
-                (process_id, user_id),
+            rows = cast(
+                list[tuple[Any, ...]],
+                await db.execute_fetchall(
+                    """
+                    select
+                        process_id,
+                        user_id,
+                        container_name,
+                        command,
+                        cwd,
+                        base_path,
+                        stdout_path,
+                        stderr_path,
+                        pid_path,
+                        exit_code_path,
+                        stdout_offset,
+                        stderr_offset
+                    from spawned_processes
+                    where process_id = ? and user_id = ?
+                    """,
+                    (process_id, user_id),
+                ),
             )
         if not rows:
             return None
@@ -247,7 +250,7 @@ class AsyncioDockerRunner:
             return DockerProcessResult(
                 stdout=stdout.decode("utf-8", errors="replace"),
                 stderr=stderr.decode("utf-8", errors="replace"),
-                exit_code=process.returncode,
+                exit_code=process.returncode if process.returncode is not None else 0,
             )
         stdout, stderr = await asyncio.wait_for(
             process.communicate(stdin),
@@ -256,7 +259,7 @@ class AsyncioDockerRunner:
         return DockerProcessResult(
             stdout=stdout.decode("utf-8", errors="replace"),
             stderr=stderr.decode("utf-8", errors="replace"),
-            exit_code=process.returncode,
+            exit_code=process.returncode if process.returncode is not None else 0,
         )
 
 
@@ -810,10 +813,10 @@ class FakeUserRuntime(UserRuntime):
         if missing:
             raise FileNotFoundError(", ".join(missing))
         return AgentFileSet(
-            soul=self._files["/workspace/agent/SOUL.md"],
-            agents=self._files["/workspace/agent/AGENTS.md"],
-            user=self._files["/workspace/agent/USER.md"],
-            tools=self._files["/workspace/agent/TOOLS.md"],
+            soul=_as_str(self._files["/workspace/agent/SOUL.md"]),
+            agents=_as_str(self._files["/workspace/agent/AGENTS.md"]),
+            user=_as_str(self._files["/workspace/agent/USER.md"]),
+            tools=_as_str(self._files["/workspace/agent/TOOLS.md"]),
         )
 
     async def list_skills(self, user_id: str) -> list[Skill]:
@@ -847,10 +850,7 @@ class FakeUserRuntime(UserRuntime):
                 )
             )
         content = self._files[path]
-        try:
-            data = content.encode("latin1")
-        except AttributeError:
-            data = content
+        data = content.encode("latin1") if isinstance(content, str) else content
         if max_bytes is None:
             return RuntimeFileRead(file=WorkspaceFile(path=path, content=data))
         return RuntimeFileRead(file=WorkspaceFile(path=path, content=data[:max_bytes]))
@@ -872,10 +872,8 @@ class FakeUserRuntime(UserRuntime):
 
     async def file_read(self, user_id: str, input: FileReadInput) -> RuntimeToolResult:
         content = self._files[input.path]
-        try:
+        if isinstance(content, bytes):
             return RuntimeToolResult(stdout=content.decode("utf-8", errors="replace"))
-        except AttributeError:
-            pass
         return RuntimeToolResult(stdout=content)
 
     async def file_write(self, user_id: str, input: FileWriteInput) -> RuntimeToolResult:
@@ -884,7 +882,7 @@ class FakeUserRuntime(UserRuntime):
         return RuntimeToolResult()
 
     async def file_edit(self, user_id: str, input: FileEditInput) -> RuntimeToolResult:
-        content = self._files[input.path]
+        content = _as_str(self._files[input.path])
         count = -1 if input.replace_all else 1
         self._files[input.path] = content.replace(input.old, input.new, count)
         return RuntimeToolResult()
@@ -894,7 +892,7 @@ class FakeUserRuntime(UserRuntime):
         user_id: str,
         input: FileMultiEditInput,
     ) -> RuntimeToolResult:
-        content = self._files[input.path]
+        content = _as_str(self._files[input.path])
         for edit in input.edits:
             count = -1 if edit.replace_all else 1
             content = content.replace(edit.old, edit.new, count)
@@ -911,7 +909,8 @@ class FakeUserRuntime(UserRuntime):
         for path, content in sorted(self._files.items()):
             if not path.startswith(input.path):
                 continue
-            for line_no, line in enumerate(content.splitlines(), start=1):
+            text = _as_str(content)
+            for line_no, line in enumerate(text.splitlines(), start=1):
                 if input.pattern in line:
                     lines.append(f"{path}:{line_no}:{line}")
         return RuntimeToolResult(stdout="\n".join(lines))
@@ -922,7 +921,7 @@ class FakeUserRuntime(UserRuntime):
         )
 
 
-def _spawned_process_row(record: SpawnedProcessRecord) -> tuple:
+def _spawned_process_row(record: SpawnedProcessRecord) -> tuple[Any, ...]:
     return (
         record.process_id,
         record.user_id,
@@ -939,7 +938,7 @@ def _spawned_process_row(record: SpawnedProcessRecord) -> tuple:
     )
 
 
-def _spawned_process_from_row(row: tuple) -> SpawnedProcessRecord:
+def _spawned_process_from_row(row: tuple[Any, ...]) -> SpawnedProcessRecord:
     return SpawnedProcessRecord(
         process_id=row[0],
         user_id=row[1],
@@ -1111,3 +1110,9 @@ def _content_path(path: str) -> str:
     if normalized != "/workspace/content" and not normalized.startswith("/workspace/content/"):
         raise ValueError(f"content path must stay inside /workspace/content: {path}")
     return normalized
+
+
+def _as_str(value: str | bytes) -> str:
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return value

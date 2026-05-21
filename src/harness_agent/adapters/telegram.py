@@ -1,12 +1,18 @@
 import base64
 import re
+from typing import Literal
 
 from aiogram import Bot, Dispatcher, Router
 from aiogram.filters import CommandStart
 from aiogram.types import Message
 
 from harness_agent.bus import EventBus
-from harness_agent.events import AssistantTextProduced, InboundAttachment, TelegramTextReceived
+from harness_agent.events import (
+    AssistantTextProduced,
+    InboundAttachment,
+    TelegramReplyTarget,
+    TelegramTextReceived,
+)
 
 
 def event_from_aiogram_message(
@@ -50,7 +56,9 @@ async def event_from_aiogram_message_with_files(
     if message.document:
         document = message.document
         mime_type = document.mime_type
-        kind = "image" if mime_type is not None and mime_type.startswith("image/") else "file"
+        kind: Literal["image", "file"] = (
+            "image" if mime_type is not None and mime_type.startswith("image/") else "file"
+        )
         attachments.append(
             await download_attachment(
                 bot=bot,
@@ -72,7 +80,7 @@ async def download_attachment(
     bot: Bot,
     file_id: str,
     file_unique_id: str,
-    kind: str,
+    kind: Literal["image", "file"],
     file_name: str,
     mime_type: str | None,
     size_bytes: int,
@@ -80,7 +88,11 @@ async def download_attachment(
     message_id: int,
 ) -> InboundAttachment:
     telegram_file = await bot.get_file(file_id)
+    if telegram_file.file_path is None:
+        raise RuntimeError(f"Telegram file has no file_path: {file_id}")
     content = await bot.download_file(telegram_file.file_path)
+    if content is None:
+        raise RuntimeError(f"Telegram download_file returned no content: {file_id}")
     data = content.read()
     safe_name = safe_file_name(file_name)
     return InboundAttachment(
@@ -112,12 +124,13 @@ class AiogramTelegramAdapter:
         self._dispatcher.include_router(self._router)
 
     async def start_polling(self) -> None:
-        await self._dispatcher.start_polling(self._bot)
+        await self._dispatcher.start_polling(self._bot)  # pyright: ignore[reportUnknownMemberType]
 
     async def send_assistant_text(self, event: AssistantTextProduced) -> None:
-        if event.reply_target is None:
+        reply_target = event.reply_target
+        if not isinstance(reply_target, TelegramReplyTarget):
             raise ValueError("Assistant text has no Telegram reply target")
-        await self._bot.send_message(chat_id=event.reply_target.chat_id, text=event.text)
+        await self._bot.send_message(chat_id=reply_target.chat_id, text=event.text)
 
     async def _on_start(self, message: Message) -> None:
         await self._on_message(message)

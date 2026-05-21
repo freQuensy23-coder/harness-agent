@@ -1,7 +1,7 @@
 import asyncio
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal, cast
 from uuid import uuid4
 
 import aiosqlite
@@ -10,6 +10,7 @@ from pydantic import BaseModel
 from harness_agent.bus import EventBus
 from harness_agent.events import (
     AssistantTextProduced,
+    EventBase,
     SubAgentCancelled,
     SubAgentCompleted,
     SubAgentFailed,
@@ -114,29 +115,32 @@ class SQLiteSubAgentStore:
     async def get(self, agent_id: str) -> SubAgentRecord | None:
         await self._ensure_schema()
         async with aiosqlite.connect(self._path) as db:
-            row = await db.execute_fetchall(
-                """
-                select
-                    id,
-                    user_id,
-                    parent_conversation_id,
-                    child_conversation_id,
-                    parent_call_id,
-                    name,
-                    prompt,
-                    status,
-                    result,
-                    error,
-                    created_at,
-                    updated_at
-                from sub_agents
-                where id = ?
-                """,
-                (agent_id,),
+            rows = cast(
+                list[tuple[Any, ...]],
+                await db.execute_fetchall(
+                    """
+                    select
+                        id,
+                        user_id,
+                        parent_conversation_id,
+                        child_conversation_id,
+                        parent_call_id,
+                        name,
+                        prompt,
+                        status,
+                        result,
+                        error,
+                        created_at,
+                        updated_at
+                    from sub_agents
+                    where id = ?
+                    """,
+                    (agent_id,),
+                ),
             )
-        if not row:
+        if not rows:
             return None
-        return _record_from_row(row[0])
+        return _record_from_row(rows[0])
 
     async def get_for_parent(
         self,
@@ -147,31 +151,34 @@ class SQLiteSubAgentStore:
     ) -> SubAgentRecord | None:
         await self._ensure_schema()
         async with aiosqlite.connect(self._path) as db:
-            row = await db.execute_fetchall(
-                """
-                select
-                    id,
-                    user_id,
-                    parent_conversation_id,
-                    child_conversation_id,
-                    parent_call_id,
-                    name,
-                    prompt,
-                    status,
-                    result,
-                    error,
-                    created_at,
-                    updated_at
-                from sub_agents
-                where id = ?
-                  and user_id = ?
-                  and parent_conversation_id = ?
-                """,
-                (agent_id, user_id, parent_conversation_id),
+            rows = cast(
+                list[tuple[Any, ...]],
+                await db.execute_fetchall(
+                    """
+                    select
+                        id,
+                        user_id,
+                        parent_conversation_id,
+                        child_conversation_id,
+                        parent_call_id,
+                        name,
+                        prompt,
+                        status,
+                        result,
+                        error,
+                        created_at,
+                        updated_at
+                    from sub_agents
+                    where id = ?
+                      and user_id = ?
+                      and parent_conversation_id = ?
+                    """,
+                    (agent_id, user_id, parent_conversation_id),
+                ),
             )
-        if not row:
+        if not rows:
             return None
-        return _record_from_row(row[0])
+        return _record_from_row(rows[0])
 
     async def list_for_parent(
         self,
@@ -198,27 +205,30 @@ class SQLiteSubAgentStore:
         parent_conversation_id: str,
     ) -> list[SubAgentRecord]:
         async with aiosqlite.connect(self._path) as db:
-            rows = await db.execute_fetchall(
-                """
-                select
-                    id,
-                    user_id,
-                    parent_conversation_id,
-                    child_conversation_id,
-                    parent_call_id,
-                    name,
-                    prompt,
-                    status,
-                    result,
-                    error,
-                    created_at,
-                    updated_at
-                from sub_agents
-                where user_id = ?
-                  and parent_conversation_id = ?
-                order by created_at asc
-                """,
-                (user_id, parent_conversation_id),
+            rows = cast(
+                list[tuple[Any, ...]],
+                await db.execute_fetchall(
+                    """
+                    select
+                        id,
+                        user_id,
+                        parent_conversation_id,
+                        child_conversation_id,
+                        parent_call_id,
+                        name,
+                        prompt,
+                        status,
+                        result,
+                        error,
+                        created_at,
+                        updated_at
+                    from sub_agents
+                    where user_id = ?
+                      and parent_conversation_id = ?
+                    order by created_at asc
+                    """,
+                    (user_id, parent_conversation_id),
+                ),
             )
         return [_record_from_row(row) for row in rows]
 
@@ -229,28 +239,31 @@ class SQLiteSubAgentStore:
         parent_conversation_id: str,
     ) -> list[SubAgentRecord]:
         async with aiosqlite.connect(self._path) as db:
-            rows = await db.execute_fetchall(
-                """
-                select
-                    id,
-                    user_id,
-                    parent_conversation_id,
-                    child_conversation_id,
-                    parent_call_id,
-                    name,
-                    prompt,
-                    status,
-                    result,
-                    error,
-                    created_at,
-                    updated_at
-                from sub_agents
-                where user_id = ?
-                  and parent_conversation_id = ?
-                  and status = ?
-                order by created_at asc
-                """,
-                (user_id, parent_conversation_id, "running"),
+            rows = cast(
+                list[tuple[Any, ...]],
+                await db.execute_fetchall(
+                    """
+                    select
+                        id,
+                        user_id,
+                        parent_conversation_id,
+                        child_conversation_id,
+                        parent_call_id,
+                        name,
+                        prompt,
+                        status,
+                        result,
+                        error,
+                        created_at,
+                        updated_at
+                    from sub_agents
+                    where user_id = ?
+                      and parent_conversation_id = ?
+                      and status = ?
+                    order by created_at asc
+                    """,
+                    (user_id, parent_conversation_id, "running"),
+                ),
             )
         return [_record_from_row(row) for row in rows]
 
@@ -346,6 +359,7 @@ class SQLiteSubAgentStore:
             await db.commit()
         if user_id is None:
             return await self.get(agent_id)
+        assert parent_conversation_id is not None
         return await self.get_for_parent(
             agent_id=agent_id,
             user_id=user_id,
@@ -389,7 +403,7 @@ class SubAgentResultWaiter:
     def forget(self, conversation_id: str) -> None:
         self._pending.pop(conversation_id, None)
 
-    async def handle_assistant_text(self, event: AssistantTextProduced) -> tuple:
+    async def handle_assistant_text(self, event: AssistantTextProduced) -> tuple[EventBase, ...]:
         future = self._pending.get(event.conversation_id)
         if future is not None and not future.done():
             future.set_result(event.text)
@@ -518,7 +532,7 @@ class SubAgentService:
         )
         return cancelled
 
-    async def _await_cancelled_task(self, task: asyncio.Task) -> None:
+    async def _await_cancelled_task(self, task: asyncio.Task[Any]) -> None:
         try:
             await task
         except asyncio.CancelledError:
@@ -619,7 +633,7 @@ def render_sub_agent_records(records: list[SubAgentRecord]) -> str:
     return "[\n" + ",\n".join(record.model_dump_json(indent=2) for record in records) + "\n]"
 
 
-def _record_row(record: SubAgentRecord) -> tuple:
+def _record_row(record: SubAgentRecord) -> tuple[Any, ...]:
     return (
         record.id,
         record.user_id,
@@ -636,7 +650,7 @@ def _record_row(record: SubAgentRecord) -> tuple:
     )
 
 
-def _record_from_row(row) -> SubAgentRecord:
+def _record_from_row(row: tuple[Any, ...]) -> SubAgentRecord:
     return SubAgentRecord(
         id=row[0],
         user_id=row[1],

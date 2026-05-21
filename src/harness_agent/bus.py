@@ -1,11 +1,12 @@
 from collections.abc import Awaitable, Callable, Iterable
+from typing import Any, cast
 
 from harness_agent.events import AgentEvent, EventBase
 from harness_agent.store import SQLiteEventStore
 
 
 HandlerResult = Iterable[EventBase]
-EventHandler = Callable[[AgentEvent], Awaitable[HandlerResult]]
+EventHandler = Callable[[Any], Awaitable[HandlerResult]]
 
 
 class EventBus:
@@ -31,4 +32,4 @@ class EventBus:
                 result = await handler(event)
                 pending.extend(result)
         for next_event in pending:
-            await self.publish(next_event)
+            await self.publish(cast(AgentEvent, next_event))

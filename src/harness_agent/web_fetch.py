@@ -100,10 +100,12 @@ def _limit_page_content(text: str, max_chars: int) -> str:
 
 def html_to_markdown(html: str, *, base_url: str) -> str:
     soup = BeautifulSoup(html, "html.parser")
-    for tag in soup.find_all(_BOILERPLATE_TAGS):
+    for tag in soup.find_all(list(_BOILERPLATE_TAGS)):
         tag.decompose()
     for anchor in soup.find_all("a", href=True):
-        anchor["href"] = urljoin(base_url, anchor["href"])
+        href = anchor.get("href")
+        if isinstance(href, str):
+            anchor["href"] = urljoin(base_url, href)
     rendered = markdownify(str(soup), heading_style="ATX", bullets="-")
     return re.sub(r"\n{3,}", "\n\n", rendered).strip()
 

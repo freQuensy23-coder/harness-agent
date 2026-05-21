@@ -1,7 +1,12 @@
 import json
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, Literal, cast
 
 from openai import AsyncOpenAI
+from openai.types.chat import (
+    ChatCompletionMessageFunctionToolCall,
+    ChatCompletionMessageParam,
+    ChatCompletionToolUnionParam,
+)
 from pydantic import BaseModel, Field
 
 from harness_agent.content import ContentRef
@@ -15,7 +20,7 @@ from harness_agent.tools import (
 class UserMessage(BaseModel):
     kind: Literal["user"] = "user"
     text: str
-    attachments: list[ContentRef] = Field(default_factory=list)
+    attachments: list[ContentRef] = Field(default_factory=list[ContentRef])
 
 
 class AssistantMessage(BaseModel):
@@ -55,12 +60,12 @@ class LlmRequest(BaseModel):
 
 
 class AssistantText(BaseModel):
-    kind: str = "assistant_text"
+    kind: Literal["assistant_text"] = "assistant_text"
     text: str
 
 
 class LlmToolCall(BaseModel):
-    kind: str = "tool_call"
+    kind: Literal["tool_call"] = "tool_call"
     call_id: str
     name: str
     input: ToolInput
@@ -86,20 +91,29 @@ class OpenAICompatibleChatClient(LlmClient):
         self._model = model
 
     async def respond(self, request: LlmRequest) -> LlmResponse:
+        messages: list[ChatCompletionMessageParam] = [
+            cast(ChatCompletionMessageParam, {"role": "system", "content": request.system}),
+            *(
+                cast(ChatCompletionMessageParam, message_to_openai(message))
+                for message in request.messages
+            ),
+        ]
+        tools: list[ChatCompletionToolUnionParam] = [
+            cast(ChatCompletionToolUnionParam, tool_to_openai(tool)) for tool in request.tools
+        ]
         response = await self._client.chat.completions.create(
             model=self._model,
-            messages=[
-                {"role": "system", "content": request.system},
-                *[message_to_openai(message) for message in request.messages],
-            ],
-            tools=[tool_to_openai(tool) for tool in request.tools],
+            messages=messages,
+            tools=tools,
             parallel_tool_calls=False,
         )
         message = response.choices[0].message
         if message.tool_calls:
             tool_call = message.tool_calls[0]
+            if not isinstance(tool_call, ChatCompletionMessageFunctionToolCall):
+                raise RuntimeError("OpenAI-compatible response returned non-function tool call")
             name = canonical_tool_name(tool_call.function.name)
-            arguments = json.loads(tool_call.function.arguments)
+            arguments = cast(dict[str, Any], json.loads(tool_call.function.arguments))
             return LlmToolCall(
                 call_id=tool_call.id,
                 name=name,
@@ -125,7 +139,7 @@ class FakeLlmClient(LlmClient):
         return self._responses.pop(0)
 
 
-def tool_to_openai(tool: ToolSpec) -> dict:
+def tool_to_openai(tool: ToolSpec) -> dict[str, Any]:
     schema = tool.parameters_schema()
     return {
         "type": "function",
@@ -199,7 +213,7 @@ def render_user_text(message: UserMessage) -> str:
     return "\n".join(lines)
 
 
-def parse_tool_input(name: str, arguments: dict) -> ToolInput:
+def parse_tool_input(name: str, arguments: dict[str, Any]) -> ToolInput:
     name = canonical_tool_name(name)
     return parse_llm_tool_input(name, arguments)
 
