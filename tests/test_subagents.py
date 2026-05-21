@@ -382,7 +382,7 @@ async def test_subagent_timeout_is_failed_event(tmp_path: Path) -> None:
         input=AgentRunInput(
             prompt="never answered",
             name="worker",
-            timeout_seconds=0.01,
+            timeout_seconds=0.5,
         ),
     )
 
