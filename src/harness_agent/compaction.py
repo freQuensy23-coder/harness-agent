@@ -2,18 +2,39 @@ import json
 import re
 from dataclasses import dataclass
 
-from harness_agent.llm import LlmResponse
-from harness_agent.projections import ConversationItemRecord
+from harness_agent.events import (
+    CompactionCommitted,
+    CompactionConflicted,
+    CompactionRequested,
+    CompactionSkipped,
+    CompactionSnapshotReady,
+    CompactionSummaryReady,
+    EventBase,
+)
+from harness_agent.llm import LlmClient, LlmRequest, LlmResponse
+from harness_agent.projections import (
+    ConversationItemRecord,
+    SQLiteConversationProjection,
+)
+
+
+EventBatch = tuple[EventBase, ...]
+
+
+_SUMMARY_ATTEMPTS = 2
 
 
 __all__ = [
     "CompactionConfig",
+    "CompactionService",
+    "EventBatch",
     "SUMMARY_SYSTEM_PROMPT",
     "_assistant_text",
     "_latest_safe_boundary",
     "_nth_user_message_from_end",
     "_records_to_jsonl",
     "_strip_analysis",
+    "_summarize",
     "_summary_block",
     "_tail_boundary",
 ]
@@ -192,3 +213,130 @@ def _records_to_jsonl(records: list[ConversationItemRecord]) -> str:
         )
         for record in records
     )
+
+
+async def _summarize(
+    llm: LlmClient,
+    records: list[ConversationItemRecord],
+    event: CompactionSnapshotReady,
+) -> str:
+    request = LlmRequest(
+        user_id=event.user_id,
+        conversation_id=event.conversation_id,
+        generation=event.generation,
+        system=SUMMARY_SYSTEM_PROMPT,
+        messages=[record.message for record in records],
+        tools=[],
+    )
+    last_text = ""
+    for _ in range(_SUMMARY_ATTEMPTS):
+        last_text = _assistant_text(await llm.respond(request))
+        extracted = _summary_block(last_text)
+        if extracted:
+            return extracted
+    stripped = _strip_analysis(last_text)
+    return stripped or last_text.strip()
+
+
+class CompactionService:
+    def __init__(
+        self,
+        *,
+        projection: SQLiteConversationProjection,
+        llm: LlmClient,
+        config: CompactionConfig,
+    ) -> None:
+        self._projection = projection
+        self._llm = llm
+        self._config = config
+
+    async def handle_requested(self, event: CompactionRequested) -> EventBatch:
+        records = await self._projection.list_active_context_items(event.conversation_id)
+        boundary = _tail_boundary(records, self._config.keep_last_user_messages)
+        if boundary is None:
+            return (
+                CompactionSkipped(
+                    compaction_id=event.compaction_id,
+                    user_id=event.user_id,
+                    conversation_id=event.conversation_id,
+                    generation=event.generation,
+                    reason="no_boundary",
+                ),
+            )
+        compacted = records[:boundary]
+        tail = records[boundary:]
+        snapshot_max_sequence = max(record.sequence for record in records)
+        archive_path = f"/workspace/.old-sessions/{event.compaction_id}.jsonl"
+        return (
+            CompactionSnapshotReady(
+                compaction_id=event.compaction_id,
+                user_id=event.user_id,
+                conversation_id=event.conversation_id,
+                generation=event.generation,
+                compacted_sequences=[record.sequence for record in compacted],
+                tail_sequences=[record.sequence for record in tail],
+                snapshot_max_sequence=snapshot_max_sequence,
+                archive_path=archive_path,
+            ),
+        )
+
+    async def handle_snapshot_ready(
+        self, event: CompactionSnapshotReady
+    ) -> EventBatch:
+        all_records = await self._projection.list_all_context_items(
+            event.conversation_id
+        )
+        by_sequence = {record.sequence: record for record in all_records}
+        compacted = [
+            by_sequence[sequence]
+            for sequence in event.compacted_sequences
+            if sequence in by_sequence
+        ]
+        summary = await _summarize(self._llm, compacted, event)
+        return (
+            CompactionSummaryReady(
+                compaction_id=event.compaction_id,
+                user_id=event.user_id,
+                conversation_id=event.conversation_id,
+                generation=event.generation,
+                compacted_sequences=list(event.compacted_sequences),
+                tail_sequences=list(event.tail_sequences),
+                snapshot_max_sequence=event.snapshot_max_sequence,
+                archive_path=event.archive_path,
+                summary=summary,
+            ),
+        )
+
+    async def handle_summary_ready(
+        self, event: CompactionSummaryReady
+    ) -> EventBatch:
+        committed = await self._projection.append_compacted_context_if_unchanged(
+            user_id=event.user_id,
+            conversation_id=event.conversation_id,
+            generation=event.generation,
+            summary=event.summary,
+            archive_path=event.archive_path,
+            compacted_sequences=list(event.compacted_sequences),
+            tail_sequences=list(event.tail_sequences),
+            snapshot_max_sequence=event.snapshot_max_sequence,
+        )
+        if not committed:
+            return (
+                CompactionConflicted(
+                    compaction_id=event.compaction_id,
+                    user_id=event.user_id,
+                    conversation_id=event.conversation_id,
+                    generation=event.generation,
+                    reason="cas_lost",
+                ),
+            )
+        return (
+            CompactionCommitted(
+                compaction_id=event.compaction_id,
+                user_id=event.user_id,
+                conversation_id=event.conversation_id,
+                generation=event.generation,
+                archive_path=event.archive_path,
+                compacted_sequences=list(event.compacted_sequences),
+            ),
+        )

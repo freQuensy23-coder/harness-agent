@@ -5,15 +5,28 @@ import aiosqlite
 import pytest
 
 from harness_agent.compaction import (
+    CompactionConfig,
+    CompactionService,
     _strip_analysis,
     _summary_block,
     _tail_boundary,
 )
 from harness_agent.config import LlmConfig, load_config
+from harness_agent.events import (
+    CompactionCommitted,
+    CompactionConflicted,
+    CompactionRequested,
+    CompactionSkipped,
+    CompactionSnapshotReady,
+    CompactionSummaryReady,
+)
 from harness_agent.llm import (
     AssistantMessage,
+    AssistantText,
+    FakeLlmClient,
     LlmMessage,
     LlmRequest,
+    LlmResponse,
     UserMessage,
     estimate_request_tokens,
 )
@@ -513,3 +526,368 @@ def test_strip_analysis_removes_analysis_block_nondestructively() -> None:
     assert "prefix text" in stripped
     assert "suffix" in stripped
     assert "<summary>kept</summary>" in stripped
+
+
+def _make_config() -> CompactionConfig:
+    return CompactionConfig(max_tokens_per_model=128_000)
+
+
+def _make_requested(
+    *,
+    compaction_id: str = "cid:test",
+    conversation_id: str = "c",
+    user_id: str = "u:1",
+    generation: int = 1,
+) -> CompactionRequested:
+    return CompactionRequested(
+        compaction_id=compaction_id,
+        user_id=user_id,
+        conversation_id=conversation_id,
+        generation=generation,
+    )
+
+
+def _make_snapshot(
+    *,
+    compaction_id: str = "cid:test",
+    conversation_id: str = "c",
+    user_id: str = "u:1",
+    generation: int = 1,
+    compacted_sequences: list[int],
+    tail_sequences: list[int],
+    snapshot_max_sequence: int,
+    archive_path: str = "/workspace/.old-sessions/cid:test.jsonl",
+) -> CompactionSnapshotReady:
+    return CompactionSnapshotReady(
+        compaction_id=compaction_id,
+        user_id=user_id,
+        conversation_id=conversation_id,
+        generation=generation,
+        compacted_sequences=compacted_sequences,
+        tail_sequences=tail_sequences,
+        snapshot_max_sequence=snapshot_max_sequence,
+        archive_path=archive_path,
+    )
+
+
+def _make_summary_ready(
+    *,
+    snapshot: CompactionSnapshotReady,
+    summary: str,
+) -> CompactionSummaryReady:
+    return CompactionSummaryReady(
+        compaction_id=snapshot.compaction_id,
+        user_id=snapshot.user_id,
+        conversation_id=snapshot.conversation_id,
+        generation=snapshot.generation,
+        compacted_sequences=list(snapshot.compacted_sequences),
+        tail_sequences=list(snapshot.tail_sequences),
+        snapshot_max_sequence=snapshot.snapshot_max_sequence,
+        archive_path=snapshot.archive_path,
+        summary=summary,
+    )
+
+
+@pytest.mark.asyncio
+async def test_handle_requested_emits_snapshot_ready_on_happy_path(tmp_path: Path) -> None:
+    projection = SQLiteConversationProjection(tmp_path / "messages.sqlite3")
+    await _seed_conversation(
+        projection,
+        conversation_id="c",
+        texts=[
+            ("user", "u1"),
+            ("assistant", "a1"),
+            ("user", "u2"),
+            ("assistant", "a2"),
+            ("user", "u3"),
+        ],
+    )
+    all_records = await projection.list_all_context_items("c")
+    assert [r.item_kind for r in all_records] == ["user", "assistant", "user", "assistant", "user"]
+    # With keep_last_user_messages=2, boundary is at the 2nd-from-last user message
+    # (index 2 — i.e. "u2"). So compacted = records[:2], tail = records[2:].
+    expected_compacted = [r.sequence for r in all_records[:2]]
+    expected_tail = [r.sequence for r in all_records[2:]]
+    snapshot_max = all_records[-1].sequence
+
+    config = CompactionConfig(max_tokens_per_model=128_000)
+    llm = FakeLlmClient([])
+    service = CompactionService(projection=projection, llm=llm, config=config)
+
+    event = _make_requested(compaction_id="cid:happy")
+    batch = await service.handle_requested(event)
+
+    assert len(batch) == 1
+    snapshot = batch[0]
+    assert isinstance(snapshot, CompactionSnapshotReady)
+    assert snapshot.compaction_id == "cid:happy"
+    assert snapshot.conversation_id == "c"
+    assert snapshot.user_id == "u:1"
+    assert snapshot.generation == 1
+    assert snapshot.compacted_sequences == expected_compacted
+    assert snapshot.tail_sequences == expected_tail
+    assert snapshot.snapshot_max_sequence == snapshot_max
+    assert snapshot.archive_path == "/workspace/.old-sessions/cid:happy.jsonl"
+
+
+@pytest.mark.asyncio
+async def test_handle_requested_emits_skipped_when_no_boundary(tmp_path: Path) -> None:
+    projection = SQLiteConversationProjection(tmp_path / "messages.sqlite3")
+    await _seed_conversation(
+        projection,
+        conversation_id="c",
+        texts=[
+            ("user", "only-user"),
+        ],
+    )
+
+    config = CompactionConfig(max_tokens_per_model=128_000)
+    llm = FakeLlmClient([])
+    service = CompactionService(projection=projection, llm=llm, config=config)
+
+    event = _make_requested(compaction_id="cid:skip")
+    batch = await service.handle_requested(event)
+
+    assert len(batch) == 1
+    skipped = batch[0]
+    assert isinstance(skipped, CompactionSkipped)
+    assert skipped.compaction_id == "cid:skip"
+    assert skipped.conversation_id == "c"
+    assert skipped.user_id == "u:1"
+    assert skipped.generation == 1
+    assert skipped.reason == "no_boundary"
+
+
+@pytest.mark.asyncio
+async def test_handle_snapshot_ready_calls_llm_once_when_summary_tag_present(
+    tmp_path: Path,
+) -> None:
+    projection = SQLiteConversationProjection(tmp_path / "messages.sqlite3")
+    await _seed_conversation(
+        projection,
+        conversation_id="c",
+        texts=[
+            ("user", "u1"),
+            ("assistant", "a1"),
+            ("user", "u2"),
+        ],
+    )
+    all_records = await projection.list_all_context_items("c")
+    compacted_seq = [r.sequence for r in all_records[:2]]
+    tail_seq = [all_records[2].sequence]
+    snapshot_max = all_records[-1].sequence
+
+    config = CompactionConfig(max_tokens_per_model=128_000)
+    responses: list[LlmResponse] = [AssistantText(text="<summary>X</summary>")]
+    llm = FakeLlmClient(responses)
+    service = CompactionService(projection=projection, llm=llm, config=config)
+
+    snapshot = _make_snapshot(
+        compaction_id="cid:once",
+        compacted_sequences=compacted_seq,
+        tail_sequences=tail_seq,
+        snapshot_max_sequence=snapshot_max,
+        archive_path="/workspace/.old-sessions/cid:once.jsonl",
+    )
+    batch = await service.handle_snapshot_ready(snapshot)
+
+    assert len(llm.requests) == 1
+    assert len(batch) == 1
+    ready = batch[0]
+    assert isinstance(ready, CompactionSummaryReady)
+    assert ready.summary == "X"
+    assert ready.compaction_id == "cid:once"
+    assert ready.compacted_sequences == compacted_seq
+    assert ready.tail_sequences == tail_seq
+    assert ready.snapshot_max_sequence == snapshot_max
+    assert ready.archive_path == "/workspace/.old-sessions/cid:once.jsonl"
+
+
+@pytest.mark.asyncio
+async def test_handle_snapshot_ready_retries_once_when_summary_tag_missing(
+    tmp_path: Path,
+) -> None:
+    projection = SQLiteConversationProjection(tmp_path / "messages.sqlite3")
+    await _seed_conversation(
+        projection,
+        conversation_id="c",
+        texts=[
+            ("user", "u1"),
+            ("assistant", "a1"),
+            ("user", "u2"),
+        ],
+    )
+    all_records = await projection.list_all_context_items("c")
+    compacted_seq = [r.sequence for r in all_records[:2]]
+    tail_seq = [all_records[2].sequence]
+    snapshot_max = all_records[-1].sequence
+
+    config = CompactionConfig(max_tokens_per_model=128_000)
+    responses: list[LlmResponse] = [
+        AssistantText(text="no tag here"),
+        AssistantText(text="<summary>second-try</summary>"),
+    ]
+    llm = FakeLlmClient(responses)
+    service = CompactionService(projection=projection, llm=llm, config=config)
+
+    snapshot = _make_snapshot(
+        compaction_id="cid:retry",
+        compacted_sequences=compacted_seq,
+        tail_sequences=tail_seq,
+        snapshot_max_sequence=snapshot_max,
+    )
+    batch = await service.handle_snapshot_ready(snapshot)
+
+    assert len(llm.requests) == 2
+    assert len(batch) == 1
+    ready = batch[0]
+    assert isinstance(ready, CompactionSummaryReady)
+    assert ready.summary == "second-try"
+
+
+@pytest.mark.asyncio
+async def test_handle_snapshot_ready_falls_back_to_analysis_stripped_when_retries_exhausted(
+    tmp_path: Path,
+) -> None:
+    projection = SQLiteConversationProjection(tmp_path / "messages.sqlite3")
+    await _seed_conversation(
+        projection,
+        conversation_id="c",
+        texts=[
+            ("user", "u1"),
+            ("assistant", "a1"),
+            ("user", "u2"),
+        ],
+    )
+    all_records = await projection.list_all_context_items("c")
+    compacted_seq = [r.sequence for r in all_records[:2]]
+    tail_seq = [all_records[2].sequence]
+    snapshot_max = all_records[-1].sequence
+
+    config = CompactionConfig(max_tokens_per_model=128_000)
+    responses: list[LlmResponse] = [
+        AssistantText(text="<analysis>noise 1</analysis>still no tag"),
+        AssistantText(
+            text="<analysis>noise 2</analysis>raw fallback body"
+        ),
+    ]
+    llm = FakeLlmClient(responses)
+    service = CompactionService(projection=projection, llm=llm, config=config)
+
+    snapshot = _make_snapshot(
+        compaction_id="cid:fallback",
+        compacted_sequences=compacted_seq,
+        tail_sequences=tail_seq,
+        snapshot_max_sequence=snapshot_max,
+    )
+    batch = await service.handle_snapshot_ready(snapshot)
+
+    assert len(llm.requests) == 2  # _SUMMARY_ATTEMPTS = 2
+    assert len(batch) == 1
+    ready = batch[0]
+    assert isinstance(ready, CompactionSummaryReady)
+    # _strip_analysis removes the <analysis>...</analysis> block on the last
+    # response and falls back to the stripped text.
+    assert ready.summary == "raw fallback body"
+
+
+@pytest.mark.asyncio
+async def test_handle_summary_ready_emits_committed_when_cas_succeeds(
+    tmp_path: Path,
+) -> None:
+    projection = SQLiteConversationProjection(tmp_path / "messages.sqlite3")
+    await _seed_conversation(
+        projection,
+        conversation_id="c",
+        texts=[
+            ("user", "u1"),
+            ("assistant", "a1"),
+            ("user", "u2"),
+        ],
+    )
+    all_records = await projection.list_all_context_items("c")
+    compacted_seq = [r.sequence for r in all_records[:2]]
+    tail_seq = [all_records[2].sequence]
+    snapshot_max = all_records[-1].sequence
+
+    config = CompactionConfig(max_tokens_per_model=128_000)
+    llm = FakeLlmClient([])
+    service = CompactionService(projection=projection, llm=llm, config=config)
+
+    snapshot = _make_snapshot(
+        compaction_id="cid:commit",
+        compacted_sequences=compacted_seq,
+        tail_sequences=tail_seq,
+        snapshot_max_sequence=snapshot_max,
+        archive_path="/workspace/.old-sessions/cid:commit.jsonl",
+    )
+    summary_ready = _make_summary_ready(snapshot=snapshot, summary="the recap")
+    batch = await service.handle_summary_ready(summary_ready)
+
+    assert len(batch) == 1
+    committed = batch[0]
+    assert isinstance(committed, CompactionCommitted)
+    assert committed.compaction_id == "cid:commit"
+    assert committed.archive_path == "/workspace/.old-sessions/cid:commit.jsonl"
+    assert committed.compacted_sequences == compacted_seq
+    assert committed.user_id == "u:1"
+    assert committed.conversation_id == "c"
+    assert committed.generation == 1
+
+    # The projection should now contain a context_summary row.
+    rows = await projection.list_all_context_items("c")
+    assert rows[-1].item_kind == CONTEXT_SUMMARY_KIND
+    assert rows[-1].text == "the recap"
+
+
+@pytest.mark.asyncio
+async def test_handle_summary_ready_emits_conflicted_when_max_sequence_advanced(
+    tmp_path: Path,
+) -> None:
+    projection = SQLiteConversationProjection(tmp_path / "messages.sqlite3")
+    await _seed_conversation(
+        projection,
+        conversation_id="c",
+        texts=[
+            ("user", "u1"),
+            ("assistant", "a1"),
+            ("user", "u2"),
+        ],
+    )
+    all_records = await projection.list_all_context_items("c")
+    compacted_seq = [r.sequence for r in all_records[:2]]
+    tail_seq = [all_records[2].sequence]
+    snapshot_max = all_records[-1].sequence
+
+    # A racer appends a new user message between snapshot and summary.
+    await projection.append_user_message(
+        user_id="u:1",
+        conversation_id="c",
+        text="racer",
+    )
+
+    config = CompactionConfig(max_tokens_per_model=128_000)
+    llm = FakeLlmClient([])
+    service = CompactionService(projection=projection, llm=llm, config=config)
+
+    snapshot = _make_snapshot(
+        compaction_id="cid:conflict",
+        compacted_sequences=compacted_seq,
+        tail_sequences=tail_seq,
+        snapshot_max_sequence=snapshot_max,
+    )
+    summary_ready = _make_summary_ready(snapshot=snapshot, summary="stale")
+    batch = await service.handle_summary_ready(summary_ready)
+
+    assert len(batch) == 1
+    conflicted = batch[0]
+    assert isinstance(conflicted, CompactionConflicted)
+    assert conflicted.compaction_id == "cid:conflict"
+    assert conflicted.reason == "cas_lost"
+    assert conflicted.user_id == "u:1"
+    assert conflicted.conversation_id == "c"
+    assert conflicted.generation == 1
+
+    # No context_summary row should have been written.
+    rows = await projection.list_all_context_items("c")
+    assert all(r.item_kind != CONTEXT_SUMMARY_KIND for r in rows)
