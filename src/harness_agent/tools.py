@@ -54,22 +54,20 @@ class FileMultiEditInput(BaseModel):
 class FileGlobInput(BaseModel):
     pattern: str
     cwd: str = "/workspace"
-    max_results: int = 200
 
 
 class FileGrepInput(BaseModel):
     pattern: str
     path: str = "/workspace"
-    max_results: int = 200
 
 
 class FileListInput(BaseModel):
     path: str = "/workspace"
-    max_results: int = 200
 
 
 class WebFetchInput(BaseModel):
     url: str
+    prompt: str = Field(min_length=1)
     max_bytes: int = 20000
 
 
@@ -362,7 +360,9 @@ def default_tool_registry() -> ToolRegistry:
             ),
             ToolSpec(
                 name="web.fetch",
-                description="Fetch text from an HTTP or HTTPS URL.",
+                description=(
+                    "Fetch an HTTP or HTTPS URL and answer the prompt from the page content."
+                ),
                 input_model=WebFetchInput,
             ),
             ToolSpec(
