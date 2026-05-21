@@ -10,6 +10,7 @@ from harness_agent.llm import (
     LlmClient,
     LlmMessage,
     LlmRequest,
+    LlmResponse,
     estimate_request_tokens,
 )
 from harness_agent.projections import ConversationItemRecord, SQLiteConversationProjection
@@ -271,7 +272,7 @@ _SUMMARY_ATTEMPTS = 2
 _ARCHIVE_WRITE_ATTEMPTS = 3
 
 
-def _assistant_text(response) -> str:
+def _assistant_text(response: LlmResponse) -> str:
     if response.kind == "assistant_text":
         return response.text
     raise RuntimeError("context compaction summary response was not text")

@@ -24,6 +24,7 @@ from harness_agent.handlers import (
     AgentTurnHandler,
     ContentIngestionHandler,
     ConversationProjector,
+    EventBatch,
     IdentityHandler,
 )
 from harness_agent.identity import StaticIdentityResolver
@@ -129,6 +130,7 @@ class HarnessApp:
             token=self._config.telegram.bot_token,
             bus=self.bus,
         )
+        self.telegram.register_outbound_handlers()
         self.scheduler_service = SchedulerService(
             pump=SchedulerPump(store=self.schedule_store, bus=self.bus),
             poll_seconds=self._config.scheduler.poll_seconds,
@@ -138,8 +140,7 @@ class HarnessApp:
         try:
             await self.telegram.start_polling()
         finally:
-            if self.scheduler_service is not None:
-                await self.scheduler_service.stop()
+            await self.scheduler_service.stop()
 
     def _wire(self) -> None:
         identity_handler = IdentityHandler(StaticIdentityResolver())
@@ -172,7 +173,7 @@ class HarnessApp:
             runtime=self.runtime,
             task_store=self.task_store,
             schedule_store=self.schedule_store,
-            web_fetcher=HttpxWebFetcher(),
+            web_fetcher=HttpxWebFetcher(llm=self.llm),
             mcp_manager=self.mcp_manager,
             sub_agents=self.sub_agents,
         )
@@ -192,25 +193,9 @@ class HarnessApp:
             AgentTurnRequested,
             agent_turn_handler.handle_agent_turn,
         )
-        self.bus.subscribe(AssistantTextProduced, self._send_telegram_reply)
         self.bus.subscribe(AssistantTextProduced, self._send_cli_reply)
 
-    async def _send_telegram_reply(self, event: AssistantTextProduced) -> tuple:
-        if event.reply_target is None:
-            return ()
-        if event.reply_target.kind != "telegram":
-            return ()
-        if not await self.turn_coordinator.is_current(
-            event.conversation_id,
-            event.generation,
-        ):
-            return ()
-        if self.telegram is None:
-            raise RuntimeError("telegram adapter is not running")
-        await self.telegram.send_assistant_text(event)
-        return ()
-
-    async def _send_cli_reply(self, event: AssistantTextProduced) -> tuple:
+    async def _send_cli_reply(self, event: AssistantTextProduced) -> EventBatch:
         if event.reply_target is None:
             return ()
         if event.reply_target.kind != "cli":

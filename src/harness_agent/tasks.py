@@ -5,6 +5,8 @@ from uuid import uuid4
 import aiosqlite
 from pydantic import BaseModel
 
+from harness_agent.db import fetchall_rows
+
 
 class Task(BaseModel):
     id: str
@@ -48,7 +50,8 @@ class SQLiteTaskStore:
     async def get(self, *, task_id: str, user_id: str, conversation_id: str) -> Task | None:
         await self._ensure_schema()
         async with aiosqlite.connect(self._path) as db:
-            row = await db.execute_fetchall(
+            rows = await fetchall_rows(
+                db,
                 """
                 select id, user_id, conversation_id, title, status
                 from tasks
@@ -56,14 +59,15 @@ class SQLiteTaskStore:
                 """,
                 (task_id, user_id, conversation_id),
             )
-        if not row:
+        if not rows:
             return None
+        row = rows[0]
         return Task(
-            id=row[0][0],
-            user_id=row[0][1],
-            conversation_id=row[0][2],
-            title=row[0][3],
-            status=row[0][4],
+            id=row[0],
+            user_id=row[1],
+            conversation_id=row[2],
+            title=row[3],
+            status=row[4],
         )
 
     async def list(
@@ -80,7 +84,8 @@ class SQLiteTaskStore:
             where += " and status != ?"
             params.append("stopped")
         async with aiosqlite.connect(self._path) as db:
-            rows = await db.execute_fetchall(
+            rows = await fetchall_rows(
+                db,
                 f"""
                 select id, user_id, conversation_id, title, status
                 from tasks

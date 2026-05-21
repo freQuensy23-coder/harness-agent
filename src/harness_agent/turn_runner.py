@@ -2,6 +2,7 @@ from harness_agent.bus import EventBus
 from harness_agent.compaction import ContextCompactor
 from harness_agent.context import ContextBuilder
 from harness_agent.events import (
+    AgentGenerationStarted,
     AgentTurnRequested,
     AgentTurnSuperseded,
     AssistantTextProduced,
@@ -13,13 +14,14 @@ from harness_agent.llm import (
     LlmClient,
     LlmMessage,
     LlmRequest,
+    LlmToolCall,
     ToolResultMessage,
     UserMessage,
 )
 from harness_agent.mcp import McpManager
 from harness_agent.projections import SQLiteConversationProjection
 from harness_agent.tool_executor import ToolCallResultWaiter
-from harness_agent.tools import ToolRegistry
+from harness_agent.tools import ToolRegistry, ToolSpec
 from harness_agent.turns import ConversationTurnCoordinator
 
 
@@ -61,6 +63,14 @@ class AgentTurnRunner:
                 messages = await self._prepare_messages(event, context.system, messages, tools)
                 if messages is None:
                     return
+                await self._bus.publish(
+                    AgentGenerationStarted(
+                        user_id=event.user_id,
+                        conversation_id=event.conversation_id,
+                        generation=event.generation,
+                        reply_target=event.reply_target,
+                    )
+                )
                 response = await self._llm.respond(
                     LlmRequest(
                         user_id=event.user_id,
@@ -92,7 +102,7 @@ class AgentTurnRunner:
         event: AgentTurnRequested,
         system: str,
         messages: list[LlmMessage],
-        tools,
+        tools: list[ToolSpec],
     ) -> list[LlmMessage] | None:
         if await self._stop_if_superseded(event):
             return None
@@ -149,7 +159,12 @@ class AgentTurnRunner:
             return None
         return compacted
 
-    async def _run_tool(self, event, response, messages: list[LlmMessage]) -> list[LlmMessage]:
+    async def _run_tool(
+        self,
+        event: AgentTurnRequested,
+        response: LlmToolCall,
+        messages: list[LlmMessage],
+    ) -> list[LlmMessage]:
         requested = ToolCallRequested(
             user_id=event.user_id,
             conversation_id=event.conversation_id,
@@ -187,8 +202,8 @@ class AgentTurnRunner:
             )
         return next_messages
 
-    async def _tools_for_user(self, user_id: str):
-        tools = list(self._tool_registry.list_for_model())
+    async def _tools_for_user(self, user_id: str) -> list[ToolSpec]:
+        tools: list[ToolSpec] = list(self._tool_registry.list_for_model())
         if self._mcp_manager is not None:
             tools.extend(await self._mcp_manager.list_tool_specs(user_id))
         return tools

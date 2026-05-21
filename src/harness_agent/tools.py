@@ -1,4 +1,4 @@
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 from pydantic import BaseModel, Field
 
@@ -54,22 +54,20 @@ class FileMultiEditInput(BaseModel):
 class FileGlobInput(BaseModel):
     pattern: str
     cwd: str = "/workspace"
-    max_results: int = 200
 
 
 class FileGrepInput(BaseModel):
     pattern: str
     path: str = "/workspace"
-    max_results: int = 200
 
 
 class FileListInput(BaseModel):
     path: str = "/workspace"
-    max_results: int = 200
 
 
 class WebFetchInput(BaseModel):
     url: str
+    prompt: str = Field(min_length=1)
     max_bytes: int = 20000
 
 
@@ -299,7 +297,7 @@ def parse_known_tool_input(name: str, payload: Any) -> ToolInput:
     input_model = TOOL_INPUT_MODELS.get(name)
     if input_model is None:
         raise ValueError(f"unknown tool: {name}")
-    return input_model.model_validate(payload)
+    return cast(ToolInput, input_model.model_validate(payload))
 
 
 def default_tool_registry() -> ToolRegistry:
@@ -362,7 +360,9 @@ def default_tool_registry() -> ToolRegistry:
             ),
             ToolSpec(
                 name="web.fetch",
-                description="Fetch text from an HTTP or HTTPS URL.",
+                description=(
+                    "Fetch an HTTP or HTTPS URL and answer the prompt from the page content."
+                ),
                 input_model=WebFetchInput,
             ),
             ToolSpec(
