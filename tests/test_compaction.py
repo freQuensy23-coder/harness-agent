@@ -4,9 +4,15 @@ from pathlib import Path
 import aiosqlite
 import pytest
 
+from harness_agent.compaction import (
+    _strip_analysis,
+    _summary_block,
+    _tail_boundary,
+)
 from harness_agent.config import LlmConfig, load_config
 from harness_agent.llm import (
     AssistantMessage,
+    LlmMessage,
     LlmRequest,
     UserMessage,
     estimate_request_tokens,
@@ -17,6 +23,27 @@ from harness_agent.projections import (
     SQLiteConversationProjection,
 )
 from harness_agent.tools import default_tool_registry
+
+
+def _record(*, sequence: int, item_kind: str, text: str = "") -> ConversationItemRecord:
+    message: LlmMessage
+    if item_kind == "user":
+        message = UserMessage(text=text)
+    else:
+        message = AssistantMessage(text=text)
+    return ConversationItemRecord(
+        sequence=sequence,
+        user_id="u:1",
+        conversation_id="c",
+        generation=1,
+        item_kind=item_kind,
+        text=text,
+        tool_call_id=None,
+        tool_name=None,
+        payload_json=None,
+        message_json=message.model_dump_json(),
+        message=message,
+    )
 
 
 async def _seed_conversation(
@@ -386,3 +413,103 @@ llm:
     assert defaults.max_tokens_per_model == 128_000
     assert defaults.compaction_reserve_tokens == 15_000
     assert defaults.compaction_keep_last_user_messages == 2
+
+
+def test_tail_boundary_finds_nth_user_message_from_end() -> None:
+    records = [
+        _record(sequence=1, item_kind="user", text="u1"),
+        _record(sequence=2, item_kind="assistant", text="a1"),
+        _record(sequence=3, item_kind="user", text="u2"),
+        _record(sequence=4, item_kind="assistant", text="a2"),
+        _record(sequence=5, item_kind="user", text="u3"),
+        _record(sequence=6, item_kind="assistant", text="a3"),
+        _record(sequence=7, item_kind="user", text="u4"),
+    ]
+
+    # With n=2, boundary is the index of the 2nd-from-last user message.
+    # User messages are at indexes 0, 2, 4, 6 -> 2nd from end is index 4.
+    assert _tail_boundary(records, keep_last_user_messages=2) == 4
+
+
+def test_tail_boundary_returns_none_when_n_users_with_first_at_index_zero() -> None:
+    # Only two user messages, with the first at index 0; n=2 picks index 0 ->
+    # _tail_boundary maps that to None (nothing to compact).
+    records = [
+        _record(sequence=1, item_kind="user", text="u1"),
+        _record(sequence=2, item_kind="assistant", text="a1"),
+        _record(sequence=3, item_kind="user", text="u2"),
+    ]
+
+    assert _tail_boundary(records, keep_last_user_messages=2) is None
+
+
+def test_tail_boundary_falls_back_to_latest_safe_when_fewer_users() -> None:
+    # Only one user message but n=2 requested; _nth_user_message_from_end
+    # returns None, so we fall back to _latest_safe_boundary, which is the
+    # last index that is not tool_result / tool_context. Here the last
+    # record is assistant -> boundary should be that index.
+    records = [
+        _record(sequence=1, item_kind="user", text="u1"),
+        _record(sequence=2, item_kind="assistant", text="a1"),
+        _record(sequence=3, item_kind="assistant", text="a2"),
+    ]
+
+    assert _tail_boundary(records, keep_last_user_messages=2) == 2
+
+
+def test_tail_boundary_safe_fallback_skips_tool_result_and_tool_context() -> None:
+    # No user messages -> nth_user returns None -> falls back to safe boundary.
+    # The trailing tool_result and tool_context rows must be skipped so the
+    # boundary lands on the latest non-tool-context-or-result index.
+    records = [
+        _record(sequence=1, item_kind="assistant", text="a1"),
+        _record(sequence=2, item_kind="assistant", text="a2"),
+        _record(sequence=3, item_kind="tool_result", text="r1"),
+        _record(sequence=4, item_kind="tool_context", text="ctx1"),
+    ]
+
+    # Latest safe boundary walks from end skipping tool_result/tool_context.
+    # Index 3 (tool_context) skipped, index 2 (tool_result) skipped,
+    # index 1 (assistant) accepted.
+    assert _tail_boundary(records, keep_last_user_messages=1) == 1
+
+
+def test_summary_block_extracts_trailing_summary_when_analysis_quotes_a_tag() -> None:
+    # The analysis section quotes a literal "<summary>" tag string, but the
+    # real summary follows. After _strip_analysis removes the analysis block,
+    # only the real <summary>...</summary> remains and is extracted.
+    text = (
+        "<analysis>I will close with a <summary> tag soon.</analysis>"
+        "<summary>real summary body</summary>"
+    )
+
+    assert _summary_block(text) == "real summary body"
+
+
+def test_summary_block_preserves_literal_summary_tag_inside_body() -> None:
+    # The regex is greedy across DOTALL: when the body itself contains a
+    # literal </summary> token, the greedy match keeps reading until the
+    # outermost </summary> at the end. Inner text including the embedded
+    # </summary> sequence must be preserved.
+    text = (
+        "<summary>line one</summary> mention of </summary> still in body"
+        "</summary>"
+    )
+
+    extracted = _summary_block(text)
+    assert extracted is not None
+    assert extracted.startswith("line one</summary>")
+    assert "still in body" in extracted
+
+
+def test_strip_analysis_removes_analysis_block_nondestructively() -> None:
+    text = (
+        "prefix text<analysis>throw away this analysis block</analysis>"
+        "suffix <summary>kept</summary>"
+    )
+
+    stripped = _strip_analysis(text)
+    assert "throw away" not in stripped
+    assert "prefix text" in stripped
+    assert "suffix" in stripped
+    assert "<summary>kept</summary>" in stripped
