@@ -696,6 +696,25 @@ class BrowserSessionPollHandler:
             )
             return tuple(emitted)
 
+        if state.status == "stopped" and state.is_task_successful is False:
+            error_text = "cloud reported is_task_successful=false"
+            await self._sessions.update_status(
+                session_id=record.session_id,
+                status="error",
+                error=error_text,
+            )
+            emitted.append(
+                BrowserSessionFailed(
+                    session_id=record.session_id,
+                    user_id=record.user_id,
+                    conversation_id=record.conversation_id,
+                    cloud_session_id=record.cloud_session_id,
+                    status="error",
+                    error=error_text,
+                )
+            )
+            return tuple(emitted)
+
         if state.status == "stopped":
             await self._sessions.update_status(
                 session_id=record.session_id,
@@ -1205,10 +1224,21 @@ def _is_success_terminal(
     state: CloudSessionState,
     record: BrowserSessionRecord,
 ) -> bool:
+    """Decide whether a cloud terminal state is success vs. abort.
+
+    The cloud transitions non-keep-alive sessions running -> stopped on
+    completion, but `is_task_successful` is sometimes left null even on
+    success. When `is_task_successful` is unset, presence of `output` is
+    the reliable success signal; an explicit `is_task_successful=false`
+    overrides both and is treated as failure upstream.
+    """
     if state.status == "idle" and record.status != "idle":
         return True
-    if state.status == "stopped" and state.is_task_successful is True:
-        return True
+    if state.status == "stopped":
+        if state.is_task_successful is True:
+            return True
+        if state.is_task_successful is None and state.output is not None:
+            return True
     return False
 
 

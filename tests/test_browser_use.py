@@ -684,6 +684,59 @@ async def test_stopped_with_task_success_emits_completed(tmp_path: Path) -> None
 
 
 @pytest.mark.asyncio
+async def test_stopped_with_output_but_null_is_task_successful_completes(tmp_path: Path) -> None:
+    sequence = [
+        CloudSessionState.model_validate({
+            "id": "x",
+            "status": "stopped",
+            "stepCount": 3,
+            "output": "Example Domain",
+        }),
+    ]
+    service, _, _, _, pump, _, published = _build(tmp_path, status_sequence=sequence)
+    record = await _run_with_ticker(
+        pump,
+        service.run(
+            user_id="alice",
+            conversation_id="c1",
+            generation=1,
+            parent_call_id="p1",
+            input=BrowserRunInput(task="t", timeout_seconds=10.0),
+        ),
+    )
+    assert record.status == "completed"
+    assert record.output == "Example Domain"
+    assert [e for e in published if isinstance(e, BrowserSessionCompleted)]
+
+
+@pytest.mark.asyncio
+async def test_stopped_with_is_task_successful_false_emits_failed(tmp_path: Path) -> None:
+    sequence = [
+        CloudSessionState.model_validate({
+            "id": "x",
+            "status": "stopped",
+            "stepCount": 2,
+            "isTaskSuccessful": False,
+        }),
+    ]
+    service, _, _, _, pump, _, published = _build(tmp_path, status_sequence=sequence)
+    record = await _run_with_ticker(
+        pump,
+        service.run(
+            user_id="alice",
+            conversation_id="c1",
+            generation=1,
+            parent_call_id="p1",
+            input=BrowserRunInput(task="t", timeout_seconds=10.0),
+        ),
+    )
+    assert record.status == "error"
+    assert record.error is not None
+    failures = [e for e in published if isinstance(e, BrowserSessionFailed)]
+    assert len(failures) == 1
+
+
+@pytest.mark.asyncio
 async def test_cloud_stop_emits_stopped_not_failed(tmp_path: Path) -> None:
     sequence = [CloudSessionState(id="x", status="stopped", step_count=2)]
     service, _, _, _, pump, _, published = _build(tmp_path, status_sequence=sequence)
