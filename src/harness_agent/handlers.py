@@ -1,6 +1,8 @@
 import base64
+from uuid import uuid4
 
 from harness_agent.bus import EventBus
+from harness_agent.compaction import CompactionConfig
 from harness_agent.content import content_ref_from_bytes
 from harness_agent.context import ContextBuilder
 from harness_agent.events import (
@@ -10,6 +12,7 @@ from harness_agent.events import (
     AssistantTextProduced,
     CliReplyTarget,
     CliTextReceived,
+    CompactionRequested,
     EventBase,
     TelegramReplyTarget,
     TelegramTextReceived,
@@ -24,6 +27,7 @@ from harness_agent.llm import (
     LlmClient,
     ToolResultMessage,
     UserMessage,
+    estimate_request_tokens,
 )
 from harness_agent.mcp import McpManager
 from harness_agent.projections import SQLiteConversationProjection
@@ -163,6 +167,7 @@ class AgentTurnHandler:
         turn_coordinator: ConversationTurnCoordinator | None = None,
         tool_results: ToolCallResultWaiter | None = None,
         sub_agent_lookup: SubAgentLookup | None = None,
+        compaction_config: CompactionConfig | None = None,
     ) -> None:
         self._bus = bus
         self._context_builder = context_builder
@@ -177,6 +182,7 @@ class AgentTurnHandler:
             tool_results = ToolCallResultWaiter()
         self._tool_results = tool_results
         self._sub_agent_lookup = sub_agent_lookup
+        self._compaction_config = compaction_config
 
     async def handle_user_text(self, event: UserTextReceived) -> EventBatch:
         generation = await self._turn_coordinator.request_generation(event.conversation_id)
@@ -212,6 +218,38 @@ class AgentTurnHandler:
             while True:
                 if await self._stop_if_superseded(event):
                     return
+                request = LlmRequest(
+                    user_id=event.user_id,
+                    conversation_id=event.conversation_id,
+                    generation=event.generation,
+                    system=system_prompt,
+                    messages=messages,
+                    tools=tools,
+                )
+                if (
+                    self._compaction_config is not None
+                    and estimate_request_tokens(request)
+                    >= self._compaction_config.threshold
+                ):
+                    await self._bus.publish(
+                        CompactionRequested(
+                            compaction_id=uuid4().hex,
+                            user_id=event.user_id,
+                            conversation_id=event.conversation_id,
+                            generation=event.generation,
+                        )
+                    )
+                    messages = await self._projection.list_llm_messages(
+                        event.conversation_id
+                    )
+                    request = LlmRequest(
+                        user_id=event.user_id,
+                        conversation_id=event.conversation_id,
+                        generation=event.generation,
+                        system=system_prompt,
+                        messages=messages,
+                        tools=tools,
+                    )
                 await self._bus.publish(
                     AgentGenerationStarted(
                         user_id=event.user_id,
@@ -220,16 +258,7 @@ class AgentTurnHandler:
                         reply_target=event.reply_target,
                     )
                 )
-                response = await self._llm.respond(
-                    LlmRequest(
-                        user_id=event.user_id,
-                        conversation_id=event.conversation_id,
-                        generation=event.generation,
-                        system=system_prompt,
-                        messages=messages,
-                        tools=tools,
-                    )
-                )
+                response = await self._llm.respond(request)
                 if await self._stop_if_superseded(event):
                     return
                 if response.kind == "assistant_text":
