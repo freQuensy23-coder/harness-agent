@@ -18,6 +18,7 @@ from pydantic import BaseModel, Field
 from harness_agent.context import AgentFileSet, Skill, UserContextRuntime
 from harness_agent.content import WorkspaceFile
 from harness_agent.mcp_models import McpServerConfig
+from harness_agent.text import as_str
 from harness_agent.tools import (
     FileEditInput,
     FileGlobInput,
@@ -813,10 +814,10 @@ class FakeUserRuntime(UserRuntime):
         if missing:
             raise FileNotFoundError(", ".join(missing))
         return AgentFileSet(
-            soul=_as_str(self._files["/workspace/agent/SOUL.md"]),
-            agents=_as_str(self._files["/workspace/agent/AGENTS.md"]),
-            user=_as_str(self._files["/workspace/agent/USER.md"]),
-            tools=_as_str(self._files["/workspace/agent/TOOLS.md"]),
+            soul=as_str(self._files["/workspace/agent/SOUL.md"]),
+            agents=as_str(self._files["/workspace/agent/AGENTS.md"]),
+            user=as_str(self._files["/workspace/agent/USER.md"]),
+            tools=as_str(self._files["/workspace/agent/TOOLS.md"]),
         )
 
     async def list_skills(self, user_id: str) -> list[Skill]:
@@ -882,7 +883,7 @@ class FakeUserRuntime(UserRuntime):
         return RuntimeToolResult()
 
     async def file_edit(self, user_id: str, input: FileEditInput) -> RuntimeToolResult:
-        content = _as_str(self._files[input.path])
+        content = as_str(self._files[input.path])
         count = -1 if input.replace_all else 1
         self._files[input.path] = content.replace(input.old, input.new, count)
         return RuntimeToolResult()
@@ -892,7 +893,7 @@ class FakeUserRuntime(UserRuntime):
         user_id: str,
         input: FileMultiEditInput,
     ) -> RuntimeToolResult:
-        content = _as_str(self._files[input.path])
+        content = as_str(self._files[input.path])
         for edit in input.edits:
             count = -1 if edit.replace_all else 1
             content = content.replace(edit.old, edit.new, count)
@@ -909,7 +910,7 @@ class FakeUserRuntime(UserRuntime):
         for path, content in sorted(self._files.items()):
             if not path.startswith(input.path):
                 continue
-            text = _as_str(content)
+            text = as_str(content)
             for line_no, line in enumerate(text.splitlines(), start=1):
                 if input.pattern in line:
                     lines.append(f"{path}:{line_no}:{line}")
@@ -1110,9 +1111,3 @@ def _content_path(path: str) -> str:
     if normalized != "/workspace/content" and not normalized.startswith("/workspace/content/"):
         raise ValueError(f"content path must stay inside /workspace/content: {path}")
     return normalized
-
-
-def _as_str(value: str | bytes) -> str:
-    if isinstance(value, bytes):
-        return value.decode("utf-8", errors="replace")
-    return value

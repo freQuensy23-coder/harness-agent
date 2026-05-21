@@ -3,10 +3,22 @@ from typing import Annotated, Any, Literal, cast
 
 from openai import AsyncOpenAI
 from openai.types.chat import (
+    ChatCompletionAssistantMessageParam,
+    ChatCompletionContentPartImageParam,
+    ChatCompletionContentPartParam,
+    ChatCompletionContentPartTextParam,
+    ChatCompletionFunctionToolParam,
     ChatCompletionMessageFunctionToolCall,
+    ChatCompletionMessageFunctionToolCallParam,
     ChatCompletionMessageParam,
+    ChatCompletionSystemMessageParam,
+    ChatCompletionToolMessageParam,
     ChatCompletionToolUnionParam,
+    ChatCompletionUserMessageParam,
 )
+from openai.types.chat.chat_completion_content_part_image_param import ImageURL
+from openai.types.chat.chat_completion_message_function_tool_call_param import Function
+from openai.types.shared_params import FunctionDefinition
 from pydantic import BaseModel, Field
 
 from harness_agent.content import ContentRef
@@ -92,14 +104,11 @@ class OpenAICompatibleChatClient(LlmClient):
 
     async def respond(self, request: LlmRequest) -> LlmResponse:
         messages: list[ChatCompletionMessageParam] = [
-            cast(ChatCompletionMessageParam, {"role": "system", "content": request.system}),
-            *(
-                cast(ChatCompletionMessageParam, message_to_openai(message))
-                for message in request.messages
-            ),
+            ChatCompletionSystemMessageParam(role="system", content=request.system),
+            *(message_to_openai(message) for message in request.messages),
         ]
         tools: list[ChatCompletionToolUnionParam] = [
-            cast(ChatCompletionToolUnionParam, tool_to_openai(tool)) for tool in request.tools
+            tool_to_openai(tool) for tool in request.tools
         ]
         response = await self._client.chat.completions.create(
             model=self._model,
@@ -139,64 +148,69 @@ class FakeLlmClient(LlmClient):
         return self._responses.pop(0)
 
 
-def tool_to_openai(tool: ToolSpec) -> dict[str, Any]:
-    schema = tool.parameters_schema()
-    return {
-        "type": "function",
-        "function": {
-            "name": api_tool_name(tool.name),
-            "description": f"Canonical tool: {tool.name}. {tool.description}",
-            "parameters": schema,
-        },
-    }
+def tool_to_openai(tool: ToolSpec) -> ChatCompletionFunctionToolParam:
+    return ChatCompletionFunctionToolParam(
+        type="function",
+        function=FunctionDefinition(
+            name=api_tool_name(tool.name),
+            description=f"Canonical tool: {tool.name}. {tool.description}",
+            parameters=tool.parameters_schema(),
+        ),
+    )
 
 
-def message_to_openai(message: LlmMessage) -> dict[str, Any]:
+def message_to_openai(message: LlmMessage) -> ChatCompletionMessageParam:
     if message.kind == "user":
-        text = render_user_text(message)
-        image_parts = [
-            {
-                "type": "image_url",
-                "image_url": {
-                    "url": (
-                        f"data:{attachment.mime_type or 'application/octet-stream'};"
-                        f"base64,{attachment.content_base64}"
-                    )
-                },
-            }
-            for attachment in message.attachments
-            if attachment.kind == "image" and attachment.content_base64 is not None
-        ]
-        if image_parts:
-            return {
-                "role": "user",
-                "content": [{"type": "text", "text": text}, *image_parts],
-            }
-        return {"role": "user", "content": text}
+        return _user_message_to_openai(message)
     if message.kind == "assistant":
-        return {"role": "assistant", "content": message.text}
+        return ChatCompletionAssistantMessageParam(role="assistant", content=message.text)
     if message.kind == "assistant_tool_call":
-        return {
-            "role": "assistant",
-            "content": None,
-            "tool_calls": [
-                {
-                    "id": message.call_id,
-                    "type": "function",
-                    "function": {
-                        "name": api_tool_name(message.name),
-                        "arguments": json.dumps(message.arguments),
-                    },
-                }
-            ],
-        }
+        tool_call = ChatCompletionMessageFunctionToolCallParam(
+            id=message.call_id,
+            type="function",
+            function=Function(
+                name=api_tool_name(message.name),
+                arguments=json.dumps(message.arguments),
+            ),
+        )
+        return ChatCompletionAssistantMessageParam(
+            role="assistant",
+            content=None,
+            tool_calls=[tool_call],
+        )
     if message.kind == "tool_result":
-        return {
-            "role": "tool",
-            "tool_call_id": message.call_id,
-            "content": message.content,
-        }
+        return ChatCompletionToolMessageParam(
+            role="tool",
+            tool_call_id=message.call_id,
+            content=message.content,
+        )
     raise ValueError(f"unsupported message kind: {message}")
+
+
+def _user_message_to_openai(message: UserMessage) -> ChatCompletionUserMessageParam:
+    text = render_user_text(message)
+    image_parts: list[ChatCompletionContentPartParam] = [
+        ChatCompletionContentPartImageParam(
+            type="image_url",
+            image_url=ImageURL(
+                url=(
+                    f"data:{attachment.mime_type or 'application/octet-stream'};"
+                    f"base64,{attachment.content_base64}"
+                )
+            ),
+        )
+        for attachment in message.attachments
+        if attachment.kind == "image" and attachment.content_base64 is not None
+    ]
+    if not image_parts:
+        return ChatCompletionUserMessageParam(role="user", content=text)
+    return ChatCompletionUserMessageParam(
+        role="user",
+        content=[
+            ChatCompletionContentPartTextParam(type="text", text=text),
+            *image_parts,
+        ],
+    )
 
 
 def render_user_text(message: UserMessage) -> str:

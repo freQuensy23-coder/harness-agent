@@ -1,4 +1,5 @@
 import re
+from typing import cast
 from urllib.parse import urljoin
 
 import httpx
@@ -103,9 +104,7 @@ def html_to_markdown(html: str, *, base_url: str) -> str:
     for tag in soup.find_all(list(_BOILERPLATE_TAGS)):
         tag.decompose()
     for anchor in soup.find_all("a", href=True):
-        href = anchor.get("href")
-        if isinstance(href, str):
-            anchor["href"] = urljoin(base_url, href)
+        anchor["href"] = urljoin(base_url, cast(str, anchor["href"]))
     rendered = markdownify(str(soup), heading_style="ATX", bullets="-")
     return re.sub(r"\n{3,}", "\n\n", rendered).strip()
 
