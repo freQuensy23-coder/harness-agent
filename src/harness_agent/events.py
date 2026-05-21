@@ -169,6 +169,18 @@ class ScheduledMessageDue(EventBase):
     reply_target: ReplyTarget | None = None
 
 
+class SubAgentRequested(EventBase):
+    type: Literal["subagent.requested"] = "subagent.requested"
+    agent_id: str
+    user_id: str
+    parent_conversation_id: str
+    child_conversation_id: str
+    parent_call_id: str
+    name: str
+    prompt: str
+    timeout_seconds: float
+
+
 class SubAgentStarted(EventBase):
     type: Literal["subagent.started"] = "subagent.started"
     agent_id: str
@@ -177,6 +189,16 @@ class SubAgentStarted(EventBase):
     child_conversation_id: str
     parent_call_id: str
     name: str
+    prompt: str = ""
+    timeout_seconds: float = 0.0
+
+
+class SubAgentTimedOut(EventBase):
+    type: Literal["subagent.timed_out"] = "subagent.timed_out"
+    agent_id: str
+    user_id: str
+    parent_conversation_id: str
+    child_conversation_id: str
 
 
 class SubAgentCompleted(EventBase):
@@ -217,7 +239,9 @@ AgentEvent = Annotated[
     | ToolCallCompleted
     | AssistantTextProduced
     | ScheduledMessageDue
+    | SubAgentRequested
     | SubAgentStarted
+    | SubAgentTimedOut
     | SubAgentCompleted
     | SubAgentFailed
     | SubAgentCancelled,
