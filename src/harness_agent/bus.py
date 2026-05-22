@@ -1,3 +1,4 @@
+import asyncio
 from collections.abc import Awaitable, Callable, Iterable
 from typing import Any, cast
 
@@ -22,6 +23,9 @@ class EventBus:
         if event_class not in self._handlers:
             self._handlers[event_class] = []
         self._handlers[event_class].append(handler)
+
+    def send(self, event: AgentEvent) -> asyncio.Task[None]:
+        return asyncio.create_task(self.publish(event))
 
     async def publish(self, event: AgentEvent) -> None:
         await self._store.append(event)

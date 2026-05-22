@@ -56,7 +56,7 @@ from harness_agent.scheduler import (
 from harness_agent.store import SQLiteEventStore
 from harness_agent.subagents import SQLiteSubAgentStore, SubAgentService
 from harness_agent.tasks import SQLiteTaskStore
-from harness_agent.tool_executor import ToolCallExecutor, ToolCallResultWaiter
+from harness_agent.tool_executor import ToolCallExecutor
 from harness_agent.turns import ConversationTurnCoordinator
 from harness_agent.tools import default_tool_registry
 from harness_agent.web_fetch import HttpxWebFetcher
@@ -82,7 +82,6 @@ class HarnessApp:
         self.task_store = SQLiteTaskStore(tasks_path)
         self.bus = EventBus(self.event_store)
         self.turn_coordinator = ConversationTurnCoordinator()
-        self.tool_results = ToolCallResultWaiter()
         self.runtime = DockerUserRuntime(
             image=config.runtime.docker.image,
             container_prefix=config.runtime.docker.container_prefix,
@@ -175,7 +174,6 @@ class HarnessApp:
             projection=self.projection,
             mcp_manager=self.mcp_manager,
             turn_coordinator=self.turn_coordinator,
-            tool_results=self.tool_results,
             sub_agent_lookup=self.sub_agents,
             compaction_config=compaction_config,
         )
@@ -211,8 +209,8 @@ class HarnessApp:
         self.bus.subscribe(SubAgentFailed, self.sub_agents.handle_failed)
         self.bus.subscribe(SubAgentCancelled, self.sub_agents.handle_cancelled)
         self.bus.subscribe(ToolCallRequested, tool_call_executor.handle_tool_call_requested)
-        self.bus.subscribe(ToolCallCompleted, self.tool_results.handle_tool_call_completed)
         self.bus.subscribe(ToolCallCompleted, conversation_projector.handle_tool_call_completed)
+        self.bus.subscribe(ToolCallCompleted, agent_turn_handler.handle_tool_call_completed)
         self.bus.subscribe(UserTextReceived, agent_turn_handler.handle_user_text)
         self.bus.subscribe(
             AgentTurnRequested,

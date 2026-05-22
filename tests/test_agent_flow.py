@@ -242,6 +242,8 @@ async def test_tool_call_executes_in_runtime_without_exposing_docker(tmp_path: P
     bus.subscribe(AssistantTextProduced, conversation_projector.handle_assistant_text)
     bus.subscribe(ToolCallRequested, tool_executor.handle_tool_call_requested)
     bus.subscribe(ToolCallCompleted, tool_results.handle_tool_call_completed)
+    bus.subscribe(ToolCallCompleted, ConversationProjector(projection).handle_tool_call_completed)
+    bus.subscribe(ToolCallCompleted, agent_turn_handler.handle_tool_call_completed)
     bus.subscribe(UserTextReceived, agent_turn_handler.handle_user_text)
     bus.subscribe(
         AgentTurnRequested,
@@ -283,6 +285,78 @@ async def test_tool_call_executes_in_runtime_without_exposing_docker(tmp_path: P
             content="shell.exec stdout:\n/workspace\nstderr:\n\nexit_code: 0",
         ),
     ]
+
+
+@pytest.mark.asyncio
+async def test_stuck_tool_does_not_block_next_turn_for_same_conversation(tmp_path: Path) -> None:
+    store = SQLiteEventStore(tmp_path / "events.sqlite3")
+    projection = SQLiteConversationProjection(tmp_path / "messages.sqlite3")
+    runtime = FakeUserRuntime(
+        agent_files=AgentFileSet(
+            soul="SOUL",
+            agents="AGENTS",
+            user="USER",
+            tools="TOOLS",
+        )
+    )
+    llm = FakeLlmClient(
+        [
+            LlmToolCall(
+                call_id="stuck_call",
+                name="shell.exec",
+                input=ShellExecInput(command="never finishes"),
+            ),
+            AssistantText(text="second turn answered"),
+        ]
+    )
+    bus = EventBus(store)
+    conversation_projector = ConversationProjector(projection)
+    agent_turn_handler = AgentTurnHandler(
+        bus=bus,
+        context_builder=ContextBuilder(runtime=runtime),
+        llm=llm,
+        tool_registry=default_tool_registry(),
+        projection=projection,
+    )
+    tool_started = asyncio.Event()
+    release_tool = asyncio.Event()
+
+    async def hang_tool(event: ToolCallRequested) -> EventBatch:
+        tool_started.set()
+        await release_tool.wait()
+        return ()
+
+    bus.subscribe(UserTextReceived, conversation_projector.handle_user_text)
+    bus.subscribe(AssistantTextProduced, conversation_projector.handle_assistant_text)
+    bus.subscribe(ToolCallRequested, hang_tool)
+    bus.subscribe(UserTextReceived, agent_turn_handler.handle_user_text)
+    bus.subscribe(AgentTurnRequested, agent_turn_handler.handle_agent_turn)
+
+    first_publish = bus.send(
+        UserTextReceived(
+            user_id="u_1",
+            conversation_id="tg:456",
+            source="telegram",
+            text="start stuck tool",
+        )
+    )
+    await asyncio.wait_for(tool_started.wait(), timeout=1)
+
+    await asyncio.wait_for(
+        bus.publish(
+            UserTextReceived(
+                user_id="u_1",
+                conversation_id="tg:456",
+                source="telegram",
+                text="new message",
+            )
+        ),
+        timeout=1,
+    )
+
+    release_tool.set()
+    await asyncio.wait_for(first_publish, timeout=1)
+    assert ("assistant", "second turn answered") in await projection.list_messages("tg:456")
 
 
 @pytest.mark.asyncio
@@ -444,6 +518,7 @@ async def test_tool_calls_and_results_are_persisted_in_llm_history(tmp_path: Pat
     bus.subscribe(ToolCallRequested, tool_executor.handle_tool_call_requested)
     bus.subscribe(ToolCallCompleted, tool_results.handle_tool_call_completed)
     bus.subscribe(ToolCallCompleted, conversation_projector.handle_tool_call_completed)
+    bus.subscribe(ToolCallCompleted, agent_turn_handler.handle_tool_call_completed)
     bus.subscribe(UserTextReceived, agent_turn_handler.handle_user_text)
     bus.subscribe(AgentTurnRequested, agent_turn_handler.handle_agent_turn)
 
@@ -531,6 +606,7 @@ async def test_tool_history_bytes_are_identical_in_next_llm_request(tmp_path: Pa
     bus.subscribe(ToolCallRequested, tool_executor.handle_tool_call_requested)
     bus.subscribe(ToolCallCompleted, tool_results.handle_tool_call_completed)
     bus.subscribe(ToolCallCompleted, conversation_projector.handle_tool_call_completed)
+    bus.subscribe(ToolCallCompleted, agent_turn_handler.handle_tool_call_completed)
     bus.subscribe(UserTextReceived, agent_turn_handler.handle_user_text)
     bus.subscribe(AgentTurnRequested, agent_turn_handler.handle_agent_turn)
 
@@ -979,10 +1055,13 @@ async def test_supersede_during_compaction_does_not_commit_stale_summary(
     rows = await projection.list_all_context_items("cli:supersede")
     assert all(r.item_kind != "context_summary" for r in rows)
 
-    # The second turn's LLM request saw the full uncompacted history.
-    # runner_llm.requests[0] was the first (stale) turn; [1] is gen 2.
+    # The second turn's LLM request saw the full uncompacted history. In the
+    # event-driven flow the stale gen-1 continuation may complete after gen 2,
+    # so select by generation instead of request order.
     assert len(runner_llm.requests) >= 2
-    second_turn_request = runner_llm.requests[-1]
+    second_turn_request = next(
+        request for request in runner_llm.requests if request.generation == 2
+    )
     assert second_turn_request.messages == [
         UserMessage(text="prior-1"),
         AssistantMessage(text="prior-a"),
