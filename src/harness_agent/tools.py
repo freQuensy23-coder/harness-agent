@@ -71,6 +71,18 @@ class WebFetchInput(BaseModel):
     max_bytes: int = 20000
 
 
+class ImageGenerateInput(BaseModel):
+    prompt: str = Field(min_length=1)
+    output_path: str = Field(min_length=1)
+    aspect_ratio: Literal[
+        "1:1", "2:3", "3:2", "3:4", "4:3", "4:5", "5:4", "9:16", "16:9", "21:9"
+    ] = "1:1"
+
+
+class ImageStatusInput(BaseModel):
+    image_id: str = Field(min_length=1)
+
+
 class TaskCreateInput(BaseModel):
     title: str
     status: Literal["pending", "in_progress", "completed", "stopped"] = "pending"
@@ -166,6 +178,8 @@ TOOL_INPUT_MODELS: dict[str, ToolInputModel] = {
     "file.grep": FileGrepInput,
     "file.list": FileListInput,
     "web.fetch": WebFetchInput,
+    "image.generate": ImageGenerateInput,
+    "image.status": ImageStatusInput,
     "task.create": TaskCreateInput,
     "task.get": TaskGetInput,
     "task.list": TaskListInput,
@@ -231,6 +245,8 @@ ToolName = Literal[
     "file.grep",
     "file.list",
     "web.fetch",
+    "image.generate",
+    "image.status",
     "task.create",
     "task.get",
     "task.list",
@@ -261,6 +277,8 @@ ToolInput = (
     | FileGrepInput
     | FileListInput
     | WebFetchInput
+    | ImageGenerateInput
+    | ImageStatusInput
     | TaskCreateInput
     | TaskGetInput
     | TaskListInput
@@ -364,6 +382,25 @@ def default_tool_registry() -> ToolRegistry:
                     "Fetch an HTTP or HTTPS URL and answer the prompt from the page content."
                 ),
                 input_model=WebFetchInput,
+            ),
+            ToolSpec(
+                name="image.generate",
+                description=(
+                    "Start an asynchronous Gemini (Nano Banana, flex tier) image "
+                    "generation job. Returns an image_id immediately; the model and the "
+                    "rest of the bot keep running while the picture is rendered. Poll "
+                    "image.status with image_id to retrieve the finished image."
+                ),
+                input_model=ImageGenerateInput,
+            ),
+            ToolSpec(
+                name="image.status",
+                description=(
+                    "Look up an image.generate job by image_id. When status is "
+                    "completed, the saved image is attached to the next assistant turn "
+                    "so it can be inspected. When still running, retry later."
+                ),
+                input_model=ImageStatusInput,
             ),
             ToolSpec(
                 name="task.create",

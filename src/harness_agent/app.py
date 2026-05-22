@@ -58,6 +58,8 @@ from harness_agent.subagents import SQLiteSubAgentStore, SubAgentService
 from harness_agent.tasks import SQLiteTaskStore
 from harness_agent.tool_executor import ToolCallExecutor
 from harness_agent.turns import ConversationTurnCoordinator
+from harness_agent.image_generate import GeminiImageGenerator
+from harness_agent.image_jobs import ImageJobService, SQLiteImageJobStore
 from harness_agent.tools import default_tool_registry
 from harness_agent.web_fetch import HttpxWebFetcher
 
@@ -67,6 +69,7 @@ class HarnessApp:
         self._config = config
         db_path = config.database.path
         events_path = _derived_db_path(db_path, "events")
+        image_jobs_path = _derived_db_path(db_path, "image_jobs")
         llm_path = _derived_db_path(db_path, "llm")
         messages_path = _derived_db_path(db_path, "messages")
         runtime_path = _derived_db_path(db_path, "runtime")
@@ -75,6 +78,7 @@ class HarnessApp:
         tasks_path = _derived_db_path(db_path, "tasks")
 
         self.event_store = SQLiteEventStore(events_path)
+        self.image_job_store = SQLiteImageJobStore(image_jobs_path)
         self.llm_audit_store = SQLiteLlmAuditStore(llm_path)
         self.projection = SQLiteConversationProjection(messages_path)
         self.schedule_store = SQLiteScheduleStore(schedules_path)
@@ -106,6 +110,17 @@ class HarnessApp:
         self.sub_agents = SubAgentService(
             bus=self.bus,
             store=self.sub_agent_store,
+        )
+        self.image_jobs = ImageJobService(
+            store=self.image_job_store,
+            generator=GeminiImageGenerator(
+                api_key=self._config.image.api_key,
+                base_url=self._config.image.base_url,
+                model=self._config.image.model,
+                service_tier=self._config.image.service_tier,
+                timeout_seconds=self._config.image.timeout_seconds,
+            ),
+            runtime=self.runtime,
         )
         self.telegram: AiogramTelegramAdapter | None = None
         self.scheduler_service: SchedulerService | None = None
@@ -191,6 +206,7 @@ class HarnessApp:
             task_store=self.task_store,
             schedule_store=self.schedule_store,
             web_fetcher=HttpxWebFetcher(llm=self.llm),
+            image_jobs=self.image_jobs,
             mcp_manager=self.mcp_manager,
             sub_agents=self.sub_agents,
         )

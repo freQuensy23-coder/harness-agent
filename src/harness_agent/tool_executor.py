@@ -5,8 +5,16 @@ from datetime import UTC, datetime
 
 from pydantic import BaseModel, Field
 
-from harness_agent.content import ContentRef, content_ref_from_workspace_file
+from harness_agent.content import (
+    ContentRef,
+    content_ref_from_bytes,
+    content_ref_from_workspace_file,
+)
 from harness_agent.events import EventBase, ToolCallCompleted, ToolCallError, ToolCallRequested
+from harness_agent.image_jobs import (
+    ImageJobService,
+    render_image_job_record,
+)
 from harness_agent.mcp import McpManager
 from harness_agent.runtime import RuntimeToolResult, UserRuntime
 from harness_agent.scheduler import SQLiteScheduleStore
@@ -29,6 +37,8 @@ from harness_agent.tools import (
     FileMultiEditInput,
     FileReadInput,
     FileWriteInput,
+    ImageGenerateInput,
+    ImageStatusInput,
     McpToolInput,
     ScheduleCancelInput,
     ScheduleCronInput,
@@ -91,6 +101,7 @@ class ToolCallExecutor:
         task_store: SQLiteTaskStore | None = None,
         schedule_store: SQLiteScheduleStore | None = None,
         web_fetcher: WebFetcher | None = None,
+        image_jobs: ImageJobService | None = None,
         mcp_manager: McpManager | None = None,
         sub_agents: SubAgentService | None = None,
         max_model_output_chars: int = 20_000,
@@ -99,6 +110,7 @@ class ToolCallExecutor:
         self._task_store = task_store
         self._schedule_store = schedule_store
         self._web_fetcher = web_fetcher
+        self._image_jobs = image_jobs
         self._mcp_manager = mcp_manager
         self._sub_agents = sub_agents
         self._max_model_output_chars = max_model_output_chars
@@ -114,6 +126,7 @@ class ToolCallExecutor:
             "file.grep": self._file_grep,
             "file.list": self._file_list,
             "web.fetch": self._web_fetch,
+            "image.generate": self._image_generate,
             "task.create": self._task_create,
             "task.get": self._task_get,
             "task.list": self._task_list,
@@ -209,6 +222,8 @@ class ToolCallExecutor:
     async def _execute_tool(self, event: ToolCallRequested) -> ToolExecutionResult:
         if event.tool_name == "file.read":
             return await self._file_read_for_model(event.user_id, event)
+        if event.tool_name == "image.status":
+            return await self._image_status_for_model(event.user_id, event)
         if event.tool_name not in self._tool_executors:
             if event.tool_name.startswith("mcp."):
                 return ToolExecutionResult(result=await self._mcp_call(event))
@@ -348,6 +363,67 @@ class ToolCallExecutor:
         if self._web_fetcher is None:
             raise RuntimeError("web fetcher is not configured")
         return await self._web_fetcher.fetch(WebFetchInput.model_validate(event.input))
+
+    async def _image_generate(
+        self,
+        user_id: str,
+        event: ToolCallRequested,
+    ) -> RuntimeToolResult:
+        record = await self._require_image_jobs().start(
+            user_id=user_id,
+            conversation_id=event.conversation_id,
+            parent_call_id=event.call_id,
+            input=ImageGenerateInput.model_validate(event.input),
+        )
+        return RuntimeToolResult(stdout=render_image_job_record(record))
+
+    async def _image_status_for_model(
+        self,
+        user_id: str,
+        event: ToolCallRequested,
+    ) -> ToolExecutionResult:
+        input = ImageStatusInput.model_validate(event.input)
+        record = await self._require_image_jobs().get(
+            job_id=input.image_id,
+            user_id=user_id,
+            conversation_id=event.conversation_id,
+        )
+        if record is None:
+            return ToolExecutionResult(
+                result=RuntimeToolResult(
+                    stderr=f"Unknown image job: {input.image_id}\n",
+                    exit_code=1,
+                )
+            )
+        if record.status != "completed":
+            return ToolExecutionResult(
+                result=RuntimeToolResult(stdout=render_image_job_record(record))
+            )
+        if record.mime_type is None:
+            raise RuntimeError(
+                f"completed image job {record.id} is missing mime_type"
+            )
+        read = await self._runtime.read_file_bytes(user_id, record.output_path, None)
+        if read.result.exit_code != 0:
+            return ToolExecutionResult(result=read.result)
+        if read.file is None:
+            raise RuntimeError("image file read succeeded without file content")
+        content_ref = content_ref_from_bytes(
+            kind="image",
+            file_name=_basename(record.output_path),
+            mime_type=record.mime_type,
+            workspace_path=record.output_path,
+            content=read.file.content,
+        )
+        return ToolExecutionResult(
+            result=RuntimeToolResult(stdout=render_image_job_record(record)),
+            attachments=[content_ref],
+        )
+
+    def _require_image_jobs(self) -> ImageJobService:
+        if self._image_jobs is None:
+            raise RuntimeError("image job service is not configured")
+        return self._image_jobs
 
     async def _task_create(
         self,
@@ -626,3 +702,7 @@ def _tool_result_path(event: ToolCallRequested) -> str:
 def _safe_path_part(value: str) -> str:
     safe = re.sub(r"[^A-Za-z0-9._-]+", "-", value).strip("-")
     return safe or "tool-call"
+
+
+def _basename(path: str) -> str:
+    return path.rsplit("/", 1)[-1] or path

@@ -37,6 +37,16 @@ class TelegramConfig(BaseModel):
     bot_token: str | None = None
 
 
+class ImageConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    base_url: str = "https://generativelanguage.googleapis.com/v1beta"
+    api_key: str = "replace-me"
+    model: str = "gemini-2.5-flash-image"
+    service_tier: str = "flex"
+    timeout_seconds: float = 60.0
+
+
 class DockerConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -71,6 +81,7 @@ class HarnessConfig(BaseModel):
     server: ServerConfig = Field(default_factory=ServerConfig)
     database: DatabaseConfig = Field(default_factory=DatabaseConfig)
     llm: LlmConfig = Field(default_factory=LlmConfig)
+    image: ImageConfig = Field(default_factory=ImageConfig)
     telegram: TelegramConfig = Field(default_factory=TelegramConfig)
     runtime: RuntimeConfig = Field(default_factory=RuntimeConfig)
     scheduler: SchedulerConfig = Field(default_factory=SchedulerConfig)

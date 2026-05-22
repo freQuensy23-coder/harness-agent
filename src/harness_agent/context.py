@@ -44,6 +44,8 @@ class ContextBuilder:
                 "- file.grep searches files under /workspace.",
                 "- file.list lists paths under /workspace.",
                 "- web.fetch fetches HTTP/HTTPS text.",
+                "- image.generate starts an async Gemini (Nano Banana, flex tier) image render and returns image_id.",
+                "- image.status returns the job status; on completion the rendered image is attached to the next turn.",
                 "- task.* manages the conversation checklist.",
                 "- schedule.once schedules one future synthetic user message.",
                 "- schedule.cron schedules recurring synthetic user messages.",
