@@ -1,6 +1,7 @@
 from typing import Protocol
 
 from harness_agent.context import UserContextRuntime
+from harness_agent.memory import MemoryTarget
 from harness_agent.runtime.models import (
     DockerProcessResult,
     RuntimeFileRead,
@@ -101,4 +102,36 @@ class UserRuntime(UserContextRuntime):
         raise NotImplementedError
 
     async def file_list(self, user_id: str, input: FileListInput) -> RuntimeToolResult:
+        raise NotImplementedError
+
+    async def read_memory_file(self, user_id: str, target: MemoryTarget) -> str:
+        raise NotImplementedError
+
+    async def write_memory_file(
+        self,
+        user_id: str,
+        target: MemoryTarget,
+        content: str,
+    ) -> None:
+        raise NotImplementedError
+
+    async def append_session_log(
+        self,
+        user_id: str,
+        conversation_id: str,
+        line: str,
+    ) -> None:
+        """Append one JSONL line for a conversation. `conversation_id` is
+        a RAW identifier — the runtime is responsible for any
+        filesystem-safe encoding."""
+        raise NotImplementedError
+
+    async def list_session_logs(self, user_id: str) -> list[str]:
+        """Return RAW conversation IDs (filesystem encoding stripped)."""
+        raise NotImplementedError
+
+    async def read_session_log(self, user_id: str, conversation_id: str) -> str:
+        """Read the JSONL log for a conversation. `conversation_id` is a
+        RAW identifier; the runtime encodes it the same way
+        `append_session_log` did."""
         raise NotImplementedError

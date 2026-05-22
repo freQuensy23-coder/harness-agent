@@ -45,8 +45,12 @@ from harness_agent.identity import StaticIdentityResolver
 from harness_agent.llm import OpenAIResponsesClient
 from harness_agent.llm_audit import AuditedLlmClient, SQLiteLlmAuditStore
 from harness_agent.mcp import McpManager
+from harness_agent.memory_review import MemoryReviewService
+from harness_agent.memory_service import MemoryService
 from harness_agent.projections import SQLiteConversationProjection
 from harness_agent.runtime import DockerUserRuntime, SQLiteSpawnedProcessStore
+from harness_agent.session_log import SessionLogWriter
+from harness_agent.session_search_service import SessionSearchService
 from harness_agent.scheduler import (
     SchedulerDueHandler,
     SchedulerPump,
@@ -186,6 +190,11 @@ class HarnessApp:
             projection=self.projection,
             runtime=self.runtime,
         )
+        self.memory_service = MemoryService(runtime=self.runtime)
+        self.session_search_service = SessionSearchService(
+            runtime=self.runtime,
+            llm=self.llm,
+        )
         tool_call_executor = ToolCallExecutor(
             runtime=self.runtime,
             task_store=self.task_store,
@@ -193,14 +202,32 @@ class HarnessApp:
             web_fetcher=HttpxWebFetcher(llm=self.llm),
             mcp_manager=self.mcp_manager,
             sub_agents=self.sub_agents,
+            memory_service=self.memory_service,
+            session_search=self.session_search_service,
         )
         scheduler_due_handler = SchedulerDueHandler()
+        session_log_writer = SessionLogWriter(
+            runtime=self.runtime,
+            turn_coordinator=self.turn_coordinator,
+        )
+        self.memory_review = MemoryReviewService(
+            bus=self.bus,
+            llm=self.llm,
+            projection=self.projection,
+            tool_registry=default_tool_registry(),
+            turn_coordinator=self.turn_coordinator,
+            nudge_interval=self._config.memory.nudge_interval,
+            max_iterations=self._config.memory.review_max_iterations,
+        )
         self.bus.subscribe(TelegramTextReceived, identity_handler.handle_telegram_text)
         self.bus.subscribe(CliTextReceived, identity_handler.handle_cli_text)
         self.bus.subscribe(ScheduledMessageDue, scheduler_due_handler.handle_due)
         self.bus.subscribe(UserTextReceived, content_ingestion_handler.handle_user_text)
         self.bus.subscribe(UserTextReceived, conversation_projector.handle_user_text)
+        self.bus.subscribe(UserTextReceived, session_log_writer.handle_user_text)
         self.bus.subscribe(AssistantTextProduced, conversation_projector.handle_assistant_text)
+        self.bus.subscribe(AssistantTextProduced, session_log_writer.handle_assistant_text)
+        self.bus.subscribe(ToolCallCompleted, session_log_writer.handle_tool_call_completed)
         self.bus.subscribe(AssistantTextProduced, self.sub_agents.handle_assistant_text)
         self.bus.subscribe(SubAgentRequested, self.sub_agents.handle_requested)
         self.bus.subscribe(SubAgentStarted, self.sub_agents.handle_started)
@@ -227,6 +254,14 @@ class HarnessApp:
         )
         self.bus.subscribe(CompactionCommitted, archive_handler.handle_committed)
         self.bus.subscribe(AssistantTextProduced, self._send_cli_reply)
+        self.bus.subscribe(
+            AssistantTextProduced,
+            self.memory_review.handle_assistant_text,
+        )
+        self.bus.subscribe(
+            ToolCallCompleted,
+            self.memory_review.handle_tool_call_completed,
+        )
 
     async def _send_cli_reply(self, event: AssistantTextProduced) -> EventBatch:
         if event.reply_target is None:
