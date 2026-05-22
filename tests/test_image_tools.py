@@ -33,10 +33,13 @@ from harness_agent.image_jobs import (
     SQLiteImageJobStore,
 )
 from harness_agent.llm import AssistantText, FakeLlmClient, LlmToolCall
+from harness_agent.memory_service import MemoryService
 from harness_agent.projections import SQLiteConversationProjection
 from harness_agent.runtime import FakeUserRuntime, RuntimeToolResult
+from harness_agent.session_search_service import SessionSearchService
 from harness_agent.store import SQLiteEventStore
 from harness_agent.tool_executor import ToolCallExecutor, ToolCallResultWaiter
+from harness_agent.turns import ConversationTurnCoordinator
 from harness_agent.tools import (
     ImageGenerateInput,
     ImageStatusInput,
@@ -65,6 +68,26 @@ def _wire_image_service(
     bus.subscribe(ImageJobCompleted, service.handle_completed)
     bus.subscribe(ImageJobFailed, service.handle_failed)
     return service, bus, event_store
+
+
+def _tool_executor_for_test(
+    *,
+    runtime: FakeUserRuntime,
+    memory_service: MemoryService | None = None,
+    session_search: SessionSearchService | None = None,
+    session_search_llm: FakeLlmClient | None = None,
+    **kwargs: object,
+) -> ToolCallExecutor:
+    return ToolCallExecutor(
+        runtime=runtime,
+        memory_service=memory_service or MemoryService(runtime=runtime),
+        session_search=session_search
+        or SessionSearchService(
+            runtime=runtime,
+            llm=session_search_llm or FakeLlmClient([]),
+        ),
+        **kwargs,
+    )
 
 
 class _CapturingHandler:
@@ -260,20 +283,28 @@ async def test_image_status_attaches_image_when_completed(tmp_path: Path) -> Non
         ]
     )
     tool_results = ToolCallResultWaiter()
+    coordinator = ConversationTurnCoordinator()
     handler = AgentTurnHandler(
         bus=bus,
         context_builder=ContextBuilder(runtime=runtime),
         llm=llm,
         tool_registry=default_tool_registry(),
         projection=projection,
-        tool_results=tool_results,
+        turn_coordinator=coordinator,
     )
-    tool_executor = ToolCallExecutor(runtime=runtime, image_jobs=image_jobs)
-    bus.subscribe(UserTextReceived, ConversationProjector(projection).handle_user_text)
+    tool_executor = _tool_executor_for_test(runtime=runtime, image_jobs=image_jobs)
+    bus.subscribe(
+        UserTextReceived,
+        ConversationProjector(projection, turn_coordinator=coordinator).handle_user_text,
+    )
     bus.subscribe(ToolCallRequested, tool_executor.handle_tool_call_requested)
     bus.subscribe(ToolCallCompleted, tool_results.handle_tool_call_completed)
     bus.subscribe(
-        ToolCallCompleted, ConversationProjector(projection).handle_tool_call_completed
+        ToolCallCompleted,
+        ConversationProjector(
+            projection,
+            turn_coordinator=coordinator,
+        ).handle_tool_call_completed,
     )
     bus.subscribe(ToolCallCompleted, handler.handle_tool_call_completed)
     bus.subscribe(UserTextReceived, handler.handle_user_text)
@@ -454,7 +485,7 @@ async def test_image_status_unknown_id_returns_error_result(tmp_path: Path) -> N
     image_jobs, _bus, _store = _wire_image_service(
         tmp_path=tmp_path, generator=_BlockingGenerator(), runtime=runtime
     )
-    tool_executor = ToolCallExecutor(runtime=runtime, image_jobs=image_jobs)
+    tool_executor = _tool_executor_for_test(runtime=runtime, image_jobs=image_jobs)
     event = ToolCallRequested(
         user_id="u:1",
         conversation_id="cli:1",
@@ -479,7 +510,7 @@ async def test_image_generate_does_not_block_other_conversations(tmp_path: Path)
     image_jobs, _bus, _store = _wire_image_service(
         tmp_path=tmp_path, generator=blocker, runtime=runtime
     )
-    tool_executor = ToolCallExecutor(runtime=runtime, image_jobs=image_jobs)
+    tool_executor = _tool_executor_for_test(runtime=runtime, image_jobs=image_jobs)
 
     # Conversation A starts an image generation that will block until released.
     start_event = ToolCallRequested(
@@ -714,26 +745,38 @@ async def test_full_event_driven_image_flow_lands_image_in_next_turn_context(
         ]
     )
     tool_results = ToolCallResultWaiter()
+    coordinator = ConversationTurnCoordinator()
     handler = AgentTurnHandler(
         bus=bus,
         context_builder=ContextBuilder(runtime=runtime),
         llm=llm,
         tool_registry=default_tool_registry(),
         projection=projection,
-        tool_results=tool_results,
+        turn_coordinator=coordinator,
     )
-    tool_executor = ToolCallExecutor(runtime=runtime, image_jobs=image_jobs)
-    bus.subscribe(UserTextReceived, ConversationProjector(projection).handle_user_text)
+    tool_executor = _tool_executor_for_test(runtime=runtime, image_jobs=image_jobs)
+    bus.subscribe(
+        UserTextReceived,
+        ConversationProjector(projection, turn_coordinator=coordinator).handle_user_text,
+    )
     bus.subscribe(ToolCallRequested, tool_executor.handle_tool_call_requested)
     bus.subscribe(ToolCallCompleted, tool_results.handle_tool_call_completed)
     bus.subscribe(
-        ToolCallCompleted, ConversationProjector(projection).handle_tool_call_completed
+        ToolCallCompleted,
+        ConversationProjector(
+            projection,
+            turn_coordinator=coordinator,
+        ).handle_tool_call_completed,
     )
     bus.subscribe(ToolCallCompleted, handler.handle_tool_call_completed)
     bus.subscribe(UserTextReceived, handler.handle_user_text)
     bus.subscribe(AgentTurnRequested, handler.handle_agent_turn)
     bus.subscribe(
-        AssistantTextProduced, ConversationProjector(projection).handle_assistant_text
+        AssistantTextProduced,
+        ConversationProjector(
+            projection,
+            turn_coordinator=coordinator,
+        ).handle_assistant_text,
     )
 
     # Turn 1: user asks for an image; agent fires image.generate; tool
