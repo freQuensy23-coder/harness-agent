@@ -7,6 +7,10 @@ from harness_agent.bus import EventBus
 from harness_agent.context import AgentFileSet, ContextBuilder, Skill
 from harness_agent.events import (
     AgentTurnRequested,
+    ImageJobCompleted,
+    ImageJobFailed,
+    ImageJobRequested,
+    ImageJobStarted,
     ToolCallCompleted,
     ToolCallRequested,
     UserTextReceived,
@@ -177,10 +181,15 @@ async def test_every_exposed_tool_completes_through_agent_turn_handler(tmp_path:
     )
     image_job_store = SQLiteImageJobStore(tmp_path / "image_jobs.sqlite3")
     image_jobs = ImageJobService(
+        bus=bus,
         store=image_job_store,
         generator=FakeImageGenerator(),
         runtime=runtime,
     )
+    bus.subscribe(ImageJobRequested, image_jobs.handle_requested)
+    bus.subscribe(ImageJobStarted, image_jobs.handle_started)
+    bus.subscribe(ImageJobCompleted, image_jobs.handle_completed)
+    bus.subscribe(ImageJobFailed, image_jobs.handle_failed)
     tool_executor = ToolCallExecutor(
         runtime=runtime,
         task_store=task_store,

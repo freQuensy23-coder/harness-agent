@@ -15,12 +15,21 @@ from pathlib import Path
 
 import pytest
 
+from harness_agent.bus import EventBus
 from harness_agent.content import ContentRef
 from harness_agent.context import AgentFileSet
-from harness_agent.events import ToolCallCompleted, ToolCallRequested
+from harness_agent.events import (
+    ImageJobCompleted,
+    ImageJobFailed,
+    ImageJobRequested,
+    ImageJobStarted,
+    ToolCallCompleted,
+    ToolCallRequested,
+)
 from harness_agent.image_generate import GeminiImageGenerator
 from harness_agent.image_jobs import ImageJobService, SQLiteImageJobStore
 from harness_agent.runtime import FakeUserRuntime
+from harness_agent.store import SQLiteEventStore
 from harness_agent.tool_executor import ToolCallExecutor
 from harness_agent.tools import ImageGenerateInput, ImageStatusInput
 
@@ -41,6 +50,23 @@ def _gemini_generator() -> GeminiImageGenerator:
         service_tier="flex",
         timeout_seconds=MAX_WAIT_SECONDS,
     )
+
+
+def _wire_service(
+    *,
+    tmp_path: Path,
+    runtime: FakeUserRuntime,
+) -> tuple[ImageJobService, EventBus]:
+    bus = EventBus(SQLiteEventStore(tmp_path / "events.sqlite3"))
+    store = SQLiteImageJobStore(tmp_path / "image_jobs.sqlite3")
+    service = ImageJobService(
+        bus=bus, store=store, generator=_gemini_generator(), runtime=runtime
+    )
+    bus.subscribe(ImageJobRequested, service.handle_requested)
+    bus.subscribe(ImageJobStarted, service.handle_started)
+    bus.subscribe(ImageJobCompleted, service.handle_completed)
+    bus.subscribe(ImageJobFailed, service.handle_failed)
+    return service, bus
 
 
 @requires_gemini
@@ -68,8 +94,7 @@ async def test_image_job_lifecycle_with_real_gemini(tmp_path: Path) -> None:
     runtime = FakeUserRuntime(
         agent_files=AgentFileSet(soul="S", agents="A", user="U", tools="T")
     )
-    store = SQLiteImageJobStore(tmp_path / "image_jobs.sqlite3")
-    service = ImageJobService(store=store, generator=_gemini_generator(), runtime=runtime)
+    service, _bus = _wire_service(tmp_path=tmp_path, runtime=runtime)
 
     record = await service.start(
         user_id="u:e2e",
@@ -117,8 +142,7 @@ async def test_image_status_attaches_real_png_via_tool_executor(tmp_path: Path) 
     runtime = FakeUserRuntime(
         agent_files=AgentFileSet(soul="S", agents="A", user="U", tools="T")
     )
-    store = SQLiteImageJobStore(tmp_path / "image_jobs.sqlite3")
-    service = ImageJobService(store=store, generator=_gemini_generator(), runtime=runtime)
+    service, _bus = _wire_service(tmp_path=tmp_path, runtime=runtime)
     executor = ToolCallExecutor(runtime=runtime, image_jobs=service)
 
     # 1. image.generate -- returns immediately with a job id.

@@ -22,6 +22,10 @@ from harness_agent.events import (
     CompactionRequested,
     CompactionSnapshotReady,
     CompactionSummaryReady,
+    ImageJobCompleted,
+    ImageJobFailed,
+    ImageJobRequested,
+    ImageJobStarted,
     ScheduledMessageDue,
     SubAgentCancelled,
     SubAgentCompleted,
@@ -63,7 +67,11 @@ from harness_agent.tasks import SQLiteTaskStore
 from harness_agent.tool_executor import ToolCallExecutor
 from harness_agent.turns import ConversationTurnCoordinator
 from harness_agent.image_generate import GeminiImageGenerator
-from harness_agent.image_jobs import ImageJobService, SQLiteImageJobStore
+from harness_agent.image_jobs import (
+    ImageDeliveryHandler,
+    ImageJobService,
+    SQLiteImageJobStore,
+)
 from harness_agent.tools import default_tool_registry
 from harness_agent.web_fetch import HttpxWebFetcher
 
@@ -116,6 +124,7 @@ class HarnessApp:
             store=self.sub_agent_store,
         )
         self.image_jobs = ImageJobService(
+            bus=self.bus,
             store=self.image_job_store,
             generator=GeminiImageGenerator(
                 api_key=self._config.image.api_key,
@@ -235,6 +244,10 @@ class HarnessApp:
             nudge_interval=self._config.memory.nudge_interval,
             max_iterations=self._config.memory.review_max_iterations,
         )
+        image_delivery_handler = ImageDeliveryHandler(
+            runtime=self.runtime,
+            projection=self.projection,
+        )
         self.bus.subscribe(TelegramTextReceived, identity_handler.handle_telegram_text)
         self.bus.subscribe(CliTextReceived, identity_handler.handle_cli_text)
         self.bus.subscribe(ScheduledMessageDue, scheduler_due_handler.handle_due)
@@ -251,6 +264,11 @@ class HarnessApp:
         self.bus.subscribe(SubAgentCompleted, self.sub_agents.handle_completed)
         self.bus.subscribe(SubAgentFailed, self.sub_agents.handle_failed)
         self.bus.subscribe(SubAgentCancelled, self.sub_agents.handle_cancelled)
+        self.bus.subscribe(ImageJobRequested, self.image_jobs.handle_requested)
+        self.bus.subscribe(ImageJobStarted, self.image_jobs.handle_started)
+        self.bus.subscribe(ImageJobCompleted, self.image_jobs.handle_completed)
+        self.bus.subscribe(ImageJobFailed, self.image_jobs.handle_failed)
+        self.bus.subscribe(ImageJobCompleted, image_delivery_handler.handle_completed)
         self.bus.subscribe(ToolCallRequested, tool_call_executor.handle_tool_call_requested)
         self.bus.subscribe(ToolCallCompleted, conversation_projector.handle_tool_call_completed)
         self.bus.subscribe(ToolCallCompleted, agent_turn_handler.handle_tool_call_completed)

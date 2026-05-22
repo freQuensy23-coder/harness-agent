@@ -290,6 +290,46 @@ class SubAgentCancelled(EventBase):
     child_conversation_id: str
 
 
+class ImageJobRequested(EventBase):
+    type: Literal["image.job.requested"] = "image.job.requested"
+    job_id: str
+    user_id: str
+    conversation_id: str
+    parent_call_id: str
+    prompt: str
+    output_path: str
+    aspect_ratio: str
+
+
+class ImageJobStarted(EventBase):
+    type: Literal["image.job.started"] = "image.job.started"
+    job_id: str
+    user_id: str
+    conversation_id: str
+    parent_call_id: str
+    prompt: str
+    output_path: str
+    aspect_ratio: str
+
+
+class ImageJobCompleted(EventBase):
+    type: Literal["image.job.completed"] = "image.job.completed"
+    job_id: str
+    user_id: str
+    conversation_id: str
+    output_path: str
+    mime_type: str
+    size_bytes: int
+
+
+class ImageJobFailed(EventBase):
+    type: Literal["image.job.failed"] = "image.job.failed"
+    job_id: str
+    user_id: str
+    conversation_id: str
+    error: str
+
+
 class MemoryReviewCompleted(EventBase):
     type: Literal["memory.review.completed"] = "memory.review.completed"
     user_id: str
@@ -330,6 +370,10 @@ AgentEvent = Annotated[
     | SubAgentCompleted
     | SubAgentFailed
     | SubAgentCancelled
+    | ImageJobRequested
+    | ImageJobStarted
+    | ImageJobCompleted
+    | ImageJobFailed
     | MemoryReviewCompleted
     | SessionLogAppendFailed,
     Field(discriminator="type"),
