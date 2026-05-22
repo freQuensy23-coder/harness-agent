@@ -6,6 +6,11 @@ from loguru import logger
 from harness_agent.adapters.cli import event_from_cli_send
 from harness_agent.adapters.telegram import AiogramTelegramAdapter
 from harness_agent.bus import EventBus
+from harness_agent.compaction import (
+    CompactionArchiveHandler,
+    CompactionConfig,
+    CompactionService,
+)
 from harness_agent.config import HarnessConfig
 from harness_agent.context import ContextBuilder
 from harness_agent.events import (
@@ -13,6 +18,10 @@ from harness_agent.events import (
     AgentTurnRequested,
     AssistantTextProduced,
     CliTextReceived,
+    CompactionCommitted,
+    CompactionRequested,
+    CompactionSnapshotReady,
+    CompactionSummaryReady,
     ScheduledMessageDue,
     SubAgentCancelled,
     SubAgentCompleted,
@@ -153,6 +162,11 @@ class HarnessApp:
             self.projection,
             turn_coordinator=self.turn_coordinator,
         )
+        compaction_config = CompactionConfig(
+            max_tokens_per_model=self._config.llm.max_tokens_per_model,
+            reserve_tokens=self._config.llm.compaction_reserve_tokens,
+            keep_last_user_messages=self._config.llm.compaction_keep_last_user_messages,
+        )
         agent_turn_handler = AgentTurnHandler(
             bus=self.bus,
             context_builder=ContextBuilder(runtime=self.runtime),
@@ -163,6 +177,16 @@ class HarnessApp:
             turn_coordinator=self.turn_coordinator,
             tool_results=self.tool_results,
             sub_agent_lookup=self.sub_agents,
+            compaction_config=compaction_config,
+        )
+        compaction_service = CompactionService(
+            projection=self.projection,
+            llm=self.llm,
+            config=compaction_config,
+        )
+        archive_handler = CompactionArchiveHandler(
+            projection=self.projection,
+            runtime=self.runtime,
         )
         tool_call_executor = ToolCallExecutor(
             runtime=self.runtime,
@@ -194,6 +218,16 @@ class HarnessApp:
             AgentTurnRequested,
             agent_turn_handler.handle_agent_turn,
         )
+        self.bus.subscribe(CompactionRequested, compaction_service.handle_requested)
+        self.bus.subscribe(
+            CompactionSnapshotReady,
+            compaction_service.handle_snapshot_ready,
+        )
+        self.bus.subscribe(
+            CompactionSummaryReady,
+            compaction_service.handle_summary_ready,
+        )
+        self.bus.subscribe(CompactionCommitted, archive_handler.handle_committed)
         self.bus.subscribe(AssistantTextProduced, self._send_cli_reply)
 
     async def _send_cli_reply(self, event: AssistantTextProduced) -> EventBatch:
