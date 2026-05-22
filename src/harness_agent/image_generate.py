@@ -30,7 +30,7 @@ class GeminiImageGenerator(ImageGenerator):
         base_url: str = "https://generativelanguage.googleapis.com/v1beta",
         model: str = "gemini-2.5-flash-image",
         service_tier: str = "flex",
-        timeout_seconds: float = 60.0,
+        timeout_seconds: float = 300.0,
         transport: httpx.AsyncBaseTransport | None = None,
     ) -> None:
         self._api_key = api_key

@@ -44,7 +44,7 @@ class ImageConfig(BaseModel):
     api_key: str = "replace-me"
     model: str = "gemini-2.5-flash-image"
     service_tier: str = "flex"
-    timeout_seconds: float = 60.0
+    timeout_seconds: float = 300.0
 
 
 class DockerConfig(BaseModel):

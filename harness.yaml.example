@@ -18,7 +18,7 @@ image:
   api_key: replace-me
   model: gemini-2.5-flash-image
   service_tier: flex
-  timeout_seconds: 60
+  timeout_seconds: 300
 
 telegram:
   enabled: false
