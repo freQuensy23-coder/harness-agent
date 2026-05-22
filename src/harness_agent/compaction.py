@@ -5,6 +5,8 @@ from dataclasses import dataclass
 from loguru import logger
 
 from harness_agent.events import (
+    CompactionArchiveFailed,
+    CompactionArchiveWritten,
     CompactionCommitted,
     CompactionConflicted,
     CompactionRequested,
@@ -369,19 +371,39 @@ class CompactionArchiveHandler:
             if sequence in by_seq
         ]
         jsonl = _records_to_jsonl(compacted)
+        last_error = ""
         for _ in range(_ARCHIVE_WRITE_ATTEMPTS):
             try:
                 result = await self._runtime.file_write(
                     event.user_id,
                     FileWriteInput(path=event.archive_path, content=jsonl),
                 )
-            except Exception:
+            except Exception as exc:
+                last_error = str(exc) or exc.__class__.__name__
                 continue
             if result.exit_code == 0:
-                return ()
+                return (
+                    CompactionArchiveWritten(
+                        compaction_id=event.compaction_id,
+                        user_id=event.user_id,
+                        conversation_id=event.conversation_id,
+                        generation=event.generation,
+                        archive_path=event.archive_path,
+                    ),
+                )
+            last_error = result.stderr or f"exit {result.exit_code}"
         logger.warning(
             "compaction archive write failed after {} attempts: {}",
             _ARCHIVE_WRITE_ATTEMPTS,
             event.archive_path,
         )
-        return ()
+        return (
+            CompactionArchiveFailed(
+                compaction_id=event.compaction_id,
+                user_id=event.user_id,
+                conversation_id=event.conversation_id,
+                generation=event.generation,
+                archive_path=event.archive_path,
+                error=last_error or "unknown error",
+            ),
+        )

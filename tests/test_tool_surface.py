@@ -352,15 +352,47 @@ async def test_oversized_tool_output_is_saved_to_workspace_content() -> None:
     assert completed.result.stderr == ""
     assert (
         "truncated, because it is too long. Full result saved to "
-        "/workspace/content/tool-results/cli-large-1-long-output.txt"
+        "/workspace/content/tool-results/cli%3Alarge-1-long-output.txt"
     ) in completed.result.stdout
     assert "You can read it in chunks with file.read" in completed.result.stdout
     assert len(runtime.content_write_calls) == 1
     path, content = runtime.content_write_calls[0]
-    assert path == "/workspace/content/tool-results/cli-large-1-long-output.txt"
+    assert path == "/workspace/content/tool-results/cli%3Alarge-1-long-output.txt"
     saved = content.decode("utf-8")
     assert saved.startswith("shell.exec stdout:\n")
     assert "x" * 30_001 in saved
+
+
+@pytest.mark.asyncio
+async def test_oversized_tool_output_paths_are_injective_for_unsafe_ids() -> None:
+    """Before the fix, the lossy `re.sub("[^A-Za-z0-9._-]+", "-")` encoder
+    collapsed `:`, `/`, ` ` all to `-`, so distinct conversation_ids
+    like `tg:big`, `tg/big`, `tg-big` wrote their oversized results to
+    the same spill file. The second write silently overwrote the first
+    and could expose another conversation's saved output."""
+    runtime = FakeUserRuntime(
+        shell_results=[
+            RuntimeToolResult(stdout="x" * 30_001),
+            RuntimeToolResult(stdout="y" * 30_001),
+            RuntimeToolResult(stdout="z" * 30_001),
+        ]
+    )
+    executor = ToolCallExecutor(runtime=runtime, max_model_output_chars=20_000)
+
+    for cid in ("tg:big", "tg/big", "tg-big"):
+        await executor.handle_tool_call_requested(
+            ToolCallRequested(
+                user_id="u:1",
+                conversation_id=cid,
+                generation=1,
+                call_id="c",
+                tool_name="shell.exec",
+                input=ShellExecInput(command="yes"),
+            )
+        )
+
+    paths = {path for path, _ in runtime.content_write_calls}
+    assert len(paths) == 3
 
 
 def test_file_listing_tools_do_not_advertise_hard_result_caps() -> None:

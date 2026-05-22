@@ -2,7 +2,6 @@ import asyncio
 import base64
 import json
 import posixpath
-import re
 import shlex
 from pathlib import Path
 from pathlib import PurePosixPath
@@ -24,6 +23,7 @@ from harness_agent.runtime.models import (
 from harness_agent.runtime.paths import (
     content_path,
     safe_conversation_id_part,
+    safe_docker_user_part,
     workspace_path,
 )
 from harness_agent.runtime.protocols import DockerRunner, SpawnedProcessStore, UserRuntime
@@ -623,5 +623,4 @@ touch /workspace/agent/SOUL.md /workspace/agent/AGENTS.md /workspace/agent/USER.
             await self.ensure_user_container(user_id)
 
     def _container_name(self, user_id: str) -> str:
-        safe_user_id = re.sub(r"[^a-zA-Z0-9_.-]+", "-", user_id).strip("-")
-        return f"{self._container_prefix}-{safe_user_id}"
+        return f"{self._container_prefix}-{safe_docker_user_part(user_id)}"

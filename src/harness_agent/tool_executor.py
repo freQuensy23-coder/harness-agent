@@ -1,5 +1,4 @@
 import asyncio
-import re
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 
@@ -18,6 +17,7 @@ from harness_agent.image_jobs import (
 from harness_agent.mcp import McpManager
 from harness_agent.memory_service import MemoryService
 from harness_agent.runtime import RuntimeToolResult, UserRuntime
+from harness_agent.runtime.paths import safe_conversation_id_part
 from harness_agent.scheduler import SQLiteScheduleStore
 from harness_agent.session_search_service import SessionSearchService
 from harness_agent.subagents import (
@@ -754,15 +754,10 @@ def _tool_call_key(event: ToolCallRequested | ToolCallCompleted) -> ToolCallKey:
 def _tool_result_path(event: ToolCallRequested) -> str:
     return (
         "/workspace/content/tool-results/"
-        f"{_safe_path_part(event.conversation_id)}-"
+        f"{safe_conversation_id_part(event.conversation_id)}-"
         f"{event.generation}-"
-        f"{_safe_path_part(event.call_id)}.txt"
+        f"{safe_conversation_id_part(event.call_id)}.txt"
     )
-
-
-def _safe_path_part(value: str) -> str:
-    safe = re.sub(r"[^A-Za-z0-9._-]+", "-", value).strip("-")
-    return safe or "tool-call"
 
 
 def _basename(path: str) -> str:

@@ -14,6 +14,8 @@ from harness_agent.compaction import (
 )
 from harness_agent.config import LlmConfig, load_config
 from harness_agent.events import (
+    CompactionArchiveFailed,
+    CompactionArchiveWritten,
     CompactionCommitted,
     CompactionConflicted,
     CompactionRequested,
@@ -941,8 +943,12 @@ async def test_archive_handler_writes_jsonl_for_committed_sequences(
     )
     batch = await handler.handle_committed(event)
 
-    # Handler is terminal in the cascade.
-    assert batch == ()
+    # Handler publishes a typed success event so the audit log records it.
+    assert len(batch) == 1
+    written_event = batch[0]
+    assert isinstance(written_event, CompactionArchiveWritten)
+    assert written_event.compaction_id == "cid:write"
+    assert written_event.archive_path == "/workspace/.old-sessions/cid:write.jsonl"
 
     # Exactly one successful write attempt.
     assert len(runtime.file_write_calls) == 1
@@ -995,7 +1001,9 @@ async def test_archive_handler_retries_on_transient_failure(
     )
     batch = await handler.handle_committed(event)
 
-    assert batch == ()
+    # The third attempt succeeded, so the success event is published.
+    assert len(batch) == 1
+    assert isinstance(batch[0], CompactionArchiveWritten)
     # All three attempts consumed.
     assert len(runtime.file_write_calls) == 3
     assert all(
@@ -1005,9 +1013,14 @@ async def test_archive_handler_retries_on_transient_failure(
 
 
 @pytest.mark.asyncio
-async def test_archive_handler_swallows_persistent_failure_and_logs(
+async def test_archive_handler_publishes_failed_event_after_persistent_failure(
     tmp_path: Path,
 ) -> None:
+    """Before the fix, persistent archive failure only emitted a log
+    warning, so the event stream had no record of whether the archive
+    actually exists for a given compaction. Now the handler publishes a
+    typed CompactionArchiveFailed carrying the last error, which the
+    audit log captures alongside the original commit."""
     projection = SQLiteConversationProjection(tmp_path / "messages.sqlite3")
     await _seed_conversation(
         projection,
@@ -1053,14 +1066,66 @@ async def test_archive_handler_swallows_persistent_failure_and_logs(
 
             _logger.remove(handler_id)
 
-    # Handler does not propagate the failure and returns no follow-up event.
-    assert batch == ()
+    # Failure is now visible in the event stream, not just the log.
+    assert len(batch) == 1
+    failed = batch[0]
+    assert isinstance(failed, CompactionArchiveFailed)
+    assert failed.compaction_id == "cid:dead"
+    assert failed.archive_path == "/workspace/.old-sessions/cid:dead.jsonl"
+    # The third (final) attempt raised OSError("nope again"); the event
+    # must carry that exact message so audit can trace which failure
+    # actually wedged the archive write.
+    assert failed.error == "nope again"
     # All three attempts consumed.
     assert len(runtime.file_write_calls) == 3
-    # A warning was logged about archive write failure.
+    # The operational warning is still logged.
     assert any(
         "/workspace/.old-sessions/cid:dead.jsonl" in line for line in log_messages
     )
+
+
+@pytest.mark.asyncio
+async def test_archive_handler_failed_event_carries_non_zero_exit_stderr(
+    tmp_path: Path,
+) -> None:
+    """The previous test covers the case where the last attempt raised.
+    This one covers the case where every attempt returned a non-zero
+    exit (no exception) so the error must come from the final
+    `result.stderr`, not from a caught exception."""
+    projection = SQLiteConversationProjection(tmp_path / "messages.sqlite3")
+    await _seed_conversation(
+        projection,
+        conversation_id="c",
+        texts=[
+            ("user", "u1"),
+            ("assistant", "a1"),
+            ("user", "u2"),
+        ],
+    )
+    all_records = await projection.list_all_context_items("c")
+    compacted_seq = [r.sequence for r in all_records[:2]]
+
+    runtime = FakeUserRuntime(
+        file_write_results=[
+            RuntimeToolResult(stderr="first fail\n", exit_code=1),
+            RuntimeToolResult(stderr="second fail\n", exit_code=1),
+            RuntimeToolResult(stderr="final fail\n", exit_code=2),
+        ]
+    )
+    handler = CompactionArchiveHandler(projection=projection, runtime=runtime)
+
+    event = _make_committed(
+        compaction_id="cid:exit",
+        archive_path="/workspace/.old-sessions/cid:exit.jsonl",
+        compacted_sequences=compacted_seq,
+    )
+    batch = await handler.handle_committed(event)
+
+    assert len(batch) == 1
+    failed = batch[0]
+    assert isinstance(failed, CompactionArchiveFailed)
+    assert failed.error == "final fail\n"
+    assert len(runtime.file_write_calls) == 3
 
 
 @pytest.mark.asyncio
@@ -1093,7 +1158,8 @@ async def test_archive_handler_skips_records_not_in_compacted_sequences(
     )
     batch = await handler.handle_committed(event)
 
-    assert batch == ()
+    assert len(batch) == 1
+    assert isinstance(batch[0], CompactionArchiveWritten)
     assert len(runtime.file_write_calls) == 1
     written = runtime.file_write_calls[0]
     lines = written.content.split("\n")

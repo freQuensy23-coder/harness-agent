@@ -173,7 +173,7 @@ class SQLiteScheduleStore:
     ) -> ScheduledMessage:
         await self._ensure_schema()
         async with aiosqlite.connect(self._path) as db:
-            await db.execute(
+            cursor = await db.execute(
                 """
                 update scheduled_messages
                 set status = 'cancelled'
@@ -183,8 +183,34 @@ class SQLiteScheduleStore:
                 """,
                 (schedule_id, user_id, conversation_id),
             )
+            if cursor.rowcount == 0:
+                await db.rollback()
+                raise KeyError(schedule_id)
             await db.commit()
-        return await self.get(schedule_id)
+            rows = await fetchall_rows(
+                db,
+                """
+                select
+                    id,
+                    user_id,
+                    conversation_id,
+                    kind,
+                    status,
+                    message,
+                    next_run_at,
+                    reply_target_json,
+                    cron,
+                    timezone
+                from scheduled_messages
+                where id = ?
+                  and user_id = ?
+                  and conversation_id = ?
+                """,
+                (schedule_id, user_id, conversation_id),
+            )
+        if not rows:
+            raise KeyError(schedule_id)
+        return self._row_to_schedule(rows[0])
 
     async def claim_due(self, now: datetime) -> list[ScheduledMessage]:
         await self._ensure_schema()
@@ -407,6 +433,7 @@ class SchedulerService:
             await task
         except asyncio.CancelledError:
             pass
+        self._task = None
 
     async def _run(self) -> None:
         while True:

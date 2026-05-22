@@ -484,7 +484,6 @@ async def test_scheduler_due_event_becomes_fake_user_message(tmp_path: Path) -> 
     assert refreshed.status == "completed"
 
 
-@pytest.mark.asyncio
 async def test_claim_due_cron_advances_next_run_from_stored_metadata(tmp_path: Path) -> None:
     now = datetime(2026, 5, 19, 12, 0, tzinfo=UTC)
     schedule_store = SQLiteScheduleStore(tmp_path / "schedules.sqlite3", now=lambda: now)
@@ -507,6 +506,51 @@ async def test_claim_due_cron_advances_next_run_from_stored_metadata(tmp_path: P
     refreshed = await schedule_store.get(schedule.id)
     assert refreshed.status == "active"
     assert refreshed.next_run_at == datetime(2026, 5, 19, 12, 2, tzinfo=UTC)
+
+
+@pytest.mark.asyncio
+async def test_schedule_cancel_rejects_wrong_user_and_conversation(tmp_path: Path) -> None:
+    """Before the fix, cancel() scoped the UPDATE by user/conversation
+    but then `get(schedule_id)` read by id only — a wrong-scope caller
+    saw `status='active'` returned as if the cancel had succeeded, and
+    the real schedule kept firing."""
+    now = datetime(2026, 5, 19, 12, 0, tzinfo=UTC)
+    store = SQLiteScheduleStore(tmp_path / "schedules.sqlite3", now=lambda: now)
+    schedule = await store.create_once(
+        user_id="u:owner",
+        conversation_id="tg:owner",
+        message="ping",
+        reply_target=TelegramReplyTarget(chat_id=1),
+        delay_seconds=60,
+    )
+
+    # Wrong user.
+    with pytest.raises(KeyError):
+        await store.cancel(
+            schedule_id=schedule.id,
+            user_id="u:intruder",
+            conversation_id="tg:owner",
+        )
+
+    # Wrong conversation under the right user.
+    with pytest.raises(KeyError):
+        await store.cancel(
+            schedule_id=schedule.id,
+            user_id="u:owner",
+            conversation_id="tg:other",
+        )
+
+    # Schedule is still active after both rejected attempts.
+    untouched = await store.get(schedule.id)
+    assert untouched.status == "active"
+
+    # The legitimate owner can still cancel under matching scope.
+    cancelled = await store.cancel(
+        schedule_id=schedule.id,
+        user_id="u:owner",
+        conversation_id="tg:owner",
+    )
+    assert cancelled.status == "cancelled"
 
 
 class CountingPump:

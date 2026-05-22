@@ -154,6 +154,25 @@ class CompactionSkipped(EventBase):
     reason: Literal["no_boundary"]
 
 
+class CompactionArchiveWritten(EventBase):
+    type: Literal["compaction.archive.written"] = "compaction.archive.written"
+    compaction_id: str
+    user_id: str
+    conversation_id: str
+    generation: int
+    archive_path: str
+
+
+class CompactionArchiveFailed(EventBase):
+    type: Literal["compaction.archive.failed"] = "compaction.archive.failed"
+    compaction_id: str
+    user_id: str
+    conversation_id: str
+    generation: int
+    archive_path: str
+    error: str
+
+
 class ToolCallRequested(EventBase):
     type: Literal["tool.call.requested"] = "tool.call.requested"
     user_id: str
@@ -359,6 +378,8 @@ AgentEvent = Annotated[
     | CompactionCommitted
     | CompactionConflicted
     | CompactionSkipped
+    | CompactionArchiveWritten
+    | CompactionArchiveFailed
     | ToolCallRequested
     | ToolCallError
     | ToolCallCompleted
