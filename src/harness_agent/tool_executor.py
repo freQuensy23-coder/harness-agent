@@ -16,8 +16,10 @@ from harness_agent.image_jobs import (
     render_image_job_record,
 )
 from harness_agent.mcp import McpManager
+from harness_agent.memory_service import MemoryService
 from harness_agent.runtime import RuntimeToolResult, UserRuntime
 from harness_agent.scheduler import SQLiteScheduleStore
+from harness_agent.session_search_service import SessionSearchService
 from harness_agent.subagents import (
     SubAgentService,
     render_sub_agent_record,
@@ -40,10 +42,12 @@ from harness_agent.tools import (
     ImageGenerateInput,
     ImageStatusInput,
     McpToolInput,
+    MemoryToolInput,
     ScheduleCancelInput,
     ScheduleCronInput,
     ScheduleListInput,
     ScheduleOnceInput,
+    SessionSearchInput,
     ShellExecInput,
     ShellKillInput,
     ShellReadInput,
@@ -104,6 +108,8 @@ class ToolCallExecutor:
         image_jobs: ImageJobService | None = None,
         mcp_manager: McpManager | None = None,
         sub_agents: SubAgentService | None = None,
+        memory_service: MemoryService | None = None,
+        session_search: SessionSearchService | None = None,
         max_model_output_chars: int = 20_000,
     ) -> None:
         self._runtime = runtime
@@ -113,6 +119,8 @@ class ToolCallExecutor:
         self._image_jobs = image_jobs
         self._mcp_manager = mcp_manager
         self._sub_agents = sub_agents
+        self._memory_service = memory_service
+        self._session_search_service = session_search
         self._max_model_output_chars = max_model_output_chars
         self._tool_executors: dict[str, ToolExecutor] = {
             "shell.exec": self._shell_exec,
@@ -144,6 +152,10 @@ class ToolCallExecutor:
             "agent.list": self._agent_list,
             "agent.cancel": self._agent_cancel,
         }
+        if memory_service is not None:
+            self._tool_executors["memory"] = self._memory
+        if session_search is not None:
+            self._tool_executors["session.search"] = self._session_search
 
     async def handle_tool_call_requested(self, event: ToolCallRequested) -> EventBatch:
         try:
@@ -684,6 +696,30 @@ class ToolCallExecutor:
 
     def _text_result(self, text: str) -> RuntimeToolResult:
         return RuntimeToolResult(stdout=text)
+
+    async def _memory(
+        self,
+        user_id: str,
+        event: ToolCallRequested,
+    ) -> RuntimeToolResult:
+        if self._memory_service is None:
+            raise RuntimeError("memory service is not configured")
+        return await self._memory_service.execute(
+            user_id, MemoryToolInput.model_validate(event.input)
+        )
+
+    async def _session_search(
+        self,
+        user_id: str,
+        event: ToolCallRequested,
+    ) -> RuntimeToolResult:
+        if self._session_search_service is None:
+            raise RuntimeError("session search service is not configured")
+        return await self._session_search_service.execute(
+            user_id=user_id,
+            current_conversation_id=event.conversation_id,
+            input=SessionSearchInput.model_validate(event.input),
+        )
 
 
 def _tool_call_key(event: ToolCallRequested | ToolCallCompleted) -> ToolCallKey:

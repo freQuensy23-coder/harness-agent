@@ -18,8 +18,9 @@ Outside Docker:
 
 Inside each user Docker container:
 
-- `/workspace/agent/*.md`
+- `/workspace/agent/*.md` (`SOUL.md`, `AGENTS.md`, `USER.md`, `MEMORY.md`, `TOOLS.md`)
 - `/workspace/skills/*/SKILL.md`
+- `/workspace/sessions/<conversation_id>.jsonl` — per-conversation message log searched by `session.search`
 - `/workspace/content/**` for Telegram uploads
 - user files
 - scripts
@@ -39,6 +40,23 @@ Conversation history stores user messages, assistant messages, assistant tool ca
 Telegram uploads are represented as typed inbound events. The content ingestion handler writes every upload to `/workspace/content/...`; images are also attached to the user message sent to the LLM.
 
 Scheduler messages are also events. `schedule.once` and `schedule.cron` create rows in SQLite; the scheduler pump emits `scheduled.message.due`, which becomes a synthetic `user.text.received` event through the bus.
+
+Persistent Memory
+-----------------
+
+Two file-backed stores live in each user's workspace and are inlined into every system prompt:
+
+- `/workspace/agent/USER.md` — what the agent knows about the user (role, preferences, communication style). Char budget: 1375.
+- `/workspace/agent/MEMORY.md` — the agent's own durable notes (environment, conventions, tool quirks). Char budget: 2200.
+
+The model writes through the `memory` tool: `action ∈ {add, replace, remove}` × `target ∈ {memory, user}`. Replace / remove identify an entry by a unique substring. Entries are joined by `\n§\n`. Content is scanned host-side for prompt-injection and credential-exfiltration patterns before any disk write — memory text lands in the system prompt of every future session, so payloads cannot be allowed to persist. Mutations inside the container are atomic via `flock` + tmpfile + `mv`.
+
+A background `MemoryReviewService` watches `AssistantTextProduced` events. Per-conversation counter (`defaultdict[str, int]`) increments on each assistant message of the current generation. At the configured threshold (`memory.nudge_interval`, default 10) the service fires an asyncio task that runs a shadow LLM turn restricted to the `memory` tool, fed the conversation history plus a focused review prompt. The shadow turn never emits `AssistantTextProduced`; it surfaces only `MemoryReviewCompleted(actions, note)` for telemetry. The counter also resets when the foreground turn itself used the `memory` tool.
+
+Session Recall
+--------------
+
+Every user message, assistant message, and tool exchange is also appended to `/workspace/sessions/<conversation_id>.jsonl` (one JSON record per line). `session.search` is a two-stage tool: stage 1 grep-scans every JSONL file (excluding the current conversation), ranks by hit count; stage 2 calls an auxiliary LLM per matching session with a focused summarisation prompt. The tool returns short summaries — never raw transcripts — so cross-session recall does not consume the active context window.
 
 Tools Exposed To LLM
 --------------------
@@ -66,6 +84,8 @@ Tools Exposed To LLM
 - `schedule.cancel`
 - `skill.list`
 - `skill.read`
+- `memory`
+- `session.search`
 - `mcp.<server>.<tool>`
 
 MCP Configuration

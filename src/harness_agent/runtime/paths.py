@@ -1,4 +1,20 @@
 import posixpath
+import urllib.parse
+
+
+def safe_conversation_id_part(conversation_id: str) -> str:
+    """Encode a conversation_id into an injective filesystem-safe form.
+
+    Percent-encoding via RFC 3986's unreserved set guarantees that
+    distinct conversation_ids always produce distinct on-disk names —
+    `tg:456` and `tg-456` are kept apart, so a Telegram session and a
+    CLI session never share the same JSONL log.
+
+    The encoding is reversible. `DockerUserRuntime.list_session_logs`
+    relies on `urllib.parse.unquote` to recover the raw conversation
+    IDs from filenames so callers compare like-with-like.
+    """
+    return urllib.parse.quote(conversation_id, safe="-._~")
 
 
 def workspace_path(path: str) -> str:
