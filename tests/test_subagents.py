@@ -135,6 +135,7 @@ async def test_agent_run_subagent_can_write_file_and_return_result(tmp_path: Pat
     bus.subscribe(ToolCallRequested, tool_executor.handle_tool_call_requested)
     bus.subscribe(ToolCallCompleted, tool_results.handle_tool_call_completed)
     bus.subscribe(ToolCallCompleted, conversation_projector.handle_tool_call_completed)
+    bus.subscribe(ToolCallCompleted, agent_turn_handler.handle_tool_call_completed)
     bus.subscribe(UserTextReceived, agent_turn_handler.handle_user_text)
     bus.subscribe(AgentTurnRequested, agent_turn_handler.handle_agent_turn)
 
@@ -258,6 +259,7 @@ async def test_subagent_turn_filters_agent_tools_and_injects_system_prompt(
     bus.subscribe(ToolCallRequested, tool_executor.handle_tool_call_requested)
     bus.subscribe(ToolCallCompleted, tool_results.handle_tool_call_completed)
     bus.subscribe(ToolCallCompleted, conversation_projector.handle_tool_call_completed)
+    bus.subscribe(ToolCallCompleted, agent_turn_handler.handle_tool_call_completed)
     bus.subscribe(UserTextReceived, agent_turn_handler.handle_user_text)
     bus.subscribe(AgentTurnRequested, agent_turn_handler.handle_agent_turn)
 
@@ -327,6 +329,7 @@ async def test_agent_result_returns_unknown_agent_as_tool_error(tmp_path: Path) 
     bus.subscribe(ToolCallRequested, tool_executor.handle_tool_call_requested)
     bus.subscribe(ToolCallCompleted, tool_results.handle_tool_call_completed)
     bus.subscribe(ToolCallCompleted, ConversationProjector(projection).handle_tool_call_completed)
+    bus.subscribe(ToolCallCompleted, agent_turn_handler.handle_tool_call_completed)
     bus.subscribe(UserTextReceived, agent_turn_handler.handle_user_text)
     bus.subscribe(AgentTurnRequested, agent_turn_handler.handle_agent_turn)
 
@@ -564,6 +567,7 @@ async def test_subagent_child_turn_error_publishes_failed_event(tmp_path: Path) 
     bus.subscribe(ToolCallRequested, tool_executor.handle_tool_call_requested)
     bus.subscribe(ToolCallCompleted, tool_results.handle_tool_call_completed)
     bus.subscribe(ToolCallCompleted, conversation_projector.handle_tool_call_completed)
+    bus.subscribe(ToolCallCompleted, agent_turn_handler.handle_tool_call_completed)
     bus.subscribe(UserTextReceived, agent_turn_handler.handle_user_text)
     bus.subscribe(AgentTurnRequested, agent_turn_handler.handle_agent_turn)
 

@@ -93,6 +93,67 @@ class AgentGenerationStarted(EventBase):
     reply_target: ReplyTarget | None = None
 
 
+class CompactionRequested(EventBase):
+    type: Literal["compaction.requested"] = "compaction.requested"
+    compaction_id: str
+    user_id: str
+    conversation_id: str
+    generation: int
+
+
+class CompactionSnapshotReady(EventBase):
+    type: Literal["compaction.snapshot.ready"] = "compaction.snapshot.ready"
+    compaction_id: str
+    user_id: str
+    conversation_id: str
+    generation: int
+    compacted_sequences: list[int]
+    tail_sequences: list[int]
+    snapshot_max_sequence: int
+    archive_path: str
+
+
+class CompactionSummaryReady(EventBase):
+    type: Literal["compaction.summary.ready"] = "compaction.summary.ready"
+    compaction_id: str
+    user_id: str
+    conversation_id: str
+    generation: int
+    compacted_sequences: list[int]
+    tail_sequences: list[int]
+    snapshot_max_sequence: int
+    archive_path: str
+    summary: str
+
+
+class CompactionCommitted(EventBase):
+    type: Literal["compaction.committed"] = "compaction.committed"
+    compaction_id: str
+    user_id: str
+    conversation_id: str
+    generation: int
+    archive_path: str
+    compacted_sequences: list[int]
+
+
+class CompactionConflicted(EventBase):
+    type: Literal["compaction.conflicted"] = "compaction.conflicted"
+    compaction_id: str
+    user_id: str
+    conversation_id: str
+    generation: int
+    reason: Literal["cas_lost"]
+
+
+class CompactionSkipped(EventBase):
+    type: Literal["compaction.skipped"] = "compaction.skipped"
+    compaction_id: str
+    user_id: str
+    conversation_id: str
+    generation: int
+    reason: Literal["no_boundary"]
+
+
 class ToolCallRequested(EventBase):
     type: Literal["tool.call.requested"] = "tool.call.requested"
     user_id: str
@@ -121,6 +182,7 @@ class ToolCallError(EventBase):
     tool_name: str
     input: ToolInput
     error: str
+    reply_target: ReplyTarget | None = None
 
     @field_validator("input", mode="before")
     @classmethod
@@ -141,6 +203,7 @@ class ToolCallCompleted(EventBase):
     input: ToolInput
     result: RuntimeToolResult
     attachments: list[ContentRef] = Field(default_factory=list[ContentRef])
+    reply_target: ReplyTarget | None = None
 
     @field_validator("input", mode="before")
     @classmethod
@@ -250,6 +313,12 @@ AgentEvent = Annotated[
     | AgentTurnRequested
     | AgentTurnSuperseded
     | AgentGenerationStarted
+    | CompactionRequested
+    | CompactionSnapshotReady
+    | CompactionSummaryReady
+    | CompactionCommitted
+    | CompactionConflicted
+    | CompactionSkipped
     | ToolCallRequested
     | ToolCallError
     | ToolCallCompleted

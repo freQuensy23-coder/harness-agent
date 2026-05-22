@@ -170,6 +170,8 @@ async def test_every_exposed_tool_completes_through_agent_turn_handler(tmp_path:
     bus.subscribe(UserTextReceived, projector.handle_user_text)
     bus.subscribe(ToolCallRequested, tool_executor.handle_tool_call_requested)
     bus.subscribe(ToolCallCompleted, tool_results.handle_tool_call_completed)
+    bus.subscribe(ToolCallCompleted, ConversationProjector(projection).handle_tool_call_completed)
+    bus.subscribe(ToolCallCompleted, handler.handle_tool_call_completed)
     bus.subscribe(UserTextReceived, handler.handle_user_text)
     bus.subscribe(AgentTurnRequested, handler.handle_agent_turn)
 

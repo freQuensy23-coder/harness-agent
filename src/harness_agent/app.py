@@ -6,6 +6,11 @@ from loguru import logger
 from harness_agent.adapters.cli import event_from_cli_send
 from harness_agent.adapters.telegram import AiogramTelegramAdapter
 from harness_agent.bus import EventBus
+from harness_agent.compaction import (
+    CompactionArchiveHandler,
+    CompactionConfig,
+    CompactionService,
+)
 from harness_agent.config import HarnessConfig
 from harness_agent.context import ContextBuilder
 from harness_agent.events import (
@@ -13,6 +18,10 @@ from harness_agent.events import (
     AgentTurnRequested,
     AssistantTextProduced,
     CliTextReceived,
+    CompactionCommitted,
+    CompactionRequested,
+    CompactionSnapshotReady,
+    CompactionSummaryReady,
     ScheduledMessageDue,
     SubAgentCancelled,
     SubAgentCompleted,
@@ -51,7 +60,7 @@ from harness_agent.scheduler import (
 from harness_agent.store import SQLiteEventStore
 from harness_agent.subagents import SQLiteSubAgentStore, SubAgentService
 from harness_agent.tasks import SQLiteTaskStore
-from harness_agent.tool_executor import ToolCallExecutor, ToolCallResultWaiter
+from harness_agent.tool_executor import ToolCallExecutor
 from harness_agent.turns import ConversationTurnCoordinator
 from harness_agent.tools import default_tool_registry
 from harness_agent.web_fetch import HttpxWebFetcher
@@ -77,7 +86,6 @@ class HarnessApp:
         self.task_store = SQLiteTaskStore(tasks_path)
         self.bus = EventBus(self.event_store)
         self.turn_coordinator = ConversationTurnCoordinator()
-        self.tool_results = ToolCallResultWaiter()
         self.runtime = DockerUserRuntime(
             image=config.runtime.docker.image,
             container_prefix=config.runtime.docker.container_prefix,
@@ -157,6 +165,11 @@ class HarnessApp:
             self.projection,
             turn_coordinator=self.turn_coordinator,
         )
+        compaction_config = CompactionConfig(
+            max_tokens_per_model=self._config.llm.max_tokens_per_model,
+            reserve_tokens=self._config.llm.compaction_reserve_tokens,
+            keep_last_user_messages=self._config.llm.compaction_keep_last_user_messages,
+        )
         agent_turn_handler = AgentTurnHandler(
             bus=self.bus,
             context_builder=ContextBuilder(runtime=self.runtime),
@@ -165,8 +178,17 @@ class HarnessApp:
             projection=self.projection,
             mcp_manager=self.mcp_manager,
             turn_coordinator=self.turn_coordinator,
-            tool_results=self.tool_results,
             sub_agent_lookup=self.sub_agents,
+            compaction_config=compaction_config,
+        )
+        compaction_service = CompactionService(
+            projection=self.projection,
+            llm=self.llm,
+            config=compaction_config,
+        )
+        archive_handler = CompactionArchiveHandler(
+            projection=self.projection,
+            runtime=self.runtime,
         )
         self.memory_service = MemoryService(runtime=self.runtime)
         self.session_search_service = SessionSearchService(
@@ -215,13 +237,23 @@ class HarnessApp:
         self.bus.subscribe(SubAgentFailed, self.sub_agents.handle_failed)
         self.bus.subscribe(SubAgentCancelled, self.sub_agents.handle_cancelled)
         self.bus.subscribe(ToolCallRequested, tool_call_executor.handle_tool_call_requested)
-        self.bus.subscribe(ToolCallCompleted, self.tool_results.handle_tool_call_completed)
         self.bus.subscribe(ToolCallCompleted, conversation_projector.handle_tool_call_completed)
+        self.bus.subscribe(ToolCallCompleted, agent_turn_handler.handle_tool_call_completed)
         self.bus.subscribe(UserTextReceived, agent_turn_handler.handle_user_text)
         self.bus.subscribe(
             AgentTurnRequested,
             agent_turn_handler.handle_agent_turn,
         )
+        self.bus.subscribe(CompactionRequested, compaction_service.handle_requested)
+        self.bus.subscribe(
+            CompactionSnapshotReady,
+            compaction_service.handle_snapshot_ready,
+        )
+        self.bus.subscribe(
+            CompactionSummaryReady,
+            compaction_service.handle_summary_ready,
+        )
+        self.bus.subscribe(CompactionCommitted, archive_handler.handle_committed)
         self.bus.subscribe(AssistantTextProduced, self._send_cli_reply)
         self.bus.subscribe(
             AssistantTextProduced,
