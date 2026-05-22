@@ -150,6 +150,7 @@ class ToolCallExecutor:
                     tool_name=event.tool_name,
                     input=event.input,
                     error=error,
+                    reply_target=event.reply_target,
                 ),
                 ToolCallCompleted(
                     user_id=event.user_id,
@@ -160,6 +161,7 @@ class ToolCallExecutor:
                     input=event.input,
                     result=execution.result,
                     attachments=execution.attachments,
+                    reply_target=event.reply_target,
                 ),
             )
         return (
@@ -172,6 +174,7 @@ class ToolCallExecutor:
                 input=event.input,
                 result=execution.result,
                 attachments=execution.attachments,
+                reply_target=event.reply_target,
             ),
         )
 

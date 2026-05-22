@@ -182,6 +182,7 @@ class ToolCallError(EventBase):
     tool_name: str
     input: ToolInput
     error: str
+    reply_target: ReplyTarget | None = None
 
     @field_validator("input", mode="before")
     @classmethod
@@ -202,6 +203,7 @@ class ToolCallCompleted(EventBase):
     input: ToolInput
     result: RuntimeToolResult
     attachments: list[ContentRef] = Field(default_factory=list[ContentRef])
+    reply_target: ReplyTarget | None = None
 
     @field_validator("input", mode="before")
     @classmethod
