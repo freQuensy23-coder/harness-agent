@@ -39,7 +39,7 @@ from harness_agent.runtime import FakeUserRuntime
 from harness_agent.scheduler import SchedulerDueHandler, SchedulerPump, SQLiteScheduleStore
 from harness_agent.store import SQLiteEventStore
 from harness_agent.tasks import SQLiteTaskStore
-from harness_agent.tool_executor import ToolCallExecutor, ToolCallResultWaiter
+from harness_agent.tool_executor import ToolCallExecutor
 from harness_agent.tools import (
     FileReadInput,
     ScheduleCronInput,
@@ -205,7 +205,6 @@ async def test_file_read_on_image_injects_image_into_next_llm_context(tmp_path: 
         ]
     )
     bus = EventBus(store)
-    tool_results = ToolCallResultWaiter()
     tool_executor = ToolCallExecutor(runtime=runtime)
     conversation_projector = ConversationProjector(projection)
     agent_turn_handler = AgentTurnHandler(
@@ -214,11 +213,9 @@ async def test_file_read_on_image_injects_image_into_next_llm_context(tmp_path: 
         llm=llm,
         tool_registry=default_tool_registry(),
         projection=projection,
-        tool_results=tool_results,
+        tool_executor=tool_executor,
     )
     bus.subscribe(UserTextReceived, conversation_projector.handle_user_text)
-    bus.subscribe(ToolCallRequested, tool_executor.handle_tool_call_requested)
-    bus.subscribe(ToolCallCompleted, tool_results.handle_tool_call_completed)
     bus.subscribe(ToolCallCompleted, conversation_projector.handle_tool_call_completed)
     bus.subscribe(UserTextReceived, agent_turn_handler.handle_user_text)
     bus.subscribe(AgentTurnRequested, agent_turn_handler.handle_agent_turn)
@@ -283,7 +280,6 @@ async def test_file_read_missing_file_returns_tool_result(tmp_path: Path) -> Non
         ]
     )
     bus = EventBus(store)
-    tool_results = ToolCallResultWaiter()
     tool_executor = ToolCallExecutor(runtime=runtime)
     conversation_projector = ConversationProjector(projection)
     agent_turn_handler = AgentTurnHandler(
@@ -292,11 +288,9 @@ async def test_file_read_missing_file_returns_tool_result(tmp_path: Path) -> Non
         llm=llm,
         tool_registry=default_tool_registry(),
         projection=projection,
-        tool_results=tool_results,
+        tool_executor=tool_executor,
     )
     bus.subscribe(UserTextReceived, conversation_projector.handle_user_text)
-    bus.subscribe(ToolCallRequested, tool_executor.handle_tool_call_requested)
-    bus.subscribe(ToolCallCompleted, tool_results.handle_tool_call_completed)
     bus.subscribe(ToolCallCompleted, conversation_projector.handle_tool_call_completed)
     bus.subscribe(UserTextReceived, agent_turn_handler.handle_user_text)
     bus.subscribe(AgentTurnRequested, agent_turn_handler.handle_agent_turn)
@@ -360,7 +354,6 @@ async def test_agent_can_create_delayed_and_cron_schedules_via_tools(tmp_path: P
         ]
     )
     bus = EventBus(store)
-    tool_results = ToolCallResultWaiter()
     tool_executor = ToolCallExecutor(
         runtime=runtime,
         task_store=task_store,
@@ -372,11 +365,9 @@ async def test_agent_can_create_delayed_and_cron_schedules_via_tools(tmp_path: P
         llm=llm,
         tool_registry=default_tool_registry(),
         projection=projection,
-        tool_results=tool_results,
+        tool_executor=tool_executor,
     )
     bus.subscribe(UserTextReceived, ConversationProjector(projection).handle_user_text)
-    bus.subscribe(ToolCallRequested, tool_executor.handle_tool_call_requested)
-    bus.subscribe(ToolCallCompleted, tool_results.handle_tool_call_completed)
     bus.subscribe(UserTextReceived, agent_turn_handler.handle_user_text)
     bus.subscribe(AgentTurnRequested, agent_turn_handler.handle_agent_turn)
 

@@ -54,7 +54,7 @@ from harness_agent.runtime import (
     RuntimeToolResult,
 )
 from harness_agent.store import SQLiteEventStore
-from harness_agent.tool_executor import ToolCallExecutor, ToolCallResultWaiter
+from harness_agent.tool_executor import ToolCallExecutor
 from harness_agent.turns import ConversationTurnCoordinator
 from harness_agent.tools import ShellExecInput, default_tool_registry
 
@@ -228,7 +228,6 @@ async def test_tool_call_executes_in_runtime_without_exposing_docker(tmp_path: P
 
     bus = EventBus(store)
     conversation_projector = ConversationProjector(projection)
-    tool_results = ToolCallResultWaiter()
     tool_executor = ToolCallExecutor(runtime=runtime)
     agent_turn_handler = AgentTurnHandler(
         bus=bus,
@@ -236,12 +235,10 @@ async def test_tool_call_executes_in_runtime_without_exposing_docker(tmp_path: P
         llm=llm,
         tool_registry=default_tool_registry(),
         projection=projection,
-        tool_results=tool_results,
+        tool_executor=tool_executor,
     )
     bus.subscribe(UserTextReceived, conversation_projector.handle_user_text)
     bus.subscribe(AssistantTextProduced, conversation_projector.handle_assistant_text)
-    bus.subscribe(ToolCallRequested, tool_executor.handle_tool_call_requested)
-    bus.subscribe(ToolCallCompleted, tool_results.handle_tool_call_completed)
     bus.subscribe(UserTextReceived, agent_turn_handler.handle_user_text)
     bus.subscribe(
         AgentTurnRequested,
@@ -427,7 +424,6 @@ async def test_tool_calls_and_results_are_persisted_in_llm_history(tmp_path: Pat
     )
     bus = EventBus(store)
     coordinator = ConversationTurnCoordinator()
-    tool_results = ToolCallResultWaiter()
     tool_executor = ToolCallExecutor(runtime=runtime)
     conversation_projector = ConversationProjector(projection, turn_coordinator=coordinator)
     agent_turn_handler = AgentTurnHandler(
@@ -437,12 +433,10 @@ async def test_tool_calls_and_results_are_persisted_in_llm_history(tmp_path: Pat
         tool_registry=default_tool_registry(),
         projection=projection,
         turn_coordinator=coordinator,
-        tool_results=tool_results,
+        tool_executor=tool_executor,
     )
     bus.subscribe(UserTextReceived, conversation_projector.handle_user_text)
     bus.subscribe(AssistantTextProduced, conversation_projector.handle_assistant_text)
-    bus.subscribe(ToolCallRequested, tool_executor.handle_tool_call_requested)
-    bus.subscribe(ToolCallCompleted, tool_results.handle_tool_call_completed)
     bus.subscribe(ToolCallCompleted, conversation_projector.handle_tool_call_completed)
     bus.subscribe(UserTextReceived, agent_turn_handler.handle_user_text)
     bus.subscribe(AgentTurnRequested, agent_turn_handler.handle_agent_turn)
@@ -514,7 +508,6 @@ async def test_tool_history_bytes_are_identical_in_next_llm_request(tmp_path: Pa
     llm = AuditedLlmClient(inner=inner_llm, store=audit_store)
     bus = EventBus(store)
     coordinator = ConversationTurnCoordinator()
-    tool_results = ToolCallResultWaiter()
     tool_executor = ToolCallExecutor(runtime=runtime)
     conversation_projector = ConversationProjector(projection, turn_coordinator=coordinator)
     agent_turn_handler = AgentTurnHandler(
@@ -524,12 +517,10 @@ async def test_tool_history_bytes_are_identical_in_next_llm_request(tmp_path: Pa
         tool_registry=default_tool_registry(),
         projection=projection,
         turn_coordinator=coordinator,
-        tool_results=tool_results,
+        tool_executor=tool_executor,
     )
     bus.subscribe(UserTextReceived, conversation_projector.handle_user_text)
     bus.subscribe(AssistantTextProduced, conversation_projector.handle_assistant_text)
-    bus.subscribe(ToolCallRequested, tool_executor.handle_tool_call_requested)
-    bus.subscribe(ToolCallCompleted, tool_results.handle_tool_call_completed)
     bus.subscribe(ToolCallCompleted, conversation_projector.handle_tool_call_completed)
     bus.subscribe(UserTextReceived, agent_turn_handler.handle_user_text)
     bus.subscribe(AgentTurnRequested, agent_turn_handler.handle_agent_turn)

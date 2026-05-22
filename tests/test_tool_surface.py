@@ -17,7 +17,7 @@ from harness_agent.projections import SQLiteConversationProjection
 from harness_agent.runtime import FakeUserRuntime, RuntimeToolResult
 from harness_agent.store import SQLiteEventStore
 from harness_agent.tasks import SQLiteTaskStore
-from harness_agent.tool_executor import ToolCallExecutor, ToolCallResultWaiter
+from harness_agent.tool_executor import ToolCallExecutor
 from harness_agent.tools import (
     AgentRunInput,
     FileEditInput,
@@ -70,7 +70,6 @@ async def test_file_write_read_edit_and_shell_exec_are_routed(tmp_path: Path) ->
     )
     bus = EventBus(store)
     task_store = SQLiteTaskStore(tmp_path / "tasks.sqlite3")
-    tool_results = ToolCallResultWaiter()
     tool_executor = ToolCallExecutor(runtime=runtime, task_store=task_store)
     agent_turn_handler = AgentTurnHandler(
         bus=bus,
@@ -78,11 +77,9 @@ async def test_file_write_read_edit_and_shell_exec_are_routed(tmp_path: Path) ->
         llm=llm,
         tool_registry=default_tool_registry(),
         projection=projection,
-        tool_results=tool_results,
+        tool_executor=tool_executor,
     )
     bus.subscribe(UserTextReceived, ConversationProjector(projection).handle_user_text)
-    bus.subscribe(ToolCallRequested, tool_executor.handle_tool_call_requested)
-    bus.subscribe(ToolCallCompleted, tool_results.handle_tool_call_completed)
     bus.subscribe(UserTextReceived, agent_turn_handler.handle_user_text)
     bus.subscribe(
         AgentTurnRequested,
@@ -169,7 +166,6 @@ async def test_task_tool_is_persisted(tmp_path: Path) -> None:
         ]
     )
     bus = EventBus(store)
-    tool_results = ToolCallResultWaiter()
     tool_executor = ToolCallExecutor(runtime=runtime, task_store=task_store)
     agent_turn_handler = AgentTurnHandler(
         bus=bus,
@@ -177,11 +173,9 @@ async def test_task_tool_is_persisted(tmp_path: Path) -> None:
         llm=llm,
         tool_registry=default_tool_registry(),
         projection=projection,
-        tool_results=tool_results,
+        tool_executor=tool_executor,
     )
     bus.subscribe(UserTextReceived, ConversationProjector(projection).handle_user_text)
-    bus.subscribe(ToolCallRequested, tool_executor.handle_tool_call_requested)
-    bus.subscribe(ToolCallCompleted, tool_results.handle_tool_call_completed)
     bus.subscribe(UserTextReceived, agent_turn_handler.handle_user_text)
     bus.subscribe(
         AgentTurnRequested,
@@ -209,7 +203,6 @@ async def test_task_tool_is_persisted(tmp_path: Path) -> None:
 async def test_tool_exception_completes_with_error_event(tmp_path: Path) -> None:
     store = SQLiteEventStore(tmp_path / "events.sqlite3")
     bus = EventBus(store)
-    tool_results = ToolCallResultWaiter()
     tool_executor = ToolCallExecutor(runtime=FakeUserRuntime())
     requested = ToolCallRequested(
         user_id="u:1",
@@ -220,17 +213,17 @@ async def test_tool_exception_completes_with_error_event(tmp_path: Path) -> None
         input=AgentRunInput(prompt="work"),
     )
 
-    tool_results.expect(requested)
-    bus.subscribe(ToolCallRequested, tool_executor.handle_tool_call_requested)
-    bus.subscribe(ToolCallCompleted, tool_results.handle_tool_call_completed)
-
     await bus.publish(requested)
+    for event in await tool_executor.handle_tool_call_requested(requested):
+        await bus.publish(event)
 
-    completed = await tool_results.wait(requested)
+    events = await store.list_events()
+    completed = events[-1]
+    assert isinstance(completed, ToolCallCompleted)
     assert completed.result.exit_code == 1
     assert completed.result.stderr == "sub-agent service is not configured"
     assert completed.result.stdout == ""
-    assert [event.type for event in await store.list_events()] == [
+    assert [event.type for event in events] == [
         "tool.call.requested",
         "tool.call.error",
         "tool.call.completed",
@@ -323,7 +316,6 @@ async def test_web_fetch_result_does_not_expose_raw_markdown_to_main_history(tmp
     store = SQLiteEventStore(tmp_path / "events.sqlite3")
     projection = SQLiteConversationProjection(tmp_path / "messages.sqlite3")
     bus = EventBus(store)
-    tool_results = ToolCallResultWaiter()
     llm = FakeLlmClient(
         [
             LlmToolCall(
@@ -346,21 +338,19 @@ async def test_web_fetch_result_does_not_expose_raw_markdown_to_main_history(tmp
         )
     )
     runtime = FakeUserRuntime(agent_files=AgentFileSet(soul="S", agents="A", user="U", tools="T"))
+    tool_executor = ToolCallExecutor(
+        runtime=runtime,
+        web_fetcher=HttpxWebFetcher(llm=web_llm, transport=transport),
+    )
     handler = AgentTurnHandler(
         bus=bus,
         context_builder=ContextBuilder(runtime=runtime),
         llm=llm,
         tool_registry=default_tool_registry(),
         projection=projection,
-        tool_results=tool_results,
-    )
-    tool_executor = ToolCallExecutor(
-        runtime=runtime,
-        web_fetcher=HttpxWebFetcher(llm=web_llm, transport=transport),
+        tool_executor=tool_executor,
     )
     bus.subscribe(UserTextReceived, ConversationProjector(projection).handle_user_text)
-    bus.subscribe(ToolCallRequested, tool_executor.handle_tool_call_requested)
-    bus.subscribe(ToolCallCompleted, tool_results.handle_tool_call_completed)
     bus.subscribe(ToolCallCompleted, ConversationProjector(projection).handle_tool_call_completed)
     bus.subscribe(UserTextReceived, handler.handle_user_text)
     bus.subscribe(AgentTurnRequested, handler.handle_agent_turn)

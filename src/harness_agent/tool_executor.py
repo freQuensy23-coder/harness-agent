@@ -1,4 +1,3 @@
-import asyncio
 import re
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
@@ -52,35 +51,12 @@ from harness_agent.web_fetch import WebFetcher
 
 EventBatch = tuple[EventBase, ...]
 ToolExecutor = Callable[[str, ToolCallRequested], Awaitable[RuntimeToolResult]]
-ToolCallKey = tuple[str, int, str]
 
 
 class ToolExecutionResult(BaseModel):
     result: RuntimeToolResult
     attachments: list[ContentRef] = Field(default_factory=list[ContentRef])
-
-
-class ToolCallResultWaiter:
-    def __init__(self) -> None:
-        self._pending: dict[ToolCallKey, asyncio.Future[ToolCallCompleted]] = {}
-
-    def expect(self, event: ToolCallRequested) -> None:
-        self._pending[_tool_call_key(event)] = asyncio.get_running_loop().create_future()
-
-    async def wait(self, event: ToolCallRequested) -> ToolCallCompleted:
-        key = _tool_call_key(event)
-        future = self._pending[key]
-        try:
-            return await future
-        finally:
-            del self._pending[key]
-
-    async def handle_tool_call_completed(self, event: ToolCallCompleted) -> EventBatch:
-        key = _tool_call_key(event)
-        future = self._pending.get(key)
-        if future is not None and not future.done():
-            future.set_result(event)
-        return ()
+    error: str | None = None
 
 
 class ToolCallExecutor:
@@ -132,15 +108,41 @@ class ToolCallExecutor:
             "agent.cancel": self._agent_cancel,
         }
 
-    async def handle_tool_call_requested(self, event: ToolCallRequested) -> EventBatch:
+    async def execute(self, event: ToolCallRequested) -> ToolExecutionResult:
+        """Run the tool synchronously and return its outcome.
+
+        Errors are captured into ``ToolExecutionResult.error`` rather than raised,
+        so the caller can always materialize ``ToolCallCompleted`` (plus an optional
+        ``ToolCallError`` audit event) without a try/except around this call.
+        """
         try:
             execution = await self._execute_tool(event)
-            execution = await self._spill_oversized_result(event, execution)
+            return await self._spill_oversized_result(event, execution)
         except Exception as exc:
             error = str(exc)
-            execution = ToolExecutionResult(
-                result=RuntimeToolResult(stderr=error, exit_code=1)
+            return ToolExecutionResult(
+                result=RuntimeToolResult(stderr=error, exit_code=1),
+                error=error,
             )
+
+    async def handle_tool_call_requested(self, event: ToolCallRequested) -> EventBatch:
+        """Bus-handler form. Kept for direct callers (tests, ad-hoc dispatch).
+
+        Equivalent to ``execute()`` followed by event materialization. Not wired to
+        the bus by ``HarnessApp`` anymore — the agent turn calls ``execute()`` directly.
+        """
+        execution = await self.execute(event)
+        completed = ToolCallCompleted(
+            user_id=event.user_id,
+            conversation_id=event.conversation_id,
+            generation=event.generation,
+            call_id=event.call_id,
+            tool_name=event.tool_name,
+            input=event.input,
+            result=execution.result,
+            attachments=execution.attachments,
+        )
+        if execution.error is not None:
             return (
                 ToolCallError(
                     user_id=event.user_id,
@@ -149,31 +151,11 @@ class ToolCallExecutor:
                     call_id=event.call_id,
                     tool_name=event.tool_name,
                     input=event.input,
-                    error=error,
+                    error=execution.error,
                 ),
-                ToolCallCompleted(
-                    user_id=event.user_id,
-                    conversation_id=event.conversation_id,
-                    generation=event.generation,
-                    call_id=event.call_id,
-                    tool_name=event.tool_name,
-                    input=event.input,
-                    result=execution.result,
-                    attachments=execution.attachments,
-                ),
+                completed,
             )
-        return (
-            ToolCallCompleted(
-                user_id=event.user_id,
-                conversation_id=event.conversation_id,
-                generation=event.generation,
-                call_id=event.call_id,
-                tool_name=event.tool_name,
-                input=event.input,
-                result=execution.result,
-                attachments=execution.attachments,
-            ),
-        )
+        return (completed,)
 
     async def _spill_oversized_result(
         self,
@@ -605,10 +587,6 @@ class ToolCallExecutor:
 
     def _text_result(self, text: str) -> RuntimeToolResult:
         return RuntimeToolResult(stdout=text)
-
-
-def _tool_call_key(event: ToolCallRequested | ToolCallCompleted) -> ToolCallKey:
-    return (event.conversation_id, event.generation, event.call_id)
 
 
 def _tool_result_path(event: ToolCallRequested) -> str:

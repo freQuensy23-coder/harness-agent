@@ -17,6 +17,7 @@ from harness_agent.events import (
     TelegramReplyTarget,
     TelegramTextReceived,
     ToolCallCompleted,
+    ToolCallError,
     ToolCallRequested,
     UserTextReceived,
 )
@@ -33,7 +34,7 @@ from harness_agent.mcp import McpManager
 from harness_agent.projections import SQLiteConversationProjection
 from harness_agent.runtime import UserRuntime
 from harness_agent.subagents import SubAgentLookup, SubAgentRecord
-from harness_agent.tool_executor import ToolCallResultWaiter
+from harness_agent.tool_executor import ToolCallExecutor
 from harness_agent.turns import ConversationTurnCoordinator
 from harness_agent.tools import (
     ToolRegistry,
@@ -163,9 +164,9 @@ class AgentTurnHandler:
         llm: LlmClient,
         tool_registry: ToolRegistry,
         projection: SQLiteConversationProjection,
+        tool_executor: ToolCallExecutor | None = None,
         mcp_manager: McpManager | None = None,
         turn_coordinator: ConversationTurnCoordinator | None = None,
-        tool_results: ToolCallResultWaiter | None = None,
         sub_agent_lookup: SubAgentLookup | None = None,
         compaction_config: CompactionConfig | None = None,
     ) -> None:
@@ -174,13 +175,11 @@ class AgentTurnHandler:
         self._llm = llm
         self._tool_registry = tool_registry
         self._projection = projection
+        self._tool_executor = tool_executor
         self._mcp_manager = mcp_manager
         if turn_coordinator is None:
             turn_coordinator = ConversationTurnCoordinator()
         self._turn_coordinator = turn_coordinator
-        if tool_results is None:
-            tool_results = ToolCallResultWaiter()
-        self._tool_results = tool_results
         self._sub_agent_lookup = sub_agent_lookup
         self._compaction_config = compaction_config
 
@@ -282,12 +281,39 @@ class AgentTurnHandler:
                         input=response.input,
                         reply_target=event.reply_target,
                     )
-                    self._tool_results.expect(requested)
                     await self._bus.publish(requested)
-                    completed = await self._tool_results.wait(requested)
+                    if self._tool_executor is None:
+                        raise RuntimeError(
+                            "AgentTurnHandler.tool_executor was not configured; "
+                            "cannot handle tool call from model"
+                        )
+                    execution = await self._tool_executor.execute(requested)
+                    if execution.error is not None:
+                        await self._bus.publish(
+                            ToolCallError(
+                                user_id=event.user_id,
+                                conversation_id=event.conversation_id,
+                                generation=event.generation,
+                                call_id=response.call_id,
+                                tool_name=response.name,
+                                input=response.input,
+                                error=execution.error,
+                            )
+                        )
+                    await self._bus.publish(
+                        ToolCallCompleted(
+                            user_id=event.user_id,
+                            conversation_id=event.conversation_id,
+                            generation=event.generation,
+                            call_id=response.call_id,
+                            tool_name=response.name,
+                            input=response.input,
+                            result=execution.result,
+                            attachments=execution.attachments,
+                        )
+                    )
                     if await self._stop_if_superseded(event):
                         return
-                    result = completed.result
                     messages.extend(
                         [
                             AssistantToolCallMessage(
@@ -298,11 +324,11 @@ class AgentTurnHandler:
                             ToolResultMessage(
                                 call_id=response.call_id,
                                 name=response.name,
-                                content=result.render_for_llm(response.name),
+                                content=execution.result.render_for_llm(response.name),
                             ),
                         ]
                     )
-                    for attachment in completed.attachments:
+                    for attachment in execution.attachments:
                         messages.append(
                             UserMessage(
                                 text=f"Opened image file {attachment.workspace_path}",

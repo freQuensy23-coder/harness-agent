@@ -31,7 +31,6 @@ from harness_agent.events import (
     SubAgentTimedOut,
     TelegramTextReceived,
     ToolCallCompleted,
-    ToolCallRequested,
     UserTextReceived,
 )
 from harness_agent.handlers import (
@@ -56,7 +55,7 @@ from harness_agent.scheduler import (
 from harness_agent.store import SQLiteEventStore
 from harness_agent.subagents import SQLiteSubAgentStore, SubAgentService
 from harness_agent.tasks import SQLiteTaskStore
-from harness_agent.tool_executor import ToolCallExecutor, ToolCallResultWaiter
+from harness_agent.tool_executor import ToolCallExecutor
 from harness_agent.turns import ConversationTurnCoordinator
 from harness_agent.tools import default_tool_registry
 from harness_agent.web_fetch import HttpxWebFetcher
@@ -82,7 +81,6 @@ class HarnessApp:
         self.task_store = SQLiteTaskStore(tasks_path)
         self.bus = EventBus(self.event_store)
         self.turn_coordinator = ConversationTurnCoordinator()
-        self.tool_results = ToolCallResultWaiter()
         self.runtime = DockerUserRuntime(
             image=config.runtime.docker.image,
             container_prefix=config.runtime.docker.container_prefix,
@@ -167,15 +165,23 @@ class HarnessApp:
             reserve_tokens=self._config.llm.compaction_reserve_tokens,
             keep_last_user_messages=self._config.llm.compaction_keep_last_user_messages,
         )
+        tool_call_executor = ToolCallExecutor(
+            runtime=self.runtime,
+            task_store=self.task_store,
+            schedule_store=self.schedule_store,
+            web_fetcher=HttpxWebFetcher(llm=self.llm),
+            mcp_manager=self.mcp_manager,
+            sub_agents=self.sub_agents,
+        )
         agent_turn_handler = AgentTurnHandler(
             bus=self.bus,
             context_builder=ContextBuilder(runtime=self.runtime),
             llm=self.llm,
             tool_registry=default_tool_registry(),
             projection=self.projection,
+            tool_executor=tool_call_executor,
             mcp_manager=self.mcp_manager,
             turn_coordinator=self.turn_coordinator,
-            tool_results=self.tool_results,
             sub_agent_lookup=self.sub_agents,
             compaction_config=compaction_config,
         )
@@ -187,14 +193,6 @@ class HarnessApp:
         archive_handler = CompactionArchiveHandler(
             projection=self.projection,
             runtime=self.runtime,
-        )
-        tool_call_executor = ToolCallExecutor(
-            runtime=self.runtime,
-            task_store=self.task_store,
-            schedule_store=self.schedule_store,
-            web_fetcher=HttpxWebFetcher(llm=self.llm),
-            mcp_manager=self.mcp_manager,
-            sub_agents=self.sub_agents,
         )
         scheduler_due_handler = SchedulerDueHandler()
         self.bus.subscribe(TelegramTextReceived, identity_handler.handle_telegram_text)
@@ -210,8 +208,6 @@ class HarnessApp:
         self.bus.subscribe(SubAgentCompleted, self.sub_agents.handle_completed)
         self.bus.subscribe(SubAgentFailed, self.sub_agents.handle_failed)
         self.bus.subscribe(SubAgentCancelled, self.sub_agents.handle_cancelled)
-        self.bus.subscribe(ToolCallRequested, tool_call_executor.handle_tool_call_requested)
-        self.bus.subscribe(ToolCallCompleted, self.tool_results.handle_tool_call_completed)
         self.bus.subscribe(ToolCallCompleted, conversation_projector.handle_tool_call_completed)
         self.bus.subscribe(UserTextReceived, agent_turn_handler.handle_user_text)
         self.bus.subscribe(
