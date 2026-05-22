@@ -132,6 +132,8 @@ async def test_telegram_say_hi_builds_context_from_runtime_and_replies(tmp_path:
     assert "- memory writes durable notes" in request.system
     assert "- session.search recalls focused summaries" in request.system
     assert "Persistent memory:" in request.system
+    assert "- image.generate starts an async Gemini" in request.system
+    assert "- image.status returns the job status" in request.system
     assert request.messages == [UserMessage(text="Say hi")]
     assert [tool.name for tool in request.tools] == [
         "shell.exec",
@@ -146,6 +148,8 @@ async def test_telegram_say_hi_builds_context_from_runtime_and_replies(tmp_path:
         "file.grep",
         "file.list",
         "web.fetch",
+        "image.generate",
+        "image.status",
         "task.create",
         "task.get",
         "task.list",

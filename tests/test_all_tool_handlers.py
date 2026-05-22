@@ -7,6 +7,10 @@ from harness_agent.bus import EventBus
 from harness_agent.context import AgentFileSet, ContextBuilder, Skill
 from harness_agent.events import (
     AgentTurnRequested,
+    ImageJobCompleted,
+    ImageJobFailed,
+    ImageJobRequested,
+    ImageJobStarted,
     ToolCallCompleted,
     ToolCallRequested,
     UserTextReceived,
@@ -18,6 +22,8 @@ from harness_agent.runtime import FakeUserRuntime, RuntimeToolResult
 from harness_agent.scheduler import SQLiteScheduleStore
 from harness_agent.store import SQLiteEventStore
 from harness_agent.subagents import SubAgentRecord
+from harness_agent.image_generate import GeneratedImage, ImageGenerator
+from harness_agent.image_jobs import ImageJobService, SQLiteImageJobStore
 from harness_agent.tasks import SQLiteTaskStore
 from harness_agent.tool_executor import ToolCallExecutor, ToolCallResultWaiter
 from harness_agent.tools import (
@@ -34,6 +40,8 @@ from harness_agent.tools import (
     FileMultiEditInput,
     FileReadInput,
     FileWriteInput,
+    ImageGenerateInput,
+    ImageStatusInput,
     McpToolInput,
     ScheduleCancelInput,
     ScheduleCronInput,
@@ -112,6 +120,19 @@ async def test_every_exposed_tool_completes_through_agent_turn_handler(tmp_path:
             name="web.fetch",
             input=WebFetchInput(url="http://local.test", prompt="Extract the useful text."),
         ),
+        LlmToolCall(
+            call_id="image-generate",
+            name="image.generate",
+            input=ImageGenerateInput(
+                prompt="a cat with a hat",
+                output_path="/workspace/content/cat.png",
+            ),
+        ),
+        LlmToolCall(
+            call_id="image-status",
+            name="image.status",
+            input=ImageStatusInput(image_id="placeholder"),
+        ),
         LlmToolCall(call_id="task-create", name="task.create", input=TaskCreateInput(title="new")),
         LlmToolCall(call_id="task-get", name="task.get", input=TaskGetInput(task_id=existing_task.id)),
         LlmToolCall(call_id="task-list", name="task.list", input=TaskListInput(include_stopped=True)),
@@ -158,11 +179,23 @@ async def test_every_exposed_tool_completes_through_agent_turn_handler(tmp_path:
         mcp_manager=mcp_manager,
         tool_results=tool_results,
     )
+    image_job_store = SQLiteImageJobStore(tmp_path / "image_jobs.sqlite3")
+    image_jobs = ImageJobService(
+        bus=bus,
+        store=image_job_store,
+        generator=FakeImageGenerator(),
+        runtime=runtime,
+    )
+    bus.subscribe(ImageJobRequested, image_jobs.handle_requested)
+    bus.subscribe(ImageJobStarted, image_jobs.handle_started)
+    bus.subscribe(ImageJobCompleted, image_jobs.handle_completed)
+    bus.subscribe(ImageJobFailed, image_jobs.handle_failed)
     tool_executor = ToolCallExecutor(
         runtime=runtime,
         task_store=task_store,
         schedule_store=schedule_store,
         web_fetcher=FakeWebFetcher(),
+        image_jobs=image_jobs,
         mcp_manager=mcp_manager,
         sub_agents=FakeSubAgentService(),
     )
@@ -202,6 +235,8 @@ async def test_every_exposed_tool_completes_through_agent_turn_handler(tmp_path:
         "file.grep",
         "file.list",
         "web.fetch",
+        "image.generate",
+        "image.status",
         "task.create",
         "task.get",
         "task.list",
@@ -225,6 +260,11 @@ async def test_every_exposed_tool_completes_through_agent_turn_handler(tmp_path:
 class FakeWebFetcher:
     async def fetch(self, input: WebFetchInput) -> RuntimeToolResult:
         return RuntimeToolResult(stdout=f"fetched:{input.url}")
+
+
+class FakeImageGenerator(ImageGenerator):
+    async def generate(self, input: ImageGenerateInput) -> GeneratedImage:
+        return GeneratedImage(mime_type="image/png", data=b"\x89PNG\r\n\x1a\nfake")
 
 
 class FakeMcpManager:
