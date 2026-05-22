@@ -65,7 +65,6 @@ class McpConfig(BaseModel):
 class MemoryConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    enabled: bool = True
     nudge_interval: int = Field(default=10, ge=1)
     review_max_iterations: int = Field(default=5, ge=1)
 

@@ -188,18 +188,16 @@ class HarnessApp:
             runtime=self.runtime,
             turn_coordinator=self.turn_coordinator,
         )
-        self.memory_review: MemoryReviewService | None = None
-        if self._config.memory.enabled:
-            self.memory_review = MemoryReviewService(
-                bus=self.bus,
-                llm=self.llm,
-                tool_results=self.tool_results,
-                projection=self.projection,
-                tool_registry=default_tool_registry(),
-                turn_coordinator=self.turn_coordinator,
-                nudge_interval=self._config.memory.nudge_interval,
-                max_iterations=self._config.memory.review_max_iterations,
-            )
+        self.memory_review = MemoryReviewService(
+            bus=self.bus,
+            llm=self.llm,
+            tool_results=self.tool_results,
+            projection=self.projection,
+            tool_registry=default_tool_registry(),
+            turn_coordinator=self.turn_coordinator,
+            nudge_interval=self._config.memory.nudge_interval,
+            max_iterations=self._config.memory.review_max_iterations,
+        )
         self.bus.subscribe(TelegramTextReceived, identity_handler.handle_telegram_text)
         self.bus.subscribe(CliTextReceived, identity_handler.handle_cli_text)
         self.bus.subscribe(ScheduledMessageDue, scheduler_due_handler.handle_due)
@@ -225,15 +223,14 @@ class HarnessApp:
             agent_turn_handler.handle_agent_turn,
         )
         self.bus.subscribe(AssistantTextProduced, self._send_cli_reply)
-        if self.memory_review is not None:
-            self.bus.subscribe(
-                AssistantTextProduced,
-                self.memory_review.handle_assistant_text,
-            )
-            self.bus.subscribe(
-                ToolCallCompleted,
-                self.memory_review.handle_tool_call_completed,
-            )
+        self.bus.subscribe(
+            AssistantTextProduced,
+            self.memory_review.handle_assistant_text,
+        )
+        self.bus.subscribe(
+            ToolCallCompleted,
+            self.memory_review.handle_tool_call_completed,
+        )
 
     async def _send_cli_reply(self, event: AssistantTextProduced) -> EventBatch:
         if event.reply_target is None:
