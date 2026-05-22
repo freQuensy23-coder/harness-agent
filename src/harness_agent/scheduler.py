@@ -3,7 +3,7 @@ import json
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, cast
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
@@ -295,22 +295,34 @@ class SQLiteScheduleStore:
         reply_target: ReplyTarget | None = None
         if row[7] is not None:
             reply_target = self._reply_target_adapter.validate_python(json.loads(row[7]))
-        common = {
-            "id": row[0],
-            "user_id": row[1],
-            "conversation_id": row[2],
-            "status": row[4],
-            "message": row[5],
-            "next_run_at": datetime.fromisoformat(row[6]).astimezone(UTC),
-            "reply_target": reply_target,
-        }
-        if row[3] == "once":
-            return OnceScheduledMessage(**common)
-        if row[3] == "cron":
+        kind = cast(ScheduleKind, row[3])
+        status = cast(ScheduleStatus, row[4])
+        next_run_at = datetime.fromisoformat(str(row[6])).astimezone(UTC)
+        if kind == "once":
+            return OnceScheduledMessage(
+                id=str(row[0]),
+                user_id=str(row[1]),
+                conversation_id=str(row[2]),
+                status=status,
+                message=str(row[5]),
+                next_run_at=next_run_at,
+                reply_target=reply_target,
+            )
+        if kind == "cron":
             if row[8] is None or row[9] is None:
                 raise RuntimeError(f"cron schedule {row[0]} is missing cron metadata")
-            return CronScheduledMessage(**common, cron=row[8], timezone=row[9])
-        raise ValueError(f"unknown schedule kind: {row[3]}")
+            return CronScheduledMessage(
+                id=str(row[0]),
+                user_id=str(row[1]),
+                conversation_id=str(row[2]),
+                status=status,
+                message=str(row[5]),
+                next_run_at=next_run_at,
+                reply_target=reply_target,
+                cron=str(row[8]),
+                timezone=str(row[9]),
+            )
+        raise ValueError(f"unknown schedule kind: {kind}")
 
     async def _ensure_schema(self) -> None:
         self._path.parent.mkdir(parents=True, exist_ok=True)
