@@ -126,6 +126,18 @@ class McpToolInput(BaseModel):
     arguments: dict[str, Any]
 
 
+class MemoryToolInput(BaseModel):
+    action: Literal["add", "replace", "remove"]
+    target: Literal["memory", "user"] = "memory"
+    content: str | None = None
+    old_text: str | None = None
+
+
+class SessionSearchInput(BaseModel):
+    query: str = Field(min_length=1)
+    limit: int = Field(default=3, ge=1, le=5)
+
+
 class AgentRunInput(BaseModel):
     prompt: str
     name: str = "subagent"
@@ -177,6 +189,8 @@ TOOL_INPUT_MODELS: dict[str, ToolInputModel] = {
     "schedule.cancel": ScheduleCancelInput,
     "skill.list": SkillListInput,
     "skill.read": SkillReadInput,
+    "memory": MemoryToolInput,
+    "session.search": SessionSearchInput,
     "agent.run": AgentRunInput,
     "agent.spawn": AgentSpawnInput,
     "agent.result": AgentResultInput,
@@ -217,6 +231,23 @@ class ToolRegistry(BaseModel):
     def list_for_model(self) -> list[ToolSpec]:
         return self.tools
 
+    def filter_tools(
+        self,
+        *,
+        include_memory: bool = True,
+        include_session_search: bool = True,
+    ) -> "ToolRegistry":
+        skipped: set[str] = set()
+        if not include_memory:
+            skipped.add("memory")
+        if not include_session_search:
+            skipped.add("session.search")
+        if not skipped:
+            return self
+        return ToolRegistry(
+            tools=[tool for tool in self.tools if tool.name not in skipped]
+        )
+
 
 ToolName = Literal[
     "shell.exec",
@@ -242,6 +273,8 @@ ToolName = Literal[
     "schedule.cancel",
     "skill.list",
     "skill.read",
+    "memory",
+    "session.search",
     "agent.run",
     "agent.spawn",
     "agent.result",
@@ -272,6 +305,8 @@ ToolInput = (
     | ScheduleCancelInput
     | SkillListInput
     | SkillReadInput
+    | MemoryToolInput
+    | SessionSearchInput
     | AgentRunInput
     | AgentSpawnInput
     | AgentResultInput
@@ -300,7 +335,18 @@ def parse_known_tool_input(name: str, payload: Any) -> ToolInput:
     return cast(ToolInput, input_model.model_validate(payload))
 
 
-def default_tool_registry() -> ToolRegistry:
+def default_tool_registry(
+    *,
+    include_memory: bool = True,
+    include_session_search: bool = True,
+) -> ToolRegistry:
+    """Build the registry of tools exposed to the model.
+
+    `memory` and `session.search` are conditionally included so callers
+    that have no MemoryService / SessionSearchService configured can
+    omit them. The two flags are independent — exposing one without the
+    other is supported.
+    """
     return ToolRegistry(
         tools=[
             ToolSpec(
@@ -427,6 +473,47 @@ def default_tool_registry() -> ToolRegistry:
                 input_model=SkillReadInput,
             ),
             ToolSpec(
+                name="memory",
+                description=(
+                    "Save durable information that should outlive this session "
+                    "into the persistent memory store.\n"
+                    "Save proactively when the user reveals a preference, "
+                    "habit, role, personal detail, or correction; when you "
+                    "learn an environment fact, project convention, or tool "
+                    "quirk that will matter next time.\n"
+                    "Two targets:\n"
+                    "- 'user': who the user is (name, role, communication "
+                    "style, recurring corrections).\n"
+                    "- 'memory': your own notes (environment, conventions, "
+                    "tool quirks, lessons learned).\n"
+                    "Three actions:\n"
+                    "- add: append a new entry.\n"
+                    "- replace: change one entry — old_text is a short unique "
+                    "substring of the entry to update.\n"
+                    "- remove: delete one entry — old_text identifies it the "
+                    "same way.\n"
+                    "Write declarative facts ('User prefers concise responses'), "
+                    "not imperatives ('Always respond concisely'). Imperatives "
+                    "re-injected into future sessions act as directives.\n"
+                    "Do NOT save task progress, completed-work logs, or "
+                    "transient state to memory — use session.search to recall "
+                    "those from past transcripts."
+                ),
+                input_model=MemoryToolInput,
+            ),
+            ToolSpec(
+                name="session.search",
+                description=(
+                    "Search past conversations and return focused summaries of "
+                    "matching sessions. Use when the user references something "
+                    "from a past conversation or you suspect relevant "
+                    "cross-session context exists. The current conversation "
+                    "is excluded from results. Returns one short summary per "
+                    "matching session, not raw transcripts."
+                ),
+                input_model=SessionSearchInput,
+            ),
+            ToolSpec(
                 name="agent.run",
                 description=(
                     "Run a sub-agent to completion and return its final assistant "
@@ -461,4 +548,7 @@ def default_tool_registry() -> ToolRegistry:
                 input_model=AgentCancelInput,
             ),
         ]
+    ).filter_tools(
+        include_memory=include_memory,
+        include_session_search=include_session_search,
     )

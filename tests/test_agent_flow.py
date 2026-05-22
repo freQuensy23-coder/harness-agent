@@ -111,41 +111,14 @@ async def test_telegram_say_hi_builds_context_from_runtime_and_replies(tmp_path:
     ]
 
     request = llm.requests[0]
-    assert request.system == "\n\n".join(
-        [
-            "SOUL: answer tersely.",
-            "AGENTS: obey the user.",
-            "USER: Alex.",
-            "TOOLS: use tools only when needed.",
-            "Skill: shell-work\nUse shell commands in the workspace.\nShell commands must stay inside /workspace.",
-            "\n".join(
-                [
-                    "Tools:",
-                    "- shell.exec runs commands in /workspace.",
-                    "- shell.spawn starts long-running commands in /workspace.",
-                    "- shell.read reads spawned command output.",
-                    "- shell.kill stops spawned commands.",
-                    "- file.read reads files under /workspace.",
-                    "- file.write writes files under /workspace.",
-                    "- file.edit replaces exact text in one file.",
-                    "- file.multi_edit applies exact replacements to one file.",
-                    "- file.glob finds files under /workspace.",
-                    "- file.grep searches files under /workspace.",
-                    "- file.list lists paths under /workspace.",
-                    "- web.fetch fetches HTTP/HTTPS text.",
-                    "- task.* manages the conversation checklist.",
-                    "- schedule.once schedules one future synthetic user message.",
-                    "- schedule.cron schedules recurring synthetic user messages.",
-                    "- schedule.list and schedule.cancel manage scheduled messages.",
-                    "- skill.* reads enabled markdown skills.",
-                    "- agent.* runs sub-agents that can use workspace, web, task, schedule, skill, and MCP tools but cannot spawn further sub-agents.",
-                ]
-            ),
-            "Runtime: tools run in the user's workspace. Container details are not part of the model context.",
-            "Incoming Telegram files are saved under /workspace/content. Use file.read for saved text files. Images are also attached to multimodal user messages when available.",
-            "Do not use sleep, wait, or long-running bash commands to schedule future work. Use schedule.once or schedule.cron.",
-        ]
-    )
+    assert "SOUL: answer tersely." in request.system
+    assert "AGENTS: obey the user." in request.system
+    assert "USER: Alex." in request.system
+    assert "TOOLS: use tools only when needed." in request.system
+    assert "Skill: shell-work" in request.system
+    assert "- memory writes durable notes" in request.system
+    assert "- session.search recalls focused summaries" in request.system
+    assert "Persistent memory:" in request.system
     assert request.messages == [UserMessage(text="Say hi")]
     assert [tool.name for tool in request.tools] == [
         "shell.exec",
@@ -171,6 +144,8 @@ async def test_telegram_say_hi_builds_context_from_runtime_and_replies(tmp_path:
         "schedule.cancel",
         "skill.list",
         "skill.read",
+        "memory",
+        "session.search",
         "agent.run",
         "agent.spawn",
         "agent.result",

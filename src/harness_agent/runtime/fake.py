@@ -3,7 +3,9 @@ from collections.abc import Sequence
 from harness_agent.content import WorkspaceFile
 from harness_agent.context import AgentFileSet, Skill
 from harness_agent.mcp_models import McpServerConfig
+from harness_agent.memory import MemoryTarget
 from harness_agent.runtime.models import RuntimeFileRead, RuntimeToolResult
+from harness_agent.runtime.paths import safe_conversation_id_part
 from harness_agent.runtime.protocols import UserRuntime
 from harness_agent.text import as_str
 from harness_agent.tools import (
@@ -39,11 +41,19 @@ class FakeUserRuntime(UserRuntime):
         self.shell_exec_calls: list[ShellExecInput] = []
         self.file_write_calls: list[FileWriteInput] = []
         self.content_write_calls: list[tuple[str, bytes]] = []
+        self._memory_files: dict[tuple[str, MemoryTarget], str] = {}
+        self._session_logs: dict[tuple[str, str], list[str]] = {}
 
     async def read_agent_files(self, user_id: str) -> AgentFileSet:
         self.read_agent_files_calls.append(user_id)
         if self._agent_files is not None:
-            return self._agent_files
+            base = self._agent_files
+            return base.model_copy(
+                update={
+                    "user": self._memory_files.get((user_id, "user"), base.user),
+                    "memory": self._memory_files.get((user_id, "memory"), base.memory),
+                }
+            )
         required = [
             "/workspace/agent/SOUL.md",
             "/workspace/agent/AGENTS.md",
@@ -53,11 +63,13 @@ class FakeUserRuntime(UserRuntime):
         missing = [path for path in required if path not in self._files]
         if missing:
             raise FileNotFoundError(", ".join(missing))
+        memory_raw = self._files.get("/workspace/agent/MEMORY.md", "")
         return AgentFileSet(
             soul=as_str(self._files["/workspace/agent/SOUL.md"]),
             agents=as_str(self._files["/workspace/agent/AGENTS.md"]),
             user=as_str(self._files["/workspace/agent/USER.md"]),
             tools=as_str(self._files["/workspace/agent/TOOLS.md"]),
+            memory=as_str(memory_raw),
         )
 
     async def list_skills(self, user_id: str) -> list[Skill]:
@@ -156,3 +168,39 @@ class FakeUserRuntime(UserRuntime):
         return RuntimeToolResult(
             stdout="\n".join(path for path in sorted(self._files) if path.startswith(input.path))
         )
+
+    async def read_memory_file(self, user_id: str, target: MemoryTarget) -> str:
+        return self._memory_files.get((user_id, target), "")
+
+    async def write_memory_file(
+        self,
+        user_id: str,
+        target: MemoryTarget,
+        content: str,
+    ) -> None:
+        self._memory_files[(user_id, target)] = content
+
+    async def append_session_log(
+        self,
+        user_id: str,
+        conversation_id: str,
+        line: str,
+    ) -> None:
+        safe = safe_conversation_id_part(conversation_id)
+        if not safe:
+            return
+        self._session_logs.setdefault((user_id, safe), []).append(line)
+
+    async def list_session_logs(self, user_id: str) -> list[str]:
+        import urllib.parse
+
+        return sorted(
+            urllib.parse.unquote(safe_id)
+            for stored_user, safe_id in self._session_logs
+            if stored_user == user_id
+        )
+
+    async def read_session_log(self, user_id: str, conversation_id: str) -> str:
+        safe = safe_conversation_id_part(conversation_id)
+        lines = self._session_logs.get((user_id, safe), [])
+        return "\n".join(lines)

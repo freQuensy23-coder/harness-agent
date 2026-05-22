@@ -227,6 +227,22 @@ class SubAgentCancelled(EventBase):
     child_conversation_id: str
 
 
+class MemoryReviewCompleted(EventBase):
+    type: Literal["memory.review.completed"] = "memory.review.completed"
+    user_id: str
+    conversation_id: str
+    actions: list[str] = Field(default_factory=list[str])
+    note: str | None = None
+
+
+class SessionLogAppendFailed(EventBase):
+    type: Literal["session.log.append.failed"] = "session.log.append.failed"
+    user_id: str
+    conversation_id: str
+    role: Literal["user", "assistant", "tool"]
+    error: str
+
+
 AgentEvent = Annotated[
     TelegramTextReceived
     | CliTextReceived
@@ -244,6 +260,8 @@ AgentEvent = Annotated[
     | SubAgentTimedOut
     | SubAgentCompleted
     | SubAgentFailed
-    | SubAgentCancelled,
+    | SubAgentCancelled
+    | MemoryReviewCompleted
+    | SessionLogAppendFailed,
     Field(discriminator="type"),
 ]

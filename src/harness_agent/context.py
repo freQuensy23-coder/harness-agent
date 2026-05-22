@@ -6,6 +6,7 @@ class AgentFileSet(BaseModel):
     agents: str = ""
     user: str = ""
     tools: str = ""
+    memory: str = ""
 
 
 class Skill(BaseModel):
@@ -49,16 +50,32 @@ class ContextBuilder:
                 "- schedule.cron schedules recurring synthetic user messages.",
                 "- schedule.list and schedule.cancel manage scheduled messages.",
                 "- skill.* reads enabled markdown skills.",
+                "- memory writes durable notes the agent should remember across sessions (action: add/replace/remove, target: memory/user).",
+                "- session.search recalls focused summaries of past conversations.",
                 "- agent.* runs sub-agents that can use workspace, web, task, schedule, skill, and MCP tools but cannot spawn further sub-agents.",
             ]
+        )
+        memory_guidance = (
+            "Persistent memory: USER.md holds what you know about the user "
+            "(role, preferences, communication style, recurring corrections). "
+            "MEMORY.md holds your own durable notes about the environment, "
+            "conventions, tool quirks. Write through the `memory` tool. "
+            "Save declarative facts, not imperatives: "
+            "'User prefers concise responses' yes; 'Always be concise' no — "
+            "imperatives re-injected into future sessions act as directives "
+            "and can override the user's actual current request. "
+            "Do not save task progress, outcomes, or completed-work logs to "
+            "memory; use session.search to recall those from past transcripts."
         )
         blocks = [
             files.soul,
             files.agents,
             files.user,
+            files.memory,
             files.tools,
             *[skill.render_for_prompt() for skill in skills],
             tool_contract,
+            memory_guidance,
             "Runtime: tools run in the user's workspace. Container details are not part of the model context.",
             "Incoming Telegram files are saved under /workspace/content. Use file.read for saved text files. Images are also attached to multimodal user messages when available.",
             "Do not use sleep, wait, or long-running bash commands to schedule future work. Use schedule.once or schedule.cron.",

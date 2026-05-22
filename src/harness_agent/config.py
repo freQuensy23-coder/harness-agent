@@ -62,6 +62,14 @@ class McpConfig(BaseModel):
     servers: list[McpServerConfig] = Field(default_factory=list)
 
 
+class MemoryConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = True
+    nudge_interval: int = Field(default=10, ge=1)
+    review_max_iterations: int = Field(default=5, ge=1)
+
+
 class HarnessConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -72,6 +80,7 @@ class HarnessConfig(BaseModel):
     runtime: RuntimeConfig = Field(default_factory=RuntimeConfig)
     scheduler: SchedulerConfig = Field(default_factory=SchedulerConfig)
     mcp: McpConfig = Field(default_factory=McpConfig)
+    memory: MemoryConfig = Field(default_factory=MemoryConfig)
 
 
 def load_config(path: Path) -> HarnessConfig:

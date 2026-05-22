@@ -170,6 +170,102 @@ async def test_docker_runtime_routes_shell_without_changing_tool_name() -> None:
 
 
 @pytest.mark.asyncio
+async def test_docker_runtime_writes_memory_file_with_flock_and_atomic_rename() -> None:
+    runner = RecordingDockerRunner(
+        [DockerProcessResult(stdout="", stderr="", exit_code=0)]
+    )
+    runtime = DockerUserRuntime(runner=runner)
+
+    await runtime.write_memory_file("u:123", "memory", "entry one\n§\nentry two")
+
+    assert len(runner.calls) == 1
+    argv, stdin = runner.calls[0]
+    assert argv[:6] == ["docker", "exec", "-i", "harness-u-123", "sh", "-lc"]
+    script = argv[6]
+    assert "/workspace/agent/MEMORY.md" in script
+    assert "/workspace/agent/MEMORY.md.lock" in script
+    assert "flock -x 9" in script
+    assert "mktemp" in script and "mv " in script
+    assert stdin == "entry one\n§\nentry two".encode("utf-8")
+
+
+@pytest.mark.asyncio
+async def test_docker_runtime_writes_user_target_to_user_md() -> None:
+    runner = RecordingDockerRunner(
+        [DockerProcessResult(stdout="", stderr="", exit_code=0)]
+    )
+    runtime = DockerUserRuntime(runner=runner)
+
+    await runtime.write_memory_file("u:123", "user", "User likes pytest")
+    script = runner.calls[0][0][6]
+    assert "/workspace/agent/USER.md" in script
+    assert "/workspace/agent/MEMORY.md" not in script
+
+
+@pytest.mark.asyncio
+async def test_docker_runtime_write_memory_file_raises_on_nonzero_exit() -> None:
+    runner = RecordingDockerRunner(
+        [DockerProcessResult(stdout="", stderr="disk full\n", exit_code=1)]
+    )
+    runtime = DockerUserRuntime(runner=runner)
+    with pytest.raises(RuntimeError) as exc:
+        await runtime.write_memory_file("u:123", "memory", "x")
+    assert "disk full" in str(exc.value)
+
+
+@pytest.mark.asyncio
+async def test_docker_runtime_appends_session_log_with_flock_and_sanitises_id() -> None:
+    runner = RecordingDockerRunner(
+        [DockerProcessResult(stdout="", stderr="", exit_code=0)]
+    )
+    runtime = DockerUserRuntime(runner=runner)
+
+    # conversation_id with characters that need sanitising (`:` percent-encoded)
+    await runtime.append_session_log("u:123", "tg:456", '{"role":"user","text":"hi"}')
+    argv, stdin = runner.calls[0]
+    script = argv[6]
+    assert "/workspace/sessions/tg%3A456.jsonl" in script
+    assert "flock -x 9" in script
+    assert "cat >> " in script
+    assert stdin == b'{"role":"user","text":"hi"}\n'
+
+
+@pytest.mark.asyncio
+async def test_docker_runtime_lists_session_logs_returns_raw_ids() -> None:
+    """list_session_logs decodes the filesystem-safe form back to the
+    raw conversation IDs so callers can compare to live IDs without
+    re-encoding."""
+    runner = RecordingDockerRunner(
+        [
+            DockerProcessResult(
+                stdout=(
+                    "/workspace/sessions/conv-a.jsonl\n"
+                    "/workspace/sessions/tg%3A456.jsonl\n"
+                ),
+                stderr="",
+                exit_code=0,
+            )
+        ]
+    )
+    runtime = DockerUserRuntime(runner=runner)
+    ids = await runtime.list_session_logs("u:123")
+    assert ids == ["conv-a", "tg:456"]
+
+
+@pytest.mark.asyncio
+async def test_docker_runtime_reads_session_log_using_sanitised_id() -> None:
+    runner = RecordingDockerRunner(
+        [DockerProcessResult(stdout='{"role":"user"}\n', stderr="", exit_code=0)]
+    )
+    runtime = DockerUserRuntime(runner=runner)
+    content = await runtime.read_session_log("u:123", "tg:456")
+    assert content == '{"role":"user"}\n'
+    # read path has no stdin, so argv lacks "-i": indices shift by one
+    script = runner.calls[0][0][5]
+    assert "/workspace/sessions/tg%3A456.jsonl" in script
+
+
+@pytest.mark.asyncio
 async def test_docker_runtime_writes_file_with_stdin() -> None:
     runner = RecordingDockerRunner(
         [DockerProcessResult(stdout="", stderr="", exit_code=0)]
