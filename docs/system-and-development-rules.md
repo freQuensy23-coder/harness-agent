@@ -45,8 +45,15 @@ run there, including:
 - Short-lived and spawned shell commands.
 - Long-lived MCP stdio server processes.
 
-MCP server configuration is user workspace data. The host reads those configs
-through the runtime and starts the server processes inside the user's container.
+MCP server configuration exists at two scopes. User-scope configs live in the
+user's workspace at `/workspace/mcp/*.yaml` and the user owns them. Global-scope
+configs live in `harness.yaml` under `mcp.servers` and apply to every user; the
+user cannot edit or disable them from the workspace. The host merges both lists
+with global entries winning on name conflict, then starts each server process
+inside the user's container via the same stdio transport.
+
+User MCP YAML parsing is per-file: a single malformed file is skipped with a
+warning so it cannot suppress other user servers or globals.
 
 ## Event Flow
 
@@ -72,9 +79,18 @@ The scheduler uses the same event path. Schedule tools write rows to the schedul
 store, the pump emits `ScheduledMessageDue`, and `SchedulerDueHandler` turns that
 into a synthetic `UserTextReceived` event.
 
-Sub-agents also use the same event path. A parent tool call creates a sub-agent
-record, publishes a child `UserTextReceived`, waits for the child conversation's
-assistant text, and then publishes completion, failure, or cancellation events.
+Sub-agents also use the same event path. An `agent.run` or `agent.spawn` tool
+call publishes a `SubAgentRequested` event. `SubAgentService.handle_requested`
+persists the record, returns `SubAgentStarted`, publishes the child
+`UserTextReceived`, and starts a timeout watchdog. The child's
+`AssistantTextProduced` triggers a `SubAgentCompleted` event; the watchdog
+fires a `SubAgentTimedOut` event that turns into `SubAgentFailed`; explicit
+`cancel` publishes `SubAgentCancelled`. `agent.run` awaits any of those
+terminal events; `agent.spawn` returns the running record immediately. Sub-
+agent conversations cannot use `agent.*` tools — `AgentTurnHandler` strips
+them from the registry when `SubAgentLookup.get_by_child_conversation_id`
+returns a record for the current conversation, and the system prompt is
+prefixed with the sub-agent task so the model knows it is delegated work.
 
 ## Async Execution Model
 

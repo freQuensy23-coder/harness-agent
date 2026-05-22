@@ -1,7 +1,9 @@
 import asyncio
 import json
+from collections.abc import Sequence
+from typing import Any, cast
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from harness_agent.mcp_models import McpServerConfig
 from harness_agent.runtime import DockerUserRuntime, RuntimeToolResult
@@ -11,7 +13,26 @@ from harness_agent.tools import ToolSpec
 class McpToolDefinition(BaseModel):
     name: str
     description: str
-    input_schema: dict
+    input_schema: dict[str, Any]
+
+
+class _McpToolPayload(BaseModel):
+    name: str
+    description: str
+    input_schema: dict[str, Any] = Field(alias="inputSchema")
+
+
+class _McpToolListResponse(BaseModel):
+    tools: list[_McpToolPayload]
+
+
+class _McpContentItem(BaseModel):
+    type: str
+    text: str | None = None
+
+
+class _McpCallToolResponse(BaseModel):
+    content: list[_McpContentItem]
 
 
 class McpStdioSession:
@@ -38,30 +59,26 @@ class McpStdioSession:
 
     async def list_tools(self) -> list[McpToolDefinition]:
         response = await self._request("tools/list", {})
-        tools = response["tools"]
+        parsed = _McpToolListResponse.model_validate(response)
         return [
             McpToolDefinition(
-                name=tool["name"],
-                description=tool["description"],
-                input_schema=tool["inputSchema"],
+                name=tool.name,
+                description=tool.description,
+                input_schema=tool.input_schema,
             )
-            for tool in tools
+            for tool in parsed.tools
         ]
 
-    async def call_tool(self, name: str, arguments: dict) -> RuntimeToolResult:
+    async def call_tool(self, name: str, arguments: dict[str, Any]) -> RuntimeToolResult:
         response = await self._request(
             "tools/call",
             {"name": name, "arguments": arguments},
         )
-        content = response["content"]
-        text_parts = [
-            item["text"]
-            for item in content
-            if item["type"] == "text"
-        ]
+        parsed = _McpCallToolResponse.model_validate(response)
+        text_parts = [item.text for item in parsed.content if item.type == "text" and item.text is not None]
         return RuntimeToolResult(stdout="\n".join(text_parts))
 
-    async def _request(self, method: str, params: dict) -> dict:
+    async def _request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
         request_id = self._next_id
         self._next_id += 1
         await self._write_json(
@@ -77,7 +94,7 @@ class McpStdioSession:
             raise RuntimeError(response["error"])
         return response["result"]
 
-    async def _notify(self, method: str, params: dict) -> None:
+    async def _notify(self, method: str, params: dict[str, Any]) -> None:
         await self._write_json(
             {
                 "jsonrpc": "2.0",
@@ -86,13 +103,13 @@ class McpStdioSession:
             }
         )
 
-    async def _write_json(self, payload: dict) -> None:
+    async def _write_json(self, payload: dict[str, Any]) -> None:
         if self._process.stdin is None:
             raise RuntimeError(f"MCP server {self._server.name} stdin is closed")
         self._process.stdin.write(json.dumps(payload).encode("utf-8") + b"\n")
         await self._process.stdin.drain()
 
-    async def _read_json(self) -> dict:
+    async def _read_json(self) -> dict[str, Any]:
         if self._process.stdout is None:
             raise RuntimeError(f"MCP server {self._server.name} stdout is closed")
         line = await self._process.stdout.readline()
@@ -101,7 +118,7 @@ class McpStdioSession:
             if self._process.stderr is not None:
                 stderr = (await self._process.stderr.read()).decode("utf-8", errors="replace")
             raise RuntimeError(f"MCP server {self._server.name} closed stdout: {stderr}")
-        return json.loads(line.decode("utf-8"))
+        return cast(dict[str, Any], json.loads(line.decode("utf-8")))
 
 
 class McpManager:
@@ -109,8 +126,10 @@ class McpManager:
         self,
         *,
         runtime: DockerUserRuntime,
+        global_servers: Sequence[McpServerConfig] = (),
     ) -> None:
         self._runtime = runtime
+        self._global_servers: list[McpServerConfig] = list(global_servers)
         self._sessions: dict[tuple[str, str], McpStdioSession] = {}
         self._tool_cache: dict[tuple[str, str], list[McpToolDefinition]] = {}
         self._server_cache: dict[tuple[str, str], McpServerConfig] = {}
@@ -133,7 +152,7 @@ class McpManager:
         *,
         user_id: str,
         tool_name: str,
-        arguments: dict,
+        arguments: dict[str, Any],
     ) -> RuntimeToolResult:
         _, server_name, mcp_tool_name = tool_name.split(".", 2)
         session = await self._session(user_id, server_name)
@@ -168,10 +187,16 @@ class McpManager:
         return self._sessions[key]
 
     async def _servers_for_user(self, user_id: str) -> list[McpServerConfig]:
-        servers = await self._runtime.list_mcp_servers(user_id)
-        for server in servers:
+        user_servers = await self._runtime.list_mcp_servers(user_id)
+        global_names = {server.name for server in self._global_servers}
+        merged: list[McpServerConfig] = list(self._global_servers)
+        for server in user_servers:
+            if server.name in global_names:
+                continue
+            merged.append(server)
+        for server in merged:
             self._server_cache[(user_id, server.name)] = server
-        return servers
+        return merged
 
     async def _server_for_user(
         self,

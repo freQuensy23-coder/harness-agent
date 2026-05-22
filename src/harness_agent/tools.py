@@ -1,4 +1,4 @@
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 from pydantic import BaseModel, Field
 
@@ -54,22 +54,22 @@ class FileMultiEditInput(BaseModel):
 class FileGlobInput(BaseModel):
     pattern: str
     cwd: str = "/workspace"
-    max_results: int = 200
 
 
 class FileGrepInput(BaseModel):
     pattern: str
     path: str = "/workspace"
-    max_results: int = 200
 
 
 class FileListInput(BaseModel):
     path: str = "/workspace"
-    max_results: int = 200
 
 
 class WebFetchInput(BaseModel):
     url: str
+    # Backwards-compat: legacy persisted events have no prompt; fall back
+    # to a generic summary extraction.
+    prompt: str = Field(default="Summarize the page content.", min_length=1)
     max_bytes: int = 20000
 
 
@@ -351,7 +351,7 @@ def parse_known_tool_input(name: str, payload: Any) -> ToolInput:
     input_model = TOOL_INPUT_MODELS.get(name)
     if input_model is None:
         raise ValueError(f"unknown tool: {name}")
-    return input_model.model_validate(payload)
+    return cast(ToolInput, input_model.model_validate(payload))
 
 
 def default_tool_registry() -> ToolRegistry:
@@ -417,7 +417,9 @@ def _base_tool_specs() -> list["ToolSpec"]:
             ),
             ToolSpec(
                 name="web.fetch",
-                description="Fetch text from an HTTP or HTTPS URL.",
+                description=(
+                    "Fetch an HTTP or HTTPS URL and answer the prompt from the page content."
+                ),
                 input_model=WebFetchInput,
             ),
             ToolSpec(
@@ -484,8 +486,10 @@ def _base_tool_specs() -> list["ToolSpec"]:
             ToolSpec(
                 name="agent.run",
                 description=(
-                    "Run a sub-agent to completion. The sub-agent can use workspace "
-                    "file, shell, web, task, schedule, skill, MCP, and agent tools."
+                    "Run a sub-agent to completion and return its final assistant "
+                    "message. The sub-agent can use workspace file, shell, web, "
+                    "task, schedule, skill, and MCP tools but cannot spawn further "
+                    "sub-agents."
                 ),
                 input_model=AgentRunInput,
             ),
@@ -493,7 +497,8 @@ def _base_tool_specs() -> list["ToolSpec"]:
                 name="agent.spawn",
                 description=(
                     "Start a background sub-agent. The sub-agent can use workspace "
-                    "file, shell, web, task, schedule, skill, MCP, and agent tools."
+                    "file, shell, web, task, schedule, skill, and MCP tools but "
+                    "cannot spawn further sub-agents."
                 ),
                 input_model=AgentSpawnInput,
             ),

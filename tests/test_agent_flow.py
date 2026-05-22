@@ -4,6 +4,8 @@ from pathlib import Path
 
 import pytest
 
+from harness_agent.web_fetch import WebFetchExtractionWaiter
+from harness_agent.subagents import NullSubAgentLookup, SubAgentService
 from harness_agent.bus import EventBus
 from harness_agent.context import AgentFileSet, ContextBuilder, Skill
 from harness_agent.events import (
@@ -76,8 +78,7 @@ async def test_telegram_say_hi_builds_context_from_runtime_and_replies(tmp_path:
         context_builder=ContextBuilder(runtime=runtime),
         llm=llm,
         tool_registry=default_tool_registry(),
-        projection=projection,
-    )
+        projection=projection, sub_agent_lookup=NullSubAgentLookup())
     bus.subscribe(TelegramTextReceived, identity_handler.handle_telegram_text)
     bus.subscribe(UserTextReceived, conversation_projector.handle_user_text)
     bus.subscribe(AssistantTextProduced, conversation_projector.handle_assistant_text)
@@ -102,6 +103,7 @@ async def test_telegram_say_hi_builds_context_from_runtime_and_replies(tmp_path:
         "telegram.text.received",
         "user.text.received",
         "agent.turn.requested",
+        "agent.generation.started",
         "assistant.text.produced",
     ]
     assert await projection.list_messages("tg:456") == [
@@ -137,7 +139,7 @@ async def test_telegram_say_hi_builds_context_from_runtime_and_replies(tmp_path:
                     "- schedule.cron schedules recurring synthetic user messages.",
                     "- schedule.list and schedule.cancel manage scheduled messages.",
                     "- skill.* reads enabled markdown skills.",
-                    "- agent.* runs sub-agents that can use workspace file and shell tools.",
+                    "- agent.* runs sub-agents that can use workspace, web, task, schedule, skill, and MCP tools but cannot spawn further sub-agents.",
                 ]
             ),
             "Runtime: tools run in the user's workspace. Container details are not part of the model context.",
@@ -189,7 +191,7 @@ async def test_telegram_say_hi_builds_context_from_runtime_and_replies(tmp_path:
 
 
 @pytest.mark.asyncio
-async def test_tool_call_executes_in_runtime_without_exposing_docker(tmp_path: Path) -> None:
+async def test_tool_call_executes_in_runtime_without_exposing_docker(tmp_path: Path, browser_use_service: BrowserUseService, web_fetch_waiter: WebFetchExtractionWaiter, task_store: SQLiteTaskStore, schedule_store: SQLiteScheduleStore, sub_agents: SubAgentService) -> None:
     store = SQLiteEventStore(tmp_path / "events.sqlite3")
     projection = SQLiteConversationProjection(tmp_path / "messages.sqlite3")
     runtime = FakeUserRuntime(
@@ -221,15 +223,14 @@ async def test_tool_call_executes_in_runtime_without_exposing_docker(tmp_path: P
     bus = EventBus(store)
     conversation_projector = ConversationProjector(projection)
     tool_results = ToolCallResultWaiter()
-    tool_executor = ToolCallExecutor(runtime=runtime)
+    tool_executor = ToolCallExecutor(runtime=runtime, browser_use_service=browser_use_service, bus=bus, web_fetch_waiter=web_fetch_waiter, task_store=task_store, schedule_store=schedule_store, sub_agents=sub_agents)
     agent_turn_handler = AgentTurnHandler(
         bus=bus,
         context_builder=ContextBuilder(runtime=runtime),
         llm=llm,
         tool_registry=default_tool_registry(),
         projection=projection,
-        tool_results=tool_results,
-    )
+        tool_results=tool_results, sub_agent_lookup=NullSubAgentLookup())
     bus.subscribe(UserTextReceived, conversation_projector.handle_user_text)
     bus.subscribe(AssistantTextProduced, conversation_projector.handle_assistant_text)
     bus.subscribe(ToolCallRequested, tool_executor.handle_tool_call_requested)
@@ -253,11 +254,13 @@ async def test_tool_call_executes_in_runtime_without_exposing_docker(tmp_path: P
     assert [event.type for event in await store.list_events()] == [
         "user.text.received",
         "agent.turn.requested",
+        "agent.generation.started",
         "tool.call.requested",
         "tool.call.completed",
+        "agent.generation.started",
         "assistant.text.produced",
     ]
-    assert (await store.list_events())[2].type == "tool.call.requested"
+    assert (await store.list_events())[3].type == "tool.call.requested"
     assert runtime.shell_exec_calls == [ShellExecInput(command="pwd", cwd="/workspace")]
     assert llm.requests[0].tools[0].name == "shell.exec"
     assert not any("docker" in request.system.lower() for request in llm.requests)
@@ -364,8 +367,7 @@ async def test_agent_turn_uses_persisted_conversation_history(tmp_path: Path) ->
         context_builder=ContextBuilder(runtime=runtime),
         llm=llm,
         tool_registry=default_tool_registry(),
-        projection=projection,
-    )
+        projection=projection, sub_agent_lookup=NullSubAgentLookup())
     bus.subscribe(UserTextReceived, conversation_projector.handle_user_text)
     bus.subscribe(AssistantTextProduced, conversation_projector.handle_assistant_text)
     bus.subscribe(UserTextReceived, agent_turn_handler.handle_user_text)
@@ -397,7 +399,7 @@ async def test_agent_turn_uses_persisted_conversation_history(tmp_path: Path) ->
 
 
 @pytest.mark.asyncio
-async def test_tool_calls_and_results_are_persisted_in_llm_history(tmp_path: Path) -> None:
+async def test_tool_calls_and_results_are_persisted_in_llm_history(tmp_path: Path, browser_use_service: BrowserUseService, web_fetch_waiter: WebFetchExtractionWaiter, task_store: SQLiteTaskStore, schedule_store: SQLiteScheduleStore, sub_agents: SubAgentService) -> None:
     store = SQLiteEventStore(tmp_path / "events.sqlite3")
     projection = SQLiteConversationProjection(tmp_path / "messages.sqlite3")
     runtime = FakeUserRuntime(
@@ -418,7 +420,7 @@ async def test_tool_calls_and_results_are_persisted_in_llm_history(tmp_path: Pat
     bus = EventBus(store)
     coordinator = ConversationTurnCoordinator()
     tool_results = ToolCallResultWaiter()
-    tool_executor = ToolCallExecutor(runtime=runtime)
+    tool_executor = ToolCallExecutor(runtime=runtime, browser_use_service=browser_use_service, bus=bus, web_fetch_waiter=web_fetch_waiter, task_store=task_store, schedule_store=schedule_store, sub_agents=sub_agents)
     conversation_projector = ConversationProjector(projection, turn_coordinator=coordinator)
     agent_turn_handler = AgentTurnHandler(
         bus=bus,
@@ -427,8 +429,7 @@ async def test_tool_calls_and_results_are_persisted_in_llm_history(tmp_path: Pat
         tool_registry=default_tool_registry(),
         projection=projection,
         turn_coordinator=coordinator,
-        tool_results=tool_results,
-    )
+        tool_results=tool_results, sub_agent_lookup=NullSubAgentLookup())
     bus.subscribe(UserTextReceived, conversation_projector.handle_user_text)
     bus.subscribe(AssistantTextProduced, conversation_projector.handle_assistant_text)
     bus.subscribe(ToolCallRequested, tool_executor.handle_tool_call_requested)
@@ -482,7 +483,7 @@ async def test_tool_calls_and_results_are_persisted_in_llm_history(tmp_path: Pat
 
 
 @pytest.mark.asyncio
-async def test_tool_history_bytes_are_identical_in_next_llm_request(tmp_path: Path) -> None:
+async def test_tool_history_bytes_are_identical_in_next_llm_request(tmp_path: Path, browser_use_service: BrowserUseService, web_fetch_waiter: WebFetchExtractionWaiter, task_store: SQLiteTaskStore, schedule_store: SQLiteScheduleStore, sub_agents: SubAgentService) -> None:
     store = SQLiteEventStore(tmp_path / "events.sqlite3")
     projection = SQLiteConversationProjection(tmp_path / "messages.sqlite3")
     audit_store = SQLiteLlmAuditStore(tmp_path / "llm.sqlite3")
@@ -505,7 +506,7 @@ async def test_tool_history_bytes_are_identical_in_next_llm_request(tmp_path: Pa
     bus = EventBus(store)
     coordinator = ConversationTurnCoordinator()
     tool_results = ToolCallResultWaiter()
-    tool_executor = ToolCallExecutor(runtime=runtime)
+    tool_executor = ToolCallExecutor(runtime=runtime, browser_use_service=browser_use_service, bus=bus, web_fetch_waiter=web_fetch_waiter, task_store=task_store, schedule_store=schedule_store, sub_agents=sub_agents)
     conversation_projector = ConversationProjector(projection, turn_coordinator=coordinator)
     agent_turn_handler = AgentTurnHandler(
         bus=bus,
@@ -514,8 +515,7 @@ async def test_tool_history_bytes_are_identical_in_next_llm_request(tmp_path: Pa
         tool_registry=default_tool_registry(),
         projection=projection,
         turn_coordinator=coordinator,
-        tool_results=tool_results,
-    )
+        tool_results=tool_results, sub_agent_lookup=NullSubAgentLookup())
     bus.subscribe(UserTextReceived, conversation_projector.handle_user_text)
     bus.subscribe(AssistantTextProduced, conversation_projector.handle_assistant_text)
     bus.subscribe(ToolCallRequested, tool_executor.handle_tool_call_requested)
@@ -572,8 +572,7 @@ async def test_new_message_supersedes_running_turn_before_tool_side_effect(tmp_p
         llm=llm,
         tool_registry=default_tool_registry(),
         projection=projection,
-        turn_coordinator=coordinator,
-    )
+        turn_coordinator=coordinator, sub_agent_lookup=NullSubAgentLookup())
     bus.subscribe(UserTextReceived, conversation_projector.handle_user_text)
     bus.subscribe(AssistantTextProduced, conversation_projector.handle_assistant_text)
     bus.subscribe(UserTextReceived, agent_turn_handler.handle_user_text)

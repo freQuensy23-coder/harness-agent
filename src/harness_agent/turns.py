@@ -1,6 +1,6 @@
 import asyncio
 from contextlib import asynccontextmanager
-from collections.abc import AsyncIterator
+from collections.abc import AsyncGenerator
 
 
 class ConversationTurnCoordinator:
@@ -25,7 +25,7 @@ class ConversationTurnCoordinator:
         return await self.current_generation(conversation_id) == generation
 
     @asynccontextmanager
-    async def run_slot(self, conversation_id: str) -> AsyncIterator[None]:
+    async def run_slot(self, conversation_id: str) -> AsyncGenerator[None, None]:
         async with self._state_lock:
             if conversation_id not in self._run_locks:
                 self._run_locks[conversation_id] = asyncio.Lock()

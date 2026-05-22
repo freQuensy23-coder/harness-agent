@@ -1,4 +1,5 @@
 import asyncio
+import re
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 
@@ -9,8 +10,18 @@ from harness_agent.browser_use import (
     render_browser_session,
     render_browser_sessions,
 )
+from harness_agent.bus import EventBus
 from harness_agent.content import ContentRef, content_ref_from_workspace_file
-from harness_agent.events import EventBase, ToolCallCompleted, ToolCallRequested
+from harness_agent.events import (
+    EventBase,
+    ToolCallCompleted,
+    ToolCallError,
+    ToolCallRequested,
+    ToolResultSpillFailed,
+    ToolResultSpilled,
+    WebFetchExtractionFailed,
+    WebFetchExtractionRequested,
+)
 from harness_agent.mcp import McpManager
 from harness_agent.runtime import RuntimeToolResult, UserRuntime
 from harness_agent.scheduler import SQLiteScheduleStore
@@ -57,7 +68,7 @@ from harness_agent.tools import (
     TaskUpdateInput,
     WebFetchInput,
 )
-from harness_agent.web_fetch import WebFetcher
+from harness_agent.web_fetch import WebFetchExtractionWaiter
 
 
 EventBatch = tuple[EventBase, ...]
@@ -67,7 +78,7 @@ ToolCallKey = tuple[str, int, str]
 
 class ToolExecutionResult(BaseModel):
     result: RuntimeToolResult
-    attachments: list[ContentRef] = Field(default_factory=list)
+    attachments: list[ContentRef] = Field(default_factory=list[ContentRef])
 
 
 class ToolCallResultWaiter:
@@ -98,20 +109,24 @@ class ToolCallExecutor:
         self,
         *,
         runtime: UserRuntime,
-        task_store: SQLiteTaskStore | None = None,
-        schedule_store: SQLiteScheduleStore | None = None,
-        web_fetcher: WebFetcher | None = None,
+        browser_use_service: BrowserUseService,
+        bus: EventBus,
+        web_fetch_waiter: WebFetchExtractionWaiter,
+        task_store: SQLiteTaskStore,
+        schedule_store: SQLiteScheduleStore,
+        sub_agents: SubAgentService,
         mcp_manager: McpManager | None = None,
-        sub_agents: SubAgentService | None = None,
-        browser_use_service: BrowserUseService | None = None,
+        max_model_output_chars: int = 20_000,
     ) -> None:
         self._runtime = runtime
+        self._browser_use = browser_use_service
+        self._bus = bus
+        self._web_fetch_waiter = web_fetch_waiter
         self._task_store = task_store
         self._schedule_store = schedule_store
-        self._web_fetcher = web_fetcher
         self._mcp_manager = mcp_manager
         self._sub_agents = sub_agents
-        self._browser_use = browser_use_service
+        self._max_model_output_chars = max_model_output_chars
         self._tool_executors: dict[str, ToolExecutor] = {
             "shell.exec": self._shell_exec,
             "shell.spawn": self._shell_spawn,
@@ -149,7 +164,35 @@ class ToolCallExecutor:
         }
 
     async def handle_tool_call_requested(self, event: ToolCallRequested) -> EventBatch:
-        execution = await self._execute_tool(event)
+        try:
+            execution = await self._execute_tool(event)
+            execution = await self._spill_oversized_result(event, execution)
+        except Exception as exc:
+            error = str(exc)
+            execution = ToolExecutionResult(
+                result=RuntimeToolResult(stderr=error, exit_code=1)
+            )
+            return (
+                ToolCallError(
+                    user_id=event.user_id,
+                    conversation_id=event.conversation_id,
+                    generation=event.generation,
+                    call_id=event.call_id,
+                    tool_name=event.tool_name,
+                    input=event.input,
+                    error=error,
+                ),
+                ToolCallCompleted(
+                    user_id=event.user_id,
+                    conversation_id=event.conversation_id,
+                    generation=event.generation,
+                    call_id=event.call_id,
+                    tool_name=event.tool_name,
+                    input=event.input,
+                    result=execution.result,
+                    attachments=execution.attachments,
+                ),
+            )
         return (
             ToolCallCompleted(
                 user_id=event.user_id,
@@ -161,6 +204,63 @@ class ToolCallExecutor:
                 result=execution.result,
                 attachments=execution.attachments,
             ),
+        )
+
+    async def _spill_oversized_result(
+        self,
+        event: ToolCallRequested,
+        execution: ToolExecutionResult,
+    ) -> ToolExecutionResult:
+        rendered = execution.result.render_for_llm(event.tool_name)
+        rendered_bytes = rendered.encode("utf-8")
+        if len(rendered) <= self._max_model_output_chars:
+            return execution
+        path = _tool_result_path(event)
+        write = await self._runtime.write_content_file(
+            event.user_id,
+            path,
+            rendered_bytes,
+        )
+        if write.exit_code != 0:
+            error = write.stderr or f"failed to save oversized tool result to {path}"
+            # Record the failed spill so the audit log explains why the
+            # workspace file is missing.
+            await self._bus.publish(
+                ToolResultSpillFailed(
+                    user_id=event.user_id,
+                    conversation_id=event.conversation_id,
+                    generation=event.generation,
+                    call_id=event.call_id,
+                    tool_name=event.tool_name,
+                    workspace_path=path,
+                    rendered_size_bytes=len(rendered_bytes),
+                    error=error,
+                )
+            )
+            raise RuntimeError(error)
+        # Success: persist the spill event after the write so the audit log
+        # only ever points at files that actually exist on disk.
+        await self._bus.publish(
+            ToolResultSpilled(
+                user_id=event.user_id,
+                conversation_id=event.conversation_id,
+                generation=event.generation,
+                call_id=event.call_id,
+                tool_name=event.tool_name,
+                workspace_path=path,
+                rendered_size_bytes=len(rendered_bytes),
+            )
+        )
+        return ToolExecutionResult(
+            result=RuntimeToolResult(
+                stdout=(
+                    "truncated, because it is too long. "
+                    f"Full result saved to {path}. "
+                    "You can read it in chunks with file.read."
+                ),
+                exit_code=execution.result.exit_code,
+            ),
+            attachments=execution.attachments,
         )
 
     async def _execute_tool(self, event: ToolCallRequested) -> ToolExecutionResult:
@@ -302,9 +402,31 @@ class ToolCallExecutor:
         user_id: str,
         event: ToolCallRequested,
     ) -> RuntimeToolResult:
-        if self._web_fetcher is None:
-            raise RuntimeError("web fetcher is not configured")
-        return await self._web_fetcher.fetch(WebFetchInput.model_validate(event.input))
+        input = WebFetchInput.model_validate(event.input)
+        self._web_fetch_waiter.expect(
+            conversation_id=event.conversation_id,
+            generation=event.generation,
+            call_id=event.call_id,
+        )
+        await self._bus.publish(
+            WebFetchExtractionRequested(
+                user_id=user_id,
+                conversation_id=event.conversation_id,
+                generation=event.generation,
+                call_id=event.call_id,
+                url=input.url,
+                prompt=input.prompt,
+                max_bytes=input.max_bytes,
+            )
+        )
+        result = await self._web_fetch_waiter.wait(
+            conversation_id=event.conversation_id,
+            generation=event.generation,
+            call_id=event.call_id,
+        )
+        if isinstance(result, WebFetchExtractionFailed):
+            return RuntimeToolResult(stderr=result.error, exit_code=1)
+        return RuntimeToolResult(stdout=result.answer)
 
     async def _task_create(
         self,
@@ -312,7 +434,7 @@ class ToolCallExecutor:
         event: ToolCallRequested,
     ) -> RuntimeToolResult:
         input = TaskCreateInput.model_validate(event.input)
-        task = await self._require_task_store().create(
+        task = await self._task_store.create(
             user_id=user_id,
             conversation_id=event.conversation_id,
             title=input.title,
@@ -326,7 +448,7 @@ class ToolCallExecutor:
         event: ToolCallRequested,
     ) -> RuntimeToolResult:
         input = TaskGetInput.model_validate(event.input)
-        task = await self._require_task_store().get(
+        task = await self._task_store.get(
             task_id=input.task_id,
             user_id=user_id,
             conversation_id=event.conversation_id,
@@ -341,7 +463,7 @@ class ToolCallExecutor:
         event: ToolCallRequested,
     ) -> RuntimeToolResult:
         input = TaskListInput.model_validate(event.input)
-        tasks = await self._require_task_store().list(
+        tasks = await self._task_store.list(
             user_id=user_id,
             conversation_id=event.conversation_id,
             include_stopped=input.include_stopped,
@@ -354,7 +476,7 @@ class ToolCallExecutor:
         event: ToolCallRequested,
     ) -> RuntimeToolResult:
         input = TaskUpdateInput.model_validate(event.input)
-        task = await self._require_task_store().update(
+        task = await self._task_store.update(
             task_id=input.task_id,
             user_id=user_id,
             conversation_id=event.conversation_id,
@@ -371,7 +493,7 @@ class ToolCallExecutor:
         event: ToolCallRequested,
     ) -> RuntimeToolResult:
         input = TaskStopInput.model_validate(event.input)
-        task = await self._require_task_store().update(
+        task = await self._task_store.update(
             task_id=input.task_id,
             user_id=user_id,
             conversation_id=event.conversation_id,
@@ -416,7 +538,7 @@ class ToolCallExecutor:
         run_at_utc = None
         if input.run_at_utc is not None:
             run_at_utc = datetime.fromisoformat(input.run_at_utc).astimezone(UTC)
-        schedule = await self._require_schedule_store().create_once(
+        schedule = await self._schedule_store.create_once(
             user_id=user_id,
             conversation_id=event.conversation_id,
             message=input.message,
@@ -432,7 +554,7 @@ class ToolCallExecutor:
         event: ToolCallRequested,
     ) -> RuntimeToolResult:
         input = ScheduleCronInput.model_validate(event.input)
-        schedule = await self._require_schedule_store().create_cron(
+        schedule = await self._schedule_store.create_cron(
             user_id=user_id,
             conversation_id=event.conversation_id,
             message=input.message,
@@ -448,7 +570,7 @@ class ToolCallExecutor:
         event: ToolCallRequested,
     ) -> RuntimeToolResult:
         input = ScheduleListInput.model_validate(event.input)
-        schedules = await self._require_schedule_store().list_for_conversation(
+        schedules = await self._schedule_store.list_for_conversation(
             user_id=user_id,
             conversation_id=event.conversation_id,
             include_stopped=input.include_stopped,
@@ -465,7 +587,7 @@ class ToolCallExecutor:
         event: ToolCallRequested,
     ) -> RuntimeToolResult:
         input = ScheduleCancelInput.model_validate(event.input)
-        schedule = await self._require_schedule_store().cancel(
+        schedule = await self._schedule_store.cancel(
             schedule_id=input.schedule_id,
             user_id=user_id,
             conversation_id=event.conversation_id,
@@ -478,7 +600,7 @@ class ToolCallExecutor:
         event: ToolCallRequested,
     ) -> RuntimeToolResult:
         input = AgentRunInput.model_validate(event.input)
-        record = await self._require_sub_agents().run(
+        record = await self._sub_agents.run(
             user_id=user_id,
             parent_conversation_id=event.conversation_id,
             parent_call_id=event.call_id,
@@ -497,7 +619,7 @@ class ToolCallExecutor:
         event: ToolCallRequested,
     ) -> RuntimeToolResult:
         input = AgentSpawnInput.model_validate(event.input)
-        record = await self._require_sub_agents().spawn(
+        record = await self._sub_agents.spawn(
             user_id=user_id,
             parent_conversation_id=event.conversation_id,
             parent_call_id=event.call_id,
@@ -511,7 +633,7 @@ class ToolCallExecutor:
         event: ToolCallRequested,
     ) -> RuntimeToolResult:
         input = AgentResultInput.model_validate(event.input)
-        record = await self._require_sub_agents().result(
+        record = await self._sub_agents.result(
             agent_id=input.agent_id,
             user_id=user_id,
             parent_conversation_id=event.conversation_id,
@@ -526,7 +648,7 @@ class ToolCallExecutor:
         event: ToolCallRequested,
     ) -> RuntimeToolResult:
         input = AgentListInput.model_validate(event.input)
-        records = await self._require_sub_agents().list_for_parent(
+        records = await self._sub_agents.list_for_parent(
             user_id=user_id,
             parent_conversation_id=event.conversation_id,
             include_completed=input.include_completed,
@@ -539,7 +661,7 @@ class ToolCallExecutor:
         event: ToolCallRequested,
     ) -> RuntimeToolResult:
         input = AgentCancelInput.model_validate(event.input)
-        record = await self._require_sub_agents().cancel(
+        record = await self._sub_agents.cancel(
             agent_id=input.agent_id,
             user_id=user_id,
             parent_conversation_id=event.conversation_id,
@@ -554,7 +676,7 @@ class ToolCallExecutor:
         event: ToolCallRequested,
     ) -> RuntimeToolResult:
         input = BrowserRunInput.model_validate(event.input)
-        record = await self._require_browser_use().run(
+        record = await self._browser_use.run(
             user_id=user_id,
             conversation_id=event.conversation_id,
             generation=event.generation,
@@ -574,7 +696,7 @@ class ToolCallExecutor:
         event: ToolCallRequested,
     ) -> RuntimeToolResult:
         input = BrowserSpawnInput.model_validate(event.input)
-        record = await self._require_browser_use().spawn(
+        record = await self._browser_use.spawn(
             user_id=user_id,
             conversation_id=event.conversation_id,
             generation=event.generation,
@@ -589,7 +711,7 @@ class ToolCallExecutor:
         event: ToolCallRequested,
     ) -> RuntimeToolResult:
         input = BrowserGetInput.model_validate(event.input)
-        record, messages = await self._require_browser_use().get(
+        record, messages = await self._browser_use.get(
             user_id=user_id,
             input=input,
         )
@@ -603,7 +725,7 @@ class ToolCallExecutor:
         event: ToolCallRequested,
     ) -> RuntimeToolResult:
         input = BrowserSendInput.model_validate(event.input)
-        record = await self._require_browser_use().send(user_id=user_id, input=input)
+        record = await self._browser_use.send(user_id=user_id, input=input)
         return self._text_result(render_browser_session(record))
 
     async def _browser_stop(
@@ -612,7 +734,7 @@ class ToolCallExecutor:
         event: ToolCallRequested,
     ) -> RuntimeToolResult:
         input = BrowserStopInput.model_validate(event.input)
-        record = await self._require_browser_use().stop(user_id=user_id, input=input)
+        record = await self._browser_use.stop(user_id=user_id, input=input)
         return self._text_result(render_browser_session(record))
 
     async def _browser_list(
@@ -621,31 +743,11 @@ class ToolCallExecutor:
         event: ToolCallRequested,
     ) -> RuntimeToolResult:
         input = BrowserListInput.model_validate(event.input)
-        records = await self._require_browser_use().list_for_user(
+        records = await self._browser_use.list_for_user(
             user_id=user_id,
             input=input,
         )
         return self._text_result(render_browser_sessions(records))
-
-    def _require_task_store(self) -> SQLiteTaskStore:
-        if self._task_store is None:
-            raise RuntimeError("task store is not configured")
-        return self._task_store
-
-    def _require_schedule_store(self) -> SQLiteScheduleStore:
-        if self._schedule_store is None:
-            raise RuntimeError("schedule store is not configured")
-        return self._schedule_store
-
-    def _require_sub_agents(self) -> SubAgentService:
-        if self._sub_agents is None:
-            raise RuntimeError("sub-agent service is not configured")
-        return self._sub_agents
-
-    def _require_browser_use(self) -> BrowserUseService:
-        if self._browser_use is None:
-            raise RuntimeError("browser-use service is not configured")
-        return self._browser_use
 
     def _text_result(self, text: str) -> RuntimeToolResult:
         return RuntimeToolResult(stdout=text)
@@ -653,3 +755,17 @@ class ToolCallExecutor:
 
 def _tool_call_key(event: ToolCallRequested | ToolCallCompleted) -> ToolCallKey:
     return (event.conversation_id, event.generation, event.call_id)
+
+
+def _tool_result_path(event: ToolCallRequested) -> str:
+    return (
+        "/workspace/content/tool-results/"
+        f"{_safe_path_part(event.conversation_id)}-"
+        f"{event.generation}-"
+        f"{_safe_path_part(event.call_id)}.txt"
+    )
+
+
+def _safe_path_part(value: str) -> str:
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "-", value).strip("-")
+    return safe or "tool-call"

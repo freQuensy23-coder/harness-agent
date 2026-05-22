@@ -23,7 +23,7 @@ MessageRole = Literal["user", "assistant"]
 class SQLiteConversationProjection:
     def __init__(self, path: Path) -> None:
         self._path = path
-        self._message_adapter = TypeAdapter(LlmMessage)
+        self._message_adapter: TypeAdapter[LlmMessage] = TypeAdapter(LlmMessage)
 
     async def append_message(
         self,

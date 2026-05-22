@@ -3,6 +3,7 @@ from pathlib import Path
 
 import pytest
 
+from harness_agent import events
 from harness_agent.bus import EventBus
 from harness_agent.context import AgentFileSet, ContextBuilder, Skill
 from harness_agent.events import (
@@ -17,7 +18,7 @@ from harness_agent.projections import SQLiteConversationProjection
 from harness_agent.runtime import FakeUserRuntime, RuntimeToolResult
 from harness_agent.scheduler import SQLiteScheduleStore
 from harness_agent.store import SQLiteEventStore
-from harness_agent.subagents import SubAgentRecord
+from harness_agent.subagents import SubAgentRecord, NullSubAgentLookup, SubAgentService
 from harness_agent.tasks import SQLiteTaskStore
 from harness_agent.tool_executor import ToolCallExecutor, ToolCallResultWaiter
 from harness_agent.tools import (
@@ -58,7 +59,7 @@ from harness_agent.tools import (
 
 
 @pytest.mark.asyncio
-async def test_every_exposed_tool_completes_through_agent_turn_handler(tmp_path: Path) -> None:
+async def test_every_exposed_tool_completes_through_agent_turn_handler(tmp_path: Path, browser_use_service: BrowserUseService, web_fetch_waiter: WebFetchExtractionWaiter, task_store: SQLiteTaskStore, schedule_store: SQLiteScheduleStore) -> None:
     store = SQLiteEventStore(tmp_path / "events.sqlite3")
     projection = SQLiteConversationProjection(tmp_path / "messages.sqlite3")
     task_store = SQLiteTaskStore(tmp_path / "tasks.sqlite3")
@@ -107,7 +108,11 @@ async def test_every_exposed_tool_completes_through_agent_turn_handler(tmp_path:
         LlmToolCall(call_id="file-glob", name="file.glob", input=FileGlobInput(pattern="*.txt")),
         LlmToolCall(call_id="file-grep", name="file.grep", input=FileGrepInput(pattern="one", path="/workspace")),
         LlmToolCall(call_id="file-list", name="file.list", input=FileListInput(path="/workspace")),
-        LlmToolCall(call_id="web-fetch", name="web.fetch", input=WebFetchInput(url="http://local.test")),
+        LlmToolCall(
+            call_id="web-fetch",
+            name="web.fetch",
+            input=WebFetchInput(url="http://local.test", prompt="Extract the useful text."),
+        ),
         LlmToolCall(call_id="task-create", name="task.create", input=TaskCreateInput(title="new")),
         LlmToolCall(call_id="task-get", name="task.get", input=TaskGetInput(task_id=existing_task.id)),
         LlmToolCall(call_id="task-list", name="task.list", input=TaskListInput(include_stopped=True)),
@@ -152,22 +157,26 @@ async def test_every_exposed_tool_completes_through_agent_turn_handler(tmp_path:
         tool_registry=registry,
         projection=projection,
         mcp_manager=mcp_manager,
-        tool_results=tool_results,
-    )
+        tool_results=tool_results, sub_agent_lookup=NullSubAgentLookup())
+    from harness_agent.web_fetch import WebFetchExtractionWaiter
+    web_fetch_waiter = WebFetchExtractionWaiter()
     tool_executor = ToolCallExecutor(
         runtime=runtime,
         task_store=task_store,
         schedule_store=schedule_store,
-        web_fetcher=FakeWebFetcher(),
+        web_fetch_waiter=web_fetch_waiter,
         mcp_manager=mcp_manager,
-        sub_agents=FakeSubAgentService(),
-    )
+        sub_agents=FakeSubAgentService(), browser_use_service=browser_use_service, bus=bus)
     projector = ConversationProjector(projection)
+    fake_web = FakeWebFetcher()
     bus.subscribe(UserTextReceived, projector.handle_user_text)
     bus.subscribe(ToolCallRequested, tool_executor.handle_tool_call_requested)
     bus.subscribe(ToolCallCompleted, tool_results.handle_tool_call_completed)
     bus.subscribe(UserTextReceived, handler.handle_user_text)
     bus.subscribe(AgentTurnRequested, handler.handle_agent_turn)
+    bus.subscribe(events.WebFetchExtractionRequested, fake_web.handle_extraction_requested)
+    bus.subscribe(events.WebFetchExtractionCompleted, web_fetch_waiter.handle_completed)
+    bus.subscribe(events.WebFetchExtractionFailed, web_fetch_waiter.handle_failed)
 
     await bus.publish(
         UserTextReceived(
@@ -217,8 +226,19 @@ async def test_every_exposed_tool_completes_through_agent_turn_handler(tmp_path:
 
 
 class FakeWebFetcher:
-    async def fetch(self, input: WebFetchInput) -> RuntimeToolResult:
-        return RuntimeToolResult(stdout=f"fetched:{input.url}")
+    async def handle_extraction_requested(
+        self,
+        event: "events.WebFetchExtractionRequested",
+    ) -> tuple:
+        return (
+            events.WebFetchExtractionCompleted(
+                user_id=event.user_id,
+                conversation_id=event.conversation_id,
+                generation=event.generation,
+                call_id=event.call_id,
+                answer=f"fetched:{event.url}",
+            ),
+        )
 
 
 class FakeMcpManager:

@@ -7,8 +7,9 @@ from uuid import uuid4
 import pytest
 
 from harness_agent.context import ContextBuilder
+from harness_agent.llm import AssistantText, FakeLlmClient
 from harness_agent.mcp import McpManager
-from harness_agent.runtime import DockerUserRuntime
+from harness_agent.runtime import DockerUserRuntime, SQLiteSpawnedProcessStore
 from harness_agent.tasks import SQLiteTaskStore
 from harness_agent.tools import (
     FileEditInput,
@@ -33,11 +34,8 @@ from harness_agent.tools import (
 from harness_agent.web_fetch import HttpxWebFetcher
 
 
-pytestmark = pytest.mark.integration
-
-
 @pytest.fixture
-def docker_runtime():
+def docker_runtime(tmp_path):
     prefix = f"harness-e2e-{uuid4().hex[:8]}"
     user_id = "u:e2e"
     runtime = DockerUserRuntime(
@@ -47,6 +45,7 @@ def docker_runtime():
         network="bridge",
         memory="1g",
         cpus="1",
+        spawned_process_store=SQLiteSpawnedProcessStore(tmp_path / "runtime.sqlite3"),
     )
     yield runtime, user_id, f"{prefix}-u-e2e"
     subprocess.run(["docker", "rm", "-f", f"{prefix}-u-e2e"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -157,8 +156,29 @@ async def test_all_container_tools_skills_soul_and_mcp_work_in_docker(docker_run
 
 @pytest.mark.asyncio
 async def test_web_fetch_and_task_tools_work(local_http_server, tmp_path):
-    fetched = await HttpxWebFetcher().fetch(WebFetchInput(url=local_http_server))
-    assert fetched.stdout == "web-fetch-ok"
+    from harness_agent.events import (
+        WebFetchExtractionCompleted,
+        WebFetchExtractionRequested,
+    )
+
+    llm = FakeLlmClient([AssistantText(text="web-fetch-ok")])
+    fetcher = HttpxWebFetcher(llm=llm)
+    emitted = await fetcher.handle_extraction_requested(
+        WebFetchExtractionRequested(
+            user_id="u:1",
+            conversation_id="cli:web",
+            generation=1,
+            call_id="fetch-int",
+            url=local_http_server,
+            prompt="Return the page text.",
+            max_bytes=WebFetchInput.model_fields["max_bytes"].default,
+        )
+    )
+    assert len(emitted) == 1
+    completed = emitted[0]
+    assert isinstance(completed, WebFetchExtractionCompleted)
+    assert completed.answer == "web-fetch-ok"
+    assert "web-fetch-ok" in llm.requests[0].messages[0].text
 
     store = SQLiteTaskStore(tmp_path / "tasks.sqlite3")
     task = await store.create(

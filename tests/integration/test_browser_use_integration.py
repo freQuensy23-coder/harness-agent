@@ -1,9 +1,10 @@
 """Integration tests against the real browser-use cloud.
 
-Skipped unless BROWSER_USE_API_KEY is in the environment.
+Skipped unless BROWSER_USE_API_KEY is in the environment. This file lives in
+tests/integration/ which the default pytest run skips via norecursedirs.
 
-Run:
-    BROWSER_USE_API_KEY=bu_... uv run pytest tests/test_browser_use_integration.py -v
+Run explicitly:
+    BROWSER_USE_API_KEY=bu_... uv run pytest tests/integration/test_browser_use_integration.py -v
 """
 
 import asyncio
@@ -34,10 +35,7 @@ from harness_agent.tools import BrowserRunInput
 
 API_KEY = os.environ.get("BROWSER_USE_API_KEY")
 
-pytestmark = [
-    pytest.mark.integration,
-    pytest.mark.skipif(not API_KEY, reason="BROWSER_USE_API_KEY not set"),
-]
+pytestmark = pytest.mark.skipif(not API_KEY, reason="BROWSER_USE_API_KEY not set")
 
 
 def _make_real_stack(tmp_path: Path):

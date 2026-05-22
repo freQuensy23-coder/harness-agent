@@ -4,6 +4,7 @@ import argparse
 import asyncio
 from pathlib import Path
 
+from harness_agent import send_cli_once
 from harness_agent.app import HarnessApp
 from harness_agent.config import load_config
 
@@ -18,7 +19,8 @@ def main() -> None:
 
     app = HarnessApp(config=load_config(args.config))
     reply = asyncio.run(
-        app.send_cli(
+        send_cli_once(
+            app,
             text=args.send,
             user_id=args.user_id,
             conversation_id=args.conversation_id,

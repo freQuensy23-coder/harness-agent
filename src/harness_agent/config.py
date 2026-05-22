@@ -3,6 +3,8 @@ from pathlib import Path
 import yaml
 from pydantic import BaseModel, ConfigDict, Field
 
+from harness_agent.mcp_models import McpServerConfig
+
 
 class ServerConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -66,6 +68,12 @@ class BrowserUseConfig(BaseModel):
     request_timeout_seconds: float = 30.0
 
 
+class McpConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    servers: list[McpServerConfig] = Field(default_factory=list[McpServerConfig])
+
+
 class HarnessConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -76,6 +84,7 @@ class HarnessConfig(BaseModel):
     runtime: RuntimeConfig = Field(default_factory=RuntimeConfig)
     scheduler: SchedulerConfig = Field(default_factory=SchedulerConfig)
     browser_use: BrowserUseConfig
+    mcp: McpConfig = Field(default_factory=McpConfig)
 
 
 def load_config(path: Path) -> HarnessConfig:

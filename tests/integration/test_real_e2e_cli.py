@@ -11,9 +11,6 @@ import pytest
 import yaml
 
 
-pytestmark = pytest.mark.integration
-
-
 def test_cli_real_e2e_openrouter_docker_sqlite(tmp_path: Path) -> None:
     openrouter_config_path = Path.home() / ".config" / "harness-agent" / "openrouter.yaml"
     if not openrouter_config_path.exists():
@@ -70,7 +67,7 @@ def test_cli_real_e2e_openrouter_docker_sqlite(tmp_path: Path) -> None:
                 "--conversation_id",
                 f"cli:{user_id}",
             ],
-            cwd=Path(__file__).parents[1],
+            cwd=Path(__file__).parents[2],
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -125,7 +122,7 @@ def test_cli_real_e2e_openrouter_docker_sqlite(tmp_path: Path) -> None:
                 "--conversation_id",
                 f"cli:{user_id}",
             ],
-            cwd=Path(__file__).parents[1],
+            cwd=Path(__file__).parents[2],
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -252,7 +249,7 @@ def test_cli_real_e2e_openrouter_docker_image_file_read(tmp_path: Path) -> None:
                 "--conversation_id",
                 f"cli:{user_id}",
             ],
-            cwd=Path(__file__).parents[1],
+            cwd=Path(__file__).parents[2],
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -358,7 +355,7 @@ def test_cli_real_e2e_openrouter_docker_subagent_file_work(tmp_path: Path) -> No
                 "--conversation_id",
                 f"cli:{user_id}",
             ],
-            cwd=Path(__file__).parents[1],
+            cwd=Path(__file__).parents[2],
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,

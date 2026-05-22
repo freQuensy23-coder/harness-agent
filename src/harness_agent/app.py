@@ -1,5 +1,7 @@
 import asyncio
 from asyncio import Queue
+from collections.abc import AsyncGenerator
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from loguru import logger
@@ -23,21 +25,34 @@ from harness_agent.events import (
     AgentEvent,
     AgentTurnRequested,
     AssistantTextProduced,
+    BrowserProfileTouched,
     BrowserSessionCompleted,
     BrowserSessionFailed,
+    BrowserSessionMessageReceived,
     BrowserSessionPollDue,
+    BrowserSessionStatusChanged,
     BrowserSessionStopped,
     CliTextReceived,
     ScheduledMessageDue,
+    SubAgentCancelled,
+    SubAgentCompleted,
+    SubAgentFailed,
+    SubAgentRequested,
+    SubAgentStarted,
+    SubAgentTimedOut,
     TelegramTextReceived,
     ToolCallCompleted,
     ToolCallRequested,
     UserTextReceived,
+    WebFetchExtractionCompleted,
+    WebFetchExtractionFailed,
+    WebFetchExtractionRequested,
 )
 from harness_agent.handlers import (
     AgentTurnHandler,
     ContentIngestionHandler,
     ConversationProjector,
+    EventBatch,
     IdentityHandler,
 )
 from harness_agent.identity import StaticIdentityResolver
@@ -45,7 +60,12 @@ from harness_agent.llm import OpenAIResponsesClient
 from harness_agent.llm_audit import AuditedLlmClient, SQLiteLlmAuditStore
 from harness_agent.mcp import McpManager
 from harness_agent.projections import SQLiteConversationProjection
-from harness_agent.runtime import DockerUserRuntime
+from harness_agent.runtime import (
+    AsyncioDockerRunner,
+    DockerUserRuntime,
+    SQLiteSpawnedProcessStore,
+)
+from harness_agent.runtime.eventful_spawned_store import EventfulSpawnedProcessStore
 from harness_agent.scheduler import (
     SchedulerDueHandler,
     SchedulerPump,
@@ -53,12 +73,12 @@ from harness_agent.scheduler import (
     SQLiteScheduleStore,
 )
 from harness_agent.store import SQLiteEventStore
-from harness_agent.subagents import SQLiteSubAgentStore, SubAgentResultWaiter, SubAgentService
+from harness_agent.subagents import SQLiteSubAgentStore, SubAgentService
 from harness_agent.tasks import SQLiteTaskStore
 from harness_agent.tool_executor import ToolCallExecutor, ToolCallResultWaiter
 from harness_agent.turns import ConversationTurnCoordinator
 from harness_agent.tools import default_tool_registry
-from harness_agent.web_fetch import HttpxWebFetcher
+from harness_agent.web_fetch import HttpxWebFetcher, WebFetchExtractionWaiter
 
 
 class HarnessApp:
@@ -68,6 +88,7 @@ class HarnessApp:
         events_path = _derived_db_path(db_path, "events")
         llm_path = _derived_db_path(db_path, "llm")
         messages_path = _derived_db_path(db_path, "messages")
+        runtime_path = _derived_db_path(db_path, "runtime")
         schedules_path = _derived_db_path(db_path, "schedules")
         sub_agents_path = _derived_db_path(db_path, "subagents")
         tasks_path = _derived_db_path(db_path, "tasks")
@@ -85,17 +106,22 @@ class HarnessApp:
         self.bus = EventBus(self.event_store)
         self.turn_coordinator = ConversationTurnCoordinator()
         self.tool_results = ToolCallResultWaiter()
-        self.sub_agent_results = SubAgentResultWaiter()
         self.runtime = DockerUserRuntime(
+            runner=AsyncioDockerRunner(),
             image=config.runtime.docker.image,
             container_prefix=config.runtime.docker.container_prefix,
             network=config.runtime.docker.network,
             memory=config.runtime.docker.memory,
             cpus=config.runtime.docker.cpus,
             ensure_container=True,
+            spawned_process_store=EventfulSpawnedProcessStore(
+                store=SQLiteSpawnedProcessStore(runtime_path),
+                bus=self.bus,
+            ),
         )
         self.mcp_manager = McpManager(
             runtime=self.runtime,
+            global_servers=config.mcp.servers,
         )
         self.llm = AuditedLlmClient(
             inner=OpenAIResponsesClient(
@@ -108,8 +134,9 @@ class HarnessApp:
         self.sub_agents = SubAgentService(
             bus=self.bus,
             store=self.sub_agent_store,
-            result_waiter=self.sub_agent_results,
         )
+        self.web_fetch_waiter = WebFetchExtractionWaiter()
+        self.web_fetcher = HttpxWebFetcher(llm=self.llm)
         self.browser_use_results = BrowserSessionResultWaiter()
         self.browser_use_client = HttpxBrowserUseClient(
             api_key=config.browser_use.api_key,
@@ -143,24 +170,48 @@ class HarnessApp:
         )
         self.telegram: AiogramTelegramAdapter | None = None
         self._cli_replies: dict[str, Queue[str]] = {}
-        self._background_uses = 0
-        self._background_lock = asyncio.Lock()
+        # Background services (scheduler + browser pump + http client) must
+        # stay alive while ANY caller is in flight -- a telegram session or
+        # one of N concurrent CLI calls. start() / stop() acquire and
+        # release a hold; only the last release tears the services down.
+        self._lifecycle_holders = 0
+        self._lifecycle_lock = asyncio.Lock()
         self._wire()
 
     async def publish(self, event: AgentEvent) -> None:
         await self.bus.publish(event)
 
-    async def start_background_services(self) -> None:
-        async with self._background_lock:
-            if self._background_uses == 0:
+    @asynccontextmanager
+    async def background_services(self) -> AsyncGenerator[None]:
+        """Lease the background services for the duration of the
+        ``async with`` block. The first lease boots scheduler + browser
+        pump; the last release tears them down. Releases are bound to
+        the matching acquire via the context manager, so a stray extra
+        release can never close shared resources out from under another
+        caller."""
+        await self._acquire_lifecycle_hold()
+        try:
+            yield
+        finally:
+            await self._release_lifecycle_hold()
+
+    async def _acquire_lifecycle_hold(self) -> None:
+        async with self._lifecycle_lock:
+            if self._lifecycle_holders == 0:
                 await self.scheduler_service.start()
                 await self.browser_use_pump_service.start()
-            self._background_uses += 1
+            self._lifecycle_holders += 1
 
-    async def stop_background_services(self) -> None:
-        async with self._background_lock:
-            self._background_uses -= 1
-            if self._background_uses > 0:
+    async def _release_lifecycle_hold(self) -> None:
+        async with self._lifecycle_lock:
+            if self._lifecycle_holders == 0:
+                raise RuntimeError(
+                    "Lifecycle hold released without a matching acquire; "
+                    "use `async with app.background_services():` rather than "
+                    "calling internal release directly."
+                )
+            self._lifecycle_holders -= 1
+            if self._lifecycle_holders > 0:
                 return
             await self.browser_use_pump_service.stop()
             await self.scheduler_service.stop()
@@ -179,14 +230,11 @@ class HarnessApp:
             conversation_id=conversation_id,
         )
         self._cli_replies[event.request_id] = Queue(maxsize=1)
-        await self.start_background_services()
         try:
             await self.bus.publish(event)
-            reply = await self._cli_replies[event.request_id].get()
+            return await self._cli_replies[event.request_id].get()
         finally:
             del self._cli_replies[event.request_id]
-            await self.stop_background_services()
-        return reply
 
     async def run_telegram(self) -> None:
         if not self._config.telegram.enabled:
@@ -196,13 +244,12 @@ class HarnessApp:
         self.telegram = AiogramTelegramAdapter(
             token=self._config.telegram.bot_token,
             bus=self.bus,
+            turn_coordinator=self.turn_coordinator,
         )
-        await self.start_background_services()
-        logger.info("Starting Telegram polling")
-        try:
+        self.telegram.register_outbound_handlers()
+        async with self.background_services():
+            logger.info("Starting Telegram polling")
             await self.telegram.start_polling()
-        finally:
-            await self.stop_background_services()
 
     def _wire(self) -> None:
         identity_handler = IdentityHandler(StaticIdentityResolver())
@@ -220,12 +267,14 @@ class HarnessApp:
             mcp_manager=self.mcp_manager,
             turn_coordinator=self.turn_coordinator,
             tool_results=self.tool_results,
+            sub_agent_lookup=self.sub_agents,
         )
         tool_call_executor = ToolCallExecutor(
             runtime=self.runtime,
+            bus=self.bus,
             task_store=self.task_store,
             schedule_store=self.schedule_store,
-            web_fetcher=HttpxWebFetcher(),
+            web_fetch_waiter=self.web_fetch_waiter,
             mcp_manager=self.mcp_manager,
             sub_agents=self.sub_agents,
             browser_use_service=self.browser_use_service,
@@ -237,7 +286,13 @@ class HarnessApp:
         self.bus.subscribe(UserTextReceived, content_ingestion_handler.handle_user_text)
         self.bus.subscribe(UserTextReceived, conversation_projector.handle_user_text)
         self.bus.subscribe(AssistantTextProduced, conversation_projector.handle_assistant_text)
-        self.bus.subscribe(AssistantTextProduced, self.sub_agent_results.handle_assistant_text)
+        self.bus.subscribe(AssistantTextProduced, self.sub_agents.handle_assistant_text)
+        self.bus.subscribe(SubAgentRequested, self.sub_agents.handle_requested)
+        self.bus.subscribe(SubAgentStarted, self.sub_agents.handle_started)
+        self.bus.subscribe(SubAgentTimedOut, self.sub_agents.handle_timed_out)
+        self.bus.subscribe(SubAgentCompleted, self.sub_agents.handle_completed)
+        self.bus.subscribe(SubAgentFailed, self.sub_agents.handle_failed)
+        self.bus.subscribe(SubAgentCancelled, self.sub_agents.handle_cancelled)
         self.bus.subscribe(ToolCallRequested, tool_call_executor.handle_tool_call_requested)
         self.bus.subscribe(ToolCallCompleted, self.tool_results.handle_tool_call_completed)
         self.bus.subscribe(ToolCallCompleted, conversation_projector.handle_tool_call_completed)
@@ -246,11 +301,37 @@ class HarnessApp:
             AgentTurnRequested,
             agent_turn_handler.handle_agent_turn,
         )
-        self.bus.subscribe(AssistantTextProduced, self._send_telegram_reply)
         self.bus.subscribe(AssistantTextProduced, self._send_cli_reply)
         self.bus.subscribe(
             BrowserSessionPollDue,
             self.browser_use_poll_handler.handle_poll_due,
+        )
+        self.bus.subscribe(
+            BrowserSessionMessageReceived,
+            self.browser_use_poll_handler.handle_message_received,
+        )
+        self.bus.subscribe(
+            BrowserProfileTouched,
+            self.browser_use_service.handle_profile_touched,
+        )
+        self.bus.subscribe(
+            BrowserSessionStatusChanged,
+            self.browser_use_service.handle_session_status_changed,
+        )
+        # Projection writers MUST be subscribed before the result waiter
+        # so a browser.run that resumes on a terminal event observes the
+        # already-updated row, not the previous running state.
+        self.bus.subscribe(
+            BrowserSessionCompleted,
+            self.browser_use_service.handle_session_completed,
+        )
+        self.bus.subscribe(
+            BrowserSessionFailed,
+            self.browser_use_service.handle_session_failed,
+        )
+        self.bus.subscribe(
+            BrowserSessionStopped,
+            self.browser_use_service.handle_session_stopped,
         )
         self.bus.subscribe(
             BrowserSessionCompleted,
@@ -264,23 +345,20 @@ class HarnessApp:
             BrowserSessionStopped,
             self.browser_use_results.handle_stopped,
         )
+        self.bus.subscribe(
+            WebFetchExtractionRequested,
+            self.web_fetcher.handle_extraction_requested,
+        )
+        self.bus.subscribe(
+            WebFetchExtractionCompleted,
+            self.web_fetch_waiter.handle_completed,
+        )
+        self.bus.subscribe(
+            WebFetchExtractionFailed,
+            self.web_fetch_waiter.handle_failed,
+        )
 
-    async def _send_telegram_reply(self, event: AssistantTextProduced) -> tuple:
-        if event.reply_target is None:
-            return ()
-        if event.reply_target.kind != "telegram":
-            return ()
-        if not await self.turn_coordinator.is_current(
-            event.conversation_id,
-            event.generation,
-        ):
-            return ()
-        if self.telegram is None:
-            raise RuntimeError("telegram adapter is not running")
-        await self.telegram.send_assistant_text(event)
-        return ()
-
-    async def _send_cli_reply(self, event: AssistantTextProduced) -> tuple:
+    async def _send_cli_reply(self, event: AssistantTextProduced) -> EventBatch:
         if event.reply_target is None:
             return ()
         if event.reply_target.kind != "cli":

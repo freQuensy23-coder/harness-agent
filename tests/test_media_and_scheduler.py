@@ -6,6 +6,8 @@ from pathlib import Path
 
 import pytest
 
+from harness_agent.web_fetch import WebFetchExtractionWaiter
+from harness_agent.subagents import NullSubAgentLookup, SubAgentService
 from harness_agent.bus import EventBus
 from harness_agent.content import ContentRef
 from harness_agent.context import AgentFileSet, ContextBuilder
@@ -36,7 +38,12 @@ from harness_agent.llm import (
 )
 from harness_agent.projections import SQLiteConversationProjection
 from harness_agent.runtime import FakeUserRuntime
-from harness_agent.scheduler import SchedulerDueHandler, SchedulerPump, SQLiteScheduleStore
+from harness_agent.scheduler import (
+    SchedulerDueHandler,
+    SchedulerPump,
+    SchedulerService,
+    SQLiteScheduleStore,
+)
 from harness_agent.store import SQLiteEventStore
 from harness_agent.tasks import SQLiteTaskStore
 from harness_agent.tool_executor import ToolCallExecutor, ToolCallResultWaiter
@@ -49,8 +56,9 @@ from harness_agent.tools import (
 
 
 def test_runtime_layer_has_no_llm_context_import() -> None:
-    runtime_source = Path("src/harness_agent/runtime.py").read_text(encoding="utf-8")
-    assert "harness_agent.llm" not in runtime_source
+    runtime_package = Path("src/harness_agent/runtime")
+    for module in sorted(runtime_package.glob("*.py")):
+        assert "harness_agent.llm" not in module.read_text(encoding="utf-8"), module
 
 
 @pytest.mark.asyncio
@@ -72,8 +80,7 @@ async def test_telegram_image_is_saved_and_passed_to_llm_context(tmp_path: Path)
         context_builder=ContextBuilder(runtime=runtime),
         llm=llm,
         tool_registry=default_tool_registry(),
-        projection=projection,
-    )
+        projection=projection, sub_agent_lookup=NullSubAgentLookup())
     bus.subscribe(TelegramTextReceived, identity_handler.handle_telegram_text)
     bus.subscribe(UserTextReceived, content_handler.handle_user_text)
     bus.subscribe(UserTextReceived, conversation_projector.handle_user_text)
@@ -145,8 +152,7 @@ async def test_telegram_file_is_saved_and_referenced_without_file_bytes_in_llm(t
         context_builder=ContextBuilder(runtime=runtime),
         llm=llm,
         tool_registry=default_tool_registry(),
-        projection=projection,
-    )
+        projection=projection, sub_agent_lookup=NullSubAgentLookup())
     bus.subscribe(TelegramTextReceived, identity_handler.handle_telegram_text)
     bus.subscribe(UserTextReceived, content_handler.handle_user_text)
     bus.subscribe(UserTextReceived, conversation_projector.handle_user_text)
@@ -184,7 +190,7 @@ async def test_telegram_file_is_saved_and_referenced_without_file_bytes_in_llm(t
 
 
 @pytest.mark.asyncio
-async def test_file_read_on_image_injects_image_into_next_llm_context(tmp_path: Path) -> None:
+async def test_file_read_on_image_injects_image_into_next_llm_context(tmp_path: Path, browser_use_service: BrowserUseService, web_fetch_waiter: WebFetchExtractionWaiter, task_store: SQLiteTaskStore, schedule_store: SQLiteScheduleStore, sub_agents: SubAgentService) -> None:
     store = SQLiteEventStore(tmp_path / "events.sqlite3")
     projection = SQLiteConversationProjection(tmp_path / "messages.sqlite3")
     image_bytes = b"\x89PNG\r\n\x1a\n" + (b"image-bytes" * 3_000)
@@ -205,7 +211,7 @@ async def test_file_read_on_image_injects_image_into_next_llm_context(tmp_path: 
     )
     bus = EventBus(store)
     tool_results = ToolCallResultWaiter()
-    tool_executor = ToolCallExecutor(runtime=runtime)
+    tool_executor = ToolCallExecutor(runtime=runtime, browser_use_service=browser_use_service, bus=bus, web_fetch_waiter=web_fetch_waiter, task_store=task_store, schedule_store=schedule_store, sub_agents=sub_agents)
     conversation_projector = ConversationProjector(projection)
     agent_turn_handler = AgentTurnHandler(
         bus=bus,
@@ -213,8 +219,7 @@ async def test_file_read_on_image_injects_image_into_next_llm_context(tmp_path: 
         llm=llm,
         tool_registry=default_tool_registry(),
         projection=projection,
-        tool_results=tool_results,
-    )
+        tool_results=tool_results, sub_agent_lookup=NullSubAgentLookup())
     bus.subscribe(UserTextReceived, conversation_projector.handle_user_text)
     bus.subscribe(ToolCallRequested, tool_executor.handle_tool_call_requested)
     bus.subscribe(ToolCallCompleted, tool_results.handle_tool_call_completed)
@@ -265,7 +270,7 @@ async def test_file_read_on_image_injects_image_into_next_llm_context(tmp_path: 
 
 
 @pytest.mark.asyncio
-async def test_file_read_missing_file_returns_tool_result(tmp_path: Path) -> None:
+async def test_file_read_missing_file_returns_tool_result(tmp_path: Path, browser_use_service: BrowserUseService, web_fetch_waiter: WebFetchExtractionWaiter, task_store: SQLiteTaskStore, schedule_store: SQLiteScheduleStore, sub_agents: SubAgentService) -> None:
     store = SQLiteEventStore(tmp_path / "events.sqlite3")
     projection = SQLiteConversationProjection(tmp_path / "messages.sqlite3")
     runtime = FakeUserRuntime(
@@ -283,7 +288,7 @@ async def test_file_read_missing_file_returns_tool_result(tmp_path: Path) -> Non
     )
     bus = EventBus(store)
     tool_results = ToolCallResultWaiter()
-    tool_executor = ToolCallExecutor(runtime=runtime)
+    tool_executor = ToolCallExecutor(runtime=runtime, browser_use_service=browser_use_service, bus=bus, web_fetch_waiter=web_fetch_waiter, task_store=task_store, schedule_store=schedule_store, sub_agents=sub_agents)
     conversation_projector = ConversationProjector(projection)
     agent_turn_handler = AgentTurnHandler(
         bus=bus,
@@ -291,8 +296,7 @@ async def test_file_read_missing_file_returns_tool_result(tmp_path: Path) -> Non
         llm=llm,
         tool_registry=default_tool_registry(),
         projection=projection,
-        tool_results=tool_results,
-    )
+        tool_results=tool_results, sub_agent_lookup=NullSubAgentLookup())
     bus.subscribe(UserTextReceived, conversation_projector.handle_user_text)
     bus.subscribe(ToolCallRequested, tool_executor.handle_tool_call_requested)
     bus.subscribe(ToolCallCompleted, tool_results.handle_tool_call_completed)
@@ -327,7 +331,7 @@ async def test_file_read_missing_file_returns_tool_result(tmp_path: Path) -> Non
 
 
 @pytest.mark.asyncio
-async def test_agent_can_create_delayed_and_cron_schedules_via_tools(tmp_path: Path) -> None:
+async def test_agent_can_create_delayed_and_cron_schedules_via_tools(tmp_path: Path, browser_use_service: BrowserUseService, web_fetch_waiter: WebFetchExtractionWaiter, task_store: SQLiteTaskStore, schedule_store: SQLiteScheduleStore, sub_agents: SubAgentService) -> None:
     now = datetime(2026, 5, 19, 12, 0, tzinfo=UTC)
     schedule_store = SQLiteScheduleStore(tmp_path / "schedules.sqlite3", now=lambda: now)
     task_store = SQLiteTaskStore(tmp_path / "tasks.sqlite3")
@@ -363,16 +367,14 @@ async def test_agent_can_create_delayed_and_cron_schedules_via_tools(tmp_path: P
     tool_executor = ToolCallExecutor(
         runtime=runtime,
         task_store=task_store,
-        schedule_store=schedule_store,
-    )
+        schedule_store=schedule_store, browser_use_service=browser_use_service, bus=bus, web_fetch_waiter=web_fetch_waiter, sub_agents=sub_agents)
     agent_turn_handler = AgentTurnHandler(
         bus=bus,
         context_builder=ContextBuilder(runtime=runtime),
         llm=llm,
         tool_registry=default_tool_registry(),
         projection=projection,
-        tool_results=tool_results,
-    )
+        tool_results=tool_results, sub_agent_lookup=NullSubAgentLookup())
     bus.subscribe(UserTextReceived, ConversationProjector(projection).handle_user_text)
     bus.subscribe(ToolCallRequested, tool_executor.handle_tool_call_requested)
     bus.subscribe(ToolCallCompleted, tool_results.handle_tool_call_completed)
@@ -437,3 +439,31 @@ async def test_scheduler_due_event_becomes_fake_user_message(tmp_path: Path) -> 
     ]
     refreshed = await schedule_store.get(schedule.id)
     assert refreshed.status == "completed"
+
+
+@pytest.mark.asyncio
+async def test_scheduler_service_start_recreates_task_after_completion(
+    tmp_path: Path,
+) -> None:
+    """If the prior scheduler loop task is already done (eg the loop
+    crashed), start() must spin up a fresh running task rather than
+    refusing silently and leaving the scheduler dead."""
+    import asyncio
+
+    schedule_store = SQLiteScheduleStore(tmp_path / "schedules.sqlite3")
+    bus = EventBus(SQLiteEventStore(tmp_path / "events.sqlite3"))
+    service = SchedulerService(
+        pump=SchedulerPump(store=schedule_store, bus=bus),
+        poll_seconds=0.01,
+    )
+    done_task: asyncio.Task[None] = asyncio.create_task(asyncio.sleep(0))
+    await done_task
+    service._task = done_task  # type: ignore[attr-defined]
+    assert done_task.done()
+
+    await service.start()
+    new_task = service._task  # type: ignore[attr-defined]
+    assert new_task is not None
+    assert new_task is not done_task
+    assert not new_task.done()
+    await service.stop()

@@ -68,16 +68,33 @@ Tools Exposed To LLM
 - `skill.read`
 - `mcp.<server>.<tool>`
 
-User MCP YAML
--------------
+MCP Configuration
+-----------------
 
-User MCP config lives inside that user's Docker workspace, not in global server config.
+MCP servers can be defined at two scopes. The same stdio transport runs both:
+the server process launches inside the user's Docker container via `docker exec -i`.
+
+User scope — config lives inside that user's Docker workspace, one YAML per server.
+The user can edit, add, or remove these from their workspace.
 
 ```yaml
 # /workspace/mcp/local.yaml
 name: local
 command: ["python", "/workspace/mcp_server.py"]
 cwd: /workspace
+```
+
+Global scope — config lives in `harness.yaml` and applies to every user. The user
+cannot edit or disable these from their workspace. On name conflict, the global
+entry wins over a user entry with the same name.
+
+```yaml
+# harness.yaml
+mcp:
+  servers:
+    - name: local
+      command: ["python", "/workspace/mcp_server.py"]
+      cwd: /workspace
 ```
 
 Documentation
@@ -110,6 +127,15 @@ uv run harness-agent --config harness.yaml telegram
 Tests
 -----
 
+Unit tests — no Docker, no network, no external APIs:
+
 ```bash
 uv run pytest
+```
+
+Integration tests — require a running Docker daemon, and the OpenRouter
+config at `~/.config/harness-agent/openrouter.yaml` for the real-LLM cases:
+
+```bash
+uv run pytest tests/integration
 ```

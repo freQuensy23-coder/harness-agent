@@ -2,9 +2,30 @@ import argparse
 import asyncio
 from pathlib import Path
 
+from harness_agent.app import HarnessApp
+
+
+async def send_cli_once(
+    app: HarnessApp,
+    *,
+    text: str,
+    user_id: str,
+    conversation_id: str | None,
+) -> str:
+    """Boot the app, deliver one CLI message, drain background services.
+
+    Uses the lifecycle lease so overlapping callers share the running
+    scheduler/browser pump; the last completing call tears them down.
+    """
+    async with app.background_services():
+        return await app.send_cli(
+            text=text,
+            user_id=user_id,
+            conversation_id=conversation_id,
+        )
+
 
 def main() -> None:
-    from harness_agent.app import HarnessApp
     from harness_agent.config import load_config
 
     parser = argparse.ArgumentParser(prog="harness-agent")
@@ -26,7 +47,8 @@ def main() -> None:
         asyncio.run(app.run_telegram())
     if args.command == "ask":
         reply = asyncio.run(
-            app.send_cli(
+            send_cli_once(
+                app,
                 text=args.text,
                 user_id=args.user_id,
                 conversation_id=args.conversation_id,
