@@ -795,19 +795,17 @@ async def test_full_event_driven_image_flow_lands_image_in_next_turn_context(
 
     # Now let the (fake) generation finish.
     generator.release_event.set()
+    delivered = []
     for _ in range(80):
         await asyncio.sleep(0)
-        if any(
-            e.type == "image.job.completed"
-            for e in await event_store.list_events()
-        ):
+        history = await projection.list_llm_messages("cli:e2e")
+        delivered = [m for m in history if m.kind == "user" and m.attachments]
+        if delivered:
             break
 
     types_after_completion = [e.type for e in await event_store.list_events()]
     assert "image.job.completed" in types_after_completion
     # Projection now carries a synthetic user message with the image attached.
-    history = await projection.list_llm_messages("cli:e2e")
-    delivered = [m for m in history if m.kind == "user" and m.attachments]
     assert len(delivered) == 1
     delivered_attachment = delivered[0].attachments[0]
     assert delivered_attachment.kind == "image"
