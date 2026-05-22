@@ -1,6 +1,8 @@
 import base64
+from uuid import uuid4
 
 from harness_agent.bus import EventBus
+from harness_agent.compaction import CompactionConfig
 from harness_agent.content import content_ref_from_bytes
 from harness_agent.context import ContextBuilder
 from harness_agent.events import (
@@ -10,6 +12,7 @@ from harness_agent.events import (
     AssistantTextProduced,
     CliReplyTarget,
     CliTextReceived,
+    CompactionRequested,
     EventBase,
     TelegramReplyTarget,
     TelegramTextReceived,
@@ -19,17 +22,14 @@ from harness_agent.events import (
 )
 from harness_agent.identity import StaticIdentityResolver
 from harness_agent.llm import (
-    AssistantToolCallMessage,
     LlmRequest,
     LlmClient,
-    ToolResultMessage,
-    UserMessage,
+    estimate_request_tokens,
 )
 from harness_agent.mcp import McpManager
 from harness_agent.projections import SQLiteConversationProjection
 from harness_agent.runtime import UserRuntime
 from harness_agent.subagents import SubAgentLookup, SubAgentRecord
-from harness_agent.tool_executor import ToolCallResultWaiter
 from harness_agent.turns import ConversationTurnCoordinator
 from harness_agent.tools import (
     ToolRegistry,
@@ -162,7 +162,7 @@ class AgentTurnHandler:
         sub_agent_lookup: SubAgentLookup,
         mcp_manager: McpManager | None = None,
         turn_coordinator: ConversationTurnCoordinator | None = None,
-        tool_results: ToolCallResultWaiter | None = None,
+        compaction_config: CompactionConfig | None = None,
     ) -> None:
         self._bus = bus
         self._context_builder = context_builder
@@ -173,10 +173,8 @@ class AgentTurnHandler:
         if turn_coordinator is None:
             turn_coordinator = ConversationTurnCoordinator()
         self._turn_coordinator = turn_coordinator
-        if tool_results is None:
-            tool_results = ToolCallResultWaiter()
-        self._tool_results = tool_results
         self._sub_agent_lookup = sub_agent_lookup
+        self._compaction_config = compaction_config
 
     async def handle_user_text(self, event: UserTextReceived) -> EventBatch:
         generation = await self._turn_coordinator.request_generation(event.conversation_id)
@@ -191,107 +189,137 @@ class AgentTurnHandler:
         )
 
     async def handle_agent_turn(self, event: AgentTurnRequested) -> EventBatch:
-        await self._run_turn(event)
-        return ()
-
-    async def _run_turn(self, event: AgentTurnRequested) -> None:
-        async with self._turn_coordinator.run_slot(event.conversation_id):
-            if await self._stop_if_superseded(event):
-                return
-            context = await self._context_builder.build(event.user_id)
-            if await self._stop_if_superseded(event):
-                return
-            messages = await self._projection.list_llm_messages(event.conversation_id)
-            sub_agent_record = await self._sub_agent_for_conversation(
-                user_id=event.user_id,
-                conversation_id=event.conversation_id,
-            )
-            tools = await self._tools_for_user(event.user_id, sub_agent_record)
-            system_prompt = _system_prompt_for_turn(context.system, sub_agent_record)
-
-            while True:
-                if await self._stop_if_superseded(event):
-                    return
-                await self._bus.publish(
-                    AgentGenerationStarted(
-                        user_id=event.user_id,
-                        conversation_id=event.conversation_id,
-                        generation=event.generation,
-                        reply_target=event.reply_target,
-                    )
-                )
-                response = await self._llm.respond(
-                    LlmRequest(
-                        user_id=event.user_id,
-                        conversation_id=event.conversation_id,
-                        generation=event.generation,
-                        system=system_prompt,
-                        messages=messages,
-                        tools=tools,
-                    )
-                )
-                if await self._stop_if_superseded(event):
-                    return
-                if response.kind == "assistant_text":
-                    await self._bus.publish(
-                        AssistantTextProduced(
-                            user_id=event.user_id,
-                            conversation_id=event.conversation_id,
-                            generation=event.generation,
-                            text=response.text,
-                            reply_target=event.reply_target,
-                        )
-                    )
-                    return
-                if response.kind == "tool_call":
-                    requested = ToolCallRequested(
-                        user_id=event.user_id,
-                        conversation_id=event.conversation_id,
-                        generation=event.generation,
-                        call_id=response.call_id,
-                        tool_name=response.name,
-                        input=response.input,
-                        reply_target=event.reply_target,
-                    )
-                    self._tool_results.expect(requested)
-                    await self._bus.publish(requested)
-                    completed = await self._tool_results.wait(requested)
-                    if await self._stop_if_superseded(event):
-                        return
-                    result = completed.result
-                    messages.extend(
-                        [
-                            AssistantToolCallMessage(
-                                call_id=response.call_id,
-                                name=response.name,
-                                arguments=response.input.model_dump(mode="json"),
-                            ),
-                            ToolResultMessage(
-                                call_id=response.call_id,
-                                name=response.name,
-                                content=result.render_for_llm(response.name),
-                            ),
-                        ]
-                    )
-                    for attachment in completed.attachments:
-                        messages.append(
-                            UserMessage(
-                                text=f"Opened image file {attachment.workspace_path}",
-                                attachments=[attachment],
-                            )
-                        )
-
-    async def _stop_if_superseded(self, event: AgentTurnRequested) -> bool:
-        current_generation = await self._turn_coordinator.current_generation(
-            event.conversation_id
+        return await self._run_step(
+            user_id=event.user_id,
+            conversation_id=event.conversation_id,
+            generation=event.generation,
+            reply_target=event.reply_target,
         )
-        if current_generation == event.generation:
+
+    async def handle_tool_call_completed(self, event: ToolCallCompleted) -> EventBatch:
+        return await self._run_step(
+            user_id=event.user_id,
+            conversation_id=event.conversation_id,
+            generation=event.generation,
+            reply_target=event.reply_target,
+        )
+
+    async def _run_step(
+        self,
+        *,
+        user_id: str,
+        conversation_id: str,
+        generation: int,
+        reply_target: TelegramReplyTarget | CliReplyTarget | None,
+    ) -> EventBatch:
+        if await self._stop_if_superseded(
+            user_id=user_id,
+            conversation_id=conversation_id,
+            generation=generation,
+        ):
+            return ()
+        context = await self._context_builder.build(user_id)
+        if await self._stop_if_superseded(
+            user_id=user_id,
+            conversation_id=conversation_id,
+            generation=generation,
+        ):
+            return ()
+        messages = await self._projection.list_llm_messages(conversation_id)
+        sub_agent_record = await self._sub_agent_for_conversation(
+            user_id=user_id,
+            conversation_id=conversation_id,
+        )
+        tools = await self._tools_for_user(user_id, sub_agent_record)
+        system_prompt = _system_prompt_for_turn(context.system, sub_agent_record)
+
+        request = LlmRequest(
+            user_id=user_id,
+            conversation_id=conversation_id,
+            generation=generation,
+            system=system_prompt,
+            messages=messages,
+            tools=tools,
+        )
+        if (
+            self._compaction_config is not None
+            and estimate_request_tokens(request)
+            >= self._compaction_config.threshold
+        ):
+            await self._bus.publish(
+                CompactionRequested(
+                    compaction_id=uuid4().hex,
+                    user_id=user_id,
+                    conversation_id=conversation_id,
+                    generation=generation,
+                )
+            )
+            messages = await self._projection.list_llm_messages(conversation_id)
+            request = LlmRequest(
+                user_id=user_id,
+                conversation_id=conversation_id,
+                generation=generation,
+                system=system_prompt,
+                messages=messages,
+                tools=tools,
+            )
+
+        await self._bus.publish(
+            AgentGenerationStarted(
+                user_id=user_id,
+                conversation_id=conversation_id,
+                generation=generation,
+                reply_target=reply_target,
+            )
+        )
+        response = await self._llm.respond(request)
+        if await self._stop_if_superseded(
+            user_id=user_id,
+            conversation_id=conversation_id,
+            generation=generation,
+        ):
+            return ()
+        if response.kind == "assistant_text":
+            return (
+                AssistantTextProduced(
+                    user_id=user_id,
+                    conversation_id=conversation_id,
+                    generation=generation,
+                    text=response.text,
+                    reply_target=reply_target,
+                ),
+            )
+        if response.kind == "tool_call":
+            return (
+                ToolCallRequested(
+                    user_id=user_id,
+                    conversation_id=conversation_id,
+                    generation=generation,
+                    call_id=response.call_id,
+                    tool_name=response.name,
+                    input=response.input,
+                    reply_target=reply_target,
+                ),
+            )
+        raise ValueError(f"unsupported LLM response kind: {response.kind}")
+
+    async def _stop_if_superseded(
+        self,
+        *,
+        user_id: str,
+        conversation_id: str,
+        generation: int,
+    ) -> bool:
+        current_generation = await self._turn_coordinator.current_generation(
+            conversation_id
+        )
+        if current_generation == generation:
             return False
         await self._bus.publish(
             AgentTurnSuperseded(
-                user_id=event.user_id,
-                conversation_id=event.conversation_id,
-                generation=event.generation,
+                user_id=user_id,
+                conversation_id=conversation_id,
+                generation=generation,
                 superseded_by=current_generation,
             )
         )

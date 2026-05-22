@@ -4,15 +4,28 @@ from pathlib import Path
 
 import pytest
 
-from harness_agent.web_fetch import WebFetchExtractionWaiter
+from harness_agent.app import HarnessApp
 from harness_agent.subagents import NullSubAgentLookup, SubAgentService
+from harness_agent.web_fetch import WebFetchExtractionWaiter
 from harness_agent.bus import EventBus
+from harness_agent.compaction import CompactionConfig, CompactionService
+from harness_agent.config import (
+    BrowserUseConfig,
+    DatabaseConfig,
+    DockerConfig,
+    HarnessConfig,
+    LlmConfig,
+    RuntimeConfig,
+)
 from harness_agent.context import AgentFileSet, ContextBuilder, Skill
 from harness_agent.events import (
     AgentTurnRequested,
     AgentTurnSuperseded,
     AssistantTextProduced,
     CliTextReceived,
+    CompactionRequested,
+    CompactionSnapshotReady,
+    CompactionSummaryReady,
     TelegramTextReceived,
     ToolCallCompleted,
     ToolCallRequested,
@@ -31,6 +44,7 @@ from harness_agent.llm import (
     FakeLlmClient,
     LlmClient,
     LlmRequest,
+    LlmResponse,
     LlmToolCall,
     AssistantToolCallMessage,
     ToolResultMessage,
@@ -43,7 +57,7 @@ from harness_agent.runtime import (
     RuntimeToolResult,
 )
 from harness_agent.store import SQLiteEventStore
-from harness_agent.tool_executor import ToolCallExecutor, ToolCallResultWaiter
+from harness_agent.tool_executor import ToolCallExecutor
 from harness_agent.turns import ConversationTurnCoordinator
 from harness_agent.tools import ShellExecInput, default_tool_registry
 
@@ -222,7 +236,6 @@ async def test_tool_call_executes_in_runtime_without_exposing_docker(tmp_path: P
 
     bus = EventBus(store)
     conversation_projector = ConversationProjector(projection)
-    tool_results = ToolCallResultWaiter()
     tool_executor = ToolCallExecutor(runtime=runtime, browser_use_service=browser_use_service, bus=bus, web_fetch_waiter=web_fetch_waiter, task_store=task_store, schedule_store=schedule_store, sub_agents=sub_agents)
     agent_turn_handler = AgentTurnHandler(
         bus=bus,
@@ -230,11 +243,12 @@ async def test_tool_call_executes_in_runtime_without_exposing_docker(tmp_path: P
         llm=llm,
         tool_registry=default_tool_registry(),
         projection=projection,
-        tool_results=tool_results, sub_agent_lookup=NullSubAgentLookup())
+        sub_agent_lookup=NullSubAgentLookup())
     bus.subscribe(UserTextReceived, conversation_projector.handle_user_text)
     bus.subscribe(AssistantTextProduced, conversation_projector.handle_assistant_text)
     bus.subscribe(ToolCallRequested, tool_executor.handle_tool_call_requested)
-    bus.subscribe(ToolCallCompleted, tool_results.handle_tool_call_completed)
+    bus.subscribe(ToolCallCompleted, ConversationProjector(projection).handle_tool_call_completed)
+    bus.subscribe(ToolCallCompleted, agent_turn_handler.handle_tool_call_completed)
     bus.subscribe(UserTextReceived, agent_turn_handler.handle_user_text)
     bus.subscribe(
         AgentTurnRequested,
@@ -276,6 +290,78 @@ async def test_tool_call_executes_in_runtime_without_exposing_docker(tmp_path: P
             content="shell.exec stdout:\n/workspace\nstderr:\n\nexit_code: 0",
         ),
     ]
+
+
+@pytest.mark.asyncio
+async def test_stuck_tool_does_not_block_next_turn_for_same_conversation(tmp_path: Path) -> None:
+    store = SQLiteEventStore(tmp_path / "events.sqlite3")
+    projection = SQLiteConversationProjection(tmp_path / "messages.sqlite3")
+    runtime = FakeUserRuntime(
+        agent_files=AgentFileSet(
+            soul="SOUL",
+            agents="AGENTS",
+            user="USER",
+            tools="TOOLS",
+        )
+    )
+    llm = FakeLlmClient(
+        [
+            LlmToolCall(
+                call_id="stuck_call",
+                name="shell.exec",
+                input=ShellExecInput(command="never finishes"),
+            ),
+            AssistantText(text="second turn answered"),
+        ]
+    )
+    bus = EventBus(store)
+    conversation_projector = ConversationProjector(projection)
+    agent_turn_handler = AgentTurnHandler(
+        bus=bus,
+        context_builder=ContextBuilder(runtime=runtime),
+        llm=llm,
+        tool_registry=default_tool_registry(),
+        projection=projection,
+        sub_agent_lookup=NullSubAgentLookup())
+    tool_started = asyncio.Event()
+    release_tool = asyncio.Event()
+
+    async def hang_tool(event: ToolCallRequested) -> EventBatch:
+        tool_started.set()
+        await release_tool.wait()
+        return ()
+
+    bus.subscribe(UserTextReceived, conversation_projector.handle_user_text)
+    bus.subscribe(AssistantTextProduced, conversation_projector.handle_assistant_text)
+    bus.subscribe(ToolCallRequested, hang_tool)
+    bus.subscribe(UserTextReceived, agent_turn_handler.handle_user_text)
+    bus.subscribe(AgentTurnRequested, agent_turn_handler.handle_agent_turn)
+
+    first_publish = bus.send(
+        UserTextReceived(
+            user_id="u_1",
+            conversation_id="tg:456",
+            source="telegram",
+            text="start stuck tool",
+        )
+    )
+    await asyncio.wait_for(tool_started.wait(), timeout=1)
+
+    await asyncio.wait_for(
+        bus.publish(
+            UserTextReceived(
+                user_id="u_1",
+                conversation_id="tg:456",
+                source="telegram",
+                text="new message",
+            )
+        ),
+        timeout=1,
+    )
+
+    release_tool.set()
+    await asyncio.wait_for(first_publish, timeout=1)
+    assert ("assistant", "second turn answered") in await projection.list_messages("tg:456")
 
 
 @pytest.mark.asyncio
@@ -419,7 +505,6 @@ async def test_tool_calls_and_results_are_persisted_in_llm_history(tmp_path: Pat
     )
     bus = EventBus(store)
     coordinator = ConversationTurnCoordinator()
-    tool_results = ToolCallResultWaiter()
     tool_executor = ToolCallExecutor(runtime=runtime, browser_use_service=browser_use_service, bus=bus, web_fetch_waiter=web_fetch_waiter, task_store=task_store, schedule_store=schedule_store, sub_agents=sub_agents)
     conversation_projector = ConversationProjector(projection, turn_coordinator=coordinator)
     agent_turn_handler = AgentTurnHandler(
@@ -429,12 +514,12 @@ async def test_tool_calls_and_results_are_persisted_in_llm_history(tmp_path: Pat
         tool_registry=default_tool_registry(),
         projection=projection,
         turn_coordinator=coordinator,
-        tool_results=tool_results, sub_agent_lookup=NullSubAgentLookup())
+        sub_agent_lookup=NullSubAgentLookup())
     bus.subscribe(UserTextReceived, conversation_projector.handle_user_text)
     bus.subscribe(AssistantTextProduced, conversation_projector.handle_assistant_text)
     bus.subscribe(ToolCallRequested, tool_executor.handle_tool_call_requested)
-    bus.subscribe(ToolCallCompleted, tool_results.handle_tool_call_completed)
     bus.subscribe(ToolCallCompleted, conversation_projector.handle_tool_call_completed)
+    bus.subscribe(ToolCallCompleted, agent_turn_handler.handle_tool_call_completed)
     bus.subscribe(UserTextReceived, agent_turn_handler.handle_user_text)
     bus.subscribe(AgentTurnRequested, agent_turn_handler.handle_agent_turn)
 
@@ -505,7 +590,6 @@ async def test_tool_history_bytes_are_identical_in_next_llm_request(tmp_path: Pa
     llm = AuditedLlmClient(inner=inner_llm, store=audit_store)
     bus = EventBus(store)
     coordinator = ConversationTurnCoordinator()
-    tool_results = ToolCallResultWaiter()
     tool_executor = ToolCallExecutor(runtime=runtime, browser_use_service=browser_use_service, bus=bus, web_fetch_waiter=web_fetch_waiter, task_store=task_store, schedule_store=schedule_store, sub_agents=sub_agents)
     conversation_projector = ConversationProjector(projection, turn_coordinator=coordinator)
     agent_turn_handler = AgentTurnHandler(
@@ -515,12 +599,12 @@ async def test_tool_history_bytes_are_identical_in_next_llm_request(tmp_path: Pa
         tool_registry=default_tool_registry(),
         projection=projection,
         turn_coordinator=coordinator,
-        tool_results=tool_results, sub_agent_lookup=NullSubAgentLookup())
+        sub_agent_lookup=NullSubAgentLookup())
     bus.subscribe(UserTextReceived, conversation_projector.handle_user_text)
     bus.subscribe(AssistantTextProduced, conversation_projector.handle_assistant_text)
     bus.subscribe(ToolCallRequested, tool_executor.handle_tool_call_requested)
-    bus.subscribe(ToolCallCompleted, tool_results.handle_tool_call_completed)
     bus.subscribe(ToolCallCompleted, conversation_projector.handle_tool_call_completed)
+    bus.subscribe(ToolCallCompleted, agent_turn_handler.handle_tool_call_completed)
     bus.subscribe(UserTextReceived, agent_turn_handler.handle_user_text)
     bus.subscribe(AgentTurnRequested, agent_turn_handler.handle_agent_turn)
 
@@ -663,3 +747,504 @@ async def wait_until_generation(
 ) -> None:
     while not await coordinator.is_current(conversation_id, generation):
         await asyncio.sleep(0.01)
+
+
+@pytest.mark.asyncio
+async def test_runner_publishes_compaction_requested_when_estimate_over_threshold(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = SQLiteEventStore(tmp_path / "events.sqlite3")
+    projection = SQLiteConversationProjection(tmp_path / "messages.sqlite3")
+    runtime = FakeUserRuntime(
+        agent_files=AgentFileSet(soul="SOUL", agents="AGENTS", user="USER", tools="TOOLS"),
+    )
+    llm = FakeLlmClient([AssistantText(text="ok")])
+    bus = EventBus(store)
+    conversation_projector = ConversationProjector(projection)
+    compaction_config = CompactionConfig(max_tokens_per_model=1_000, reserve_tokens=0)
+    agent_turn_handler = AgentTurnHandler(
+        bus=bus,
+        context_builder=ContextBuilder(runtime=runtime),
+        llm=llm,
+        tool_registry=default_tool_registry(),
+        projection=projection,
+        compaction_config=compaction_config,
+        sub_agent_lookup=NullSubAgentLookup())
+
+    monkeypatch.setattr(
+        "harness_agent.handlers.estimate_request_tokens",
+        lambda _request: compaction_config.threshold + 1,
+    )
+
+    requested_events: list[CompactionRequested] = []
+
+    async def record_compaction_requested(event: CompactionRequested) -> tuple:
+        requested_events.append(event)
+        # Synthetic summary so re-read can drop the old user row.
+        all_records = await projection.list_all_context_items(event.conversation_id)
+        compacted = [r.sequence for r in all_records]
+        await projection.append_compacted_context_if_unchanged(
+            user_id=event.user_id,
+            conversation_id=event.conversation_id,
+            generation=event.generation,
+            summary="synthetic",
+            archive_path=f"/workspace/.old-sessions/{event.compaction_id}.jsonl",
+            compacted_sequences=compacted,
+            tail_sequences=[],
+            snapshot_max_sequence=max(r.sequence for r in all_records),
+        )
+        return ()
+
+    bus.subscribe(UserTextReceived, conversation_projector.handle_user_text)
+    bus.subscribe(AssistantTextProduced, conversation_projector.handle_assistant_text)
+    bus.subscribe(UserTextReceived, agent_turn_handler.handle_user_text)
+    bus.subscribe(AgentTurnRequested, agent_turn_handler.handle_agent_turn)
+    bus.subscribe(CompactionRequested, record_compaction_requested)
+
+    await bus.publish(
+        UserTextReceived(
+            user_id="u:1",
+            conversation_id="cli:compact",
+            source="cli",
+            text="hello",
+        )
+    )
+
+    assert len(requested_events) == 1
+    requested = requested_events[0]
+    assert requested.user_id == "u:1"
+    assert requested.conversation_id == "cli:compact"
+    assert requested.generation == 1
+    assert requested.compaction_id  # uuid hex, non-empty
+
+
+@pytest.mark.asyncio
+async def test_runner_re_reads_messages_after_compaction_chain_returns(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = SQLiteEventStore(tmp_path / "events.sqlite3")
+    projection = SQLiteConversationProjection(tmp_path / "messages.sqlite3")
+    runtime = FakeUserRuntime(
+        agent_files=AgentFileSet(soul="SOUL", agents="AGENTS", user="USER", tools="TOOLS"),
+    )
+    llm = FakeLlmClient([AssistantText(text="ok")])
+    bus = EventBus(store)
+    conversation_projector = ConversationProjector(projection)
+    compaction_config = CompactionConfig(max_tokens_per_model=1_000, reserve_tokens=0)
+    agent_turn_handler = AgentTurnHandler(
+        bus=bus,
+        context_builder=ContextBuilder(runtime=runtime),
+        llm=llm,
+        tool_registry=default_tool_registry(),
+        projection=projection,
+        compaction_config=compaction_config,
+        sub_agent_lookup=NullSubAgentLookup())
+
+    monkeypatch.setattr(
+        "harness_agent.handlers.estimate_request_tokens",
+        lambda _request: compaction_config.threshold + 1,
+    )
+
+    async def synthetic_compaction(event: CompactionRequested) -> tuple:
+        all_records = await projection.list_all_context_items(event.conversation_id)
+        compacted = [r.sequence for r in all_records]
+        await projection.append_compacted_context_if_unchanged(
+            user_id=event.user_id,
+            conversation_id=event.conversation_id,
+            generation=event.generation,
+            summary="prior chat condensed",
+            archive_path=f"/workspace/.old-sessions/{event.compaction_id}.jsonl",
+            compacted_sequences=compacted,
+            tail_sequences=[],
+            snapshot_max_sequence=max(r.sequence for r in all_records),
+        )
+        return ()
+
+    bus.subscribe(UserTextReceived, conversation_projector.handle_user_text)
+    bus.subscribe(AssistantTextProduced, conversation_projector.handle_assistant_text)
+    bus.subscribe(UserTextReceived, agent_turn_handler.handle_user_text)
+    bus.subscribe(AgentTurnRequested, agent_turn_handler.handle_agent_turn)
+    bus.subscribe(CompactionRequested, synthetic_compaction)
+
+    await bus.publish(
+        UserTextReceived(
+            user_id="u:1",
+            conversation_id="cli:reread",
+            source="cli",
+            text="please summarize this",
+        )
+    )
+
+    # After the compaction cascade returns, the runner re-reads messages.
+    # The LLM call sees only the synthetic summary (the prior user row was
+    # compacted into the summary by the synthetic handler).
+    assert len(llm.requests) == 1
+    assert llm.requests[0].messages == [
+        UserMessage(text="Previous conversation summary:\nprior chat condensed"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_runner_does_not_publish_compaction_when_under_threshold(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = SQLiteEventStore(tmp_path / "events.sqlite3")
+    projection = SQLiteConversationProjection(tmp_path / "messages.sqlite3")
+    runtime = FakeUserRuntime(
+        agent_files=AgentFileSet(soul="SOUL", agents="AGENTS", user="USER", tools="TOOLS"),
+    )
+    llm = FakeLlmClient([AssistantText(text="ok")])
+    bus = EventBus(store)
+    conversation_projector = ConversationProjector(projection)
+    compaction_config = CompactionConfig(max_tokens_per_model=1_000, reserve_tokens=0)
+    agent_turn_handler = AgentTurnHandler(
+        bus=bus,
+        context_builder=ContextBuilder(runtime=runtime),
+        llm=llm,
+        tool_registry=default_tool_registry(),
+        projection=projection,
+        compaction_config=compaction_config,
+        sub_agent_lookup=NullSubAgentLookup())
+
+    monkeypatch.setattr(
+        "harness_agent.handlers.estimate_request_tokens",
+        lambda _request: compaction_config.threshold - 1,
+    )
+
+    requested_events: list[CompactionRequested] = []
+
+    async def record_compaction_requested(event: CompactionRequested) -> tuple:
+        requested_events.append(event)
+        return ()
+
+    bus.subscribe(UserTextReceived, conversation_projector.handle_user_text)
+    bus.subscribe(AssistantTextProduced, conversation_projector.handle_assistant_text)
+    bus.subscribe(UserTextReceived, agent_turn_handler.handle_user_text)
+    bus.subscribe(AgentTurnRequested, agent_turn_handler.handle_agent_turn)
+    bus.subscribe(CompactionRequested, record_compaction_requested)
+
+    await bus.publish(
+        UserTextReceived(
+            user_id="u:1",
+            conversation_id="cli:no-compact",
+            source="cli",
+            text="hello",
+        )
+    )
+
+    assert requested_events == []
+    # The runner still made its single LLM call with the unmodified messages.
+    assert len(llm.requests) == 1
+    assert llm.requests[0].messages == [UserMessage(text="hello")]
+
+
+@pytest.mark.asyncio
+async def test_supersede_during_compaction_does_not_commit_stale_summary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = SQLiteEventStore(tmp_path / "events.sqlite3")
+    projection = SQLiteConversationProjection(tmp_path / "messages.sqlite3")
+    runtime = FakeUserRuntime(
+        agent_files=AgentFileSet(soul="SOUL", agents="AGENTS", user="USER", tools="TOOLS"),
+    )
+    runner_llm = FakeLlmClient(
+        [AssistantText(text="reply gen 1"), AssistantText(text="reply gen 2")]
+    )
+    compaction_llm = BlockingSummaryLlm()
+    bus = EventBus(store)
+    coordinator = ConversationTurnCoordinator()
+    conversation_projector = ConversationProjector(projection, turn_coordinator=coordinator)
+    compaction_config = CompactionConfig(max_tokens_per_model=1_000, reserve_tokens=0)
+    agent_turn_handler = AgentTurnHandler(
+        bus=bus,
+        context_builder=ContextBuilder(runtime=runtime),
+        llm=runner_llm,
+        tool_registry=default_tool_registry(),
+        projection=projection,
+        turn_coordinator=coordinator,
+        compaction_config=compaction_config,
+        sub_agent_lookup=NullSubAgentLookup())
+    compaction_service = CompactionService(
+        projection=projection,
+        llm=compaction_llm,
+        config=compaction_config,
+    )
+
+    # First turn is over threshold; second turn is well under (so it does
+    # not retrigger compaction).
+    estimate_responses = iter([compaction_config.threshold + 1, 0])
+    monkeypatch.setattr(
+        "harness_agent.handlers.estimate_request_tokens",
+        lambda _request: next(estimate_responses),
+    )
+
+    bus.subscribe(UserTextReceived, conversation_projector.handle_user_text)
+    bus.subscribe(AssistantTextProduced, conversation_projector.handle_assistant_text)
+    bus.subscribe(UserTextReceived, agent_turn_handler.handle_user_text)
+    bus.subscribe(AgentTurnRequested, agent_turn_handler.handle_agent_turn)
+    bus.subscribe(CompactionRequested, compaction_service.handle_requested)
+    bus.subscribe(CompactionSnapshotReady, compaction_service.handle_snapshot_ready)
+    bus.subscribe(CompactionSummaryReady, compaction_service.handle_summary_ready)
+
+    # Pre-seed conversation history so the boundary algorithm has enough
+    # user messages to pick a non-trivial boundary.
+    await projection.append_user_message(
+        user_id="u:1",
+        conversation_id="cli:supersede",
+        text="prior-1",
+    )
+    await projection.append_assistant_message(
+        user_id="u:1",
+        conversation_id="cli:supersede",
+        generation=0,
+        text="prior-a",
+    )
+    await projection.append_user_message(
+        user_id="u:1",
+        conversation_id="cli:supersede",
+        text="prior-2",
+    )
+
+    first = asyncio.create_task(
+        bus.publish(
+            UserTextReceived(
+                user_id="u:1",
+                conversation_id="cli:supersede",
+                source="cli",
+                text="old",
+            )
+        )
+    )
+    # Wait until the compaction LLM call begins — the cascade is mid-flight.
+    await compaction_llm.first_started.wait()
+
+    second = asyncio.create_task(
+        bus.publish(
+            UserTextReceived(
+                user_id="u:1",
+                conversation_id="cli:supersede",
+                source="cli",
+                text="new",
+            )
+        )
+    )
+    # Wait until the second turn has bumped generation (via request_generation
+    # in handle_user_text) — projector also appended its user row, bumping
+    # max(sequence) so the in-flight CAS will fail.
+    await wait_until_generation(
+        coordinator, conversation_id="cli:supersede", generation=2
+    )
+    compaction_llm.release_first.set()
+    await first
+    await second
+
+    events = await store.list_events()
+    event_types = [event.type for event in events]
+    # The cascade emitted CompactionConflicted (CAS lost), not Committed.
+    assert "compaction.conflicted" in event_types
+    assert "compaction.committed" not in event_types
+
+    # No context_summary row was written.
+    rows = await projection.list_all_context_items("cli:supersede")
+    assert all(r.item_kind != "context_summary" for r in rows)
+
+    # The second turn's LLM request saw the full uncompacted history. In the
+    # event-driven flow the stale gen-1 continuation may complete after gen 2,
+    # so select by generation instead of request order.
+    assert len(runner_llm.requests) >= 2
+    second_turn_request = next(
+        request for request in runner_llm.requests if request.generation == 2
+    )
+    assert second_turn_request.messages == [
+        UserMessage(text="prior-1"),
+        AssistantMessage(text="prior-a"),
+        UserMessage(text="prior-2"),
+        UserMessage(text="old"),
+        UserMessage(text="new"),
+    ]
+
+
+class BlockingSummaryLlm(LlmClient):
+    def __init__(self) -> None:
+        self.first_started = asyncio.Event()
+        self.release_first = asyncio.Event()
+        self.requests: list[LlmRequest] = []
+
+    async def respond(self, request: LlmRequest) -> LlmResponse:
+        self.requests.append(request)
+        if len(self.requests) == 1:
+            self.first_started.set()
+            await self.release_first.wait()
+        return AssistantText(text="<summary>stale summary</summary>")
+
+
+@pytest.mark.asyncio
+async def test_e2e_compaction_cascade_in_order(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_llm = FakeLlmClient(
+        [
+            AssistantText(text="<summary>condensed earlier turns</summary>"),
+            AssistantText(text="hello after compaction"),
+        ]
+    )
+    fake_runtime = FakeUserRuntime(
+        agent_files=AgentFileSet(soul="SOUL", agents="AGENTS", user="USER", tools="TOOLS"),
+    )
+
+    class _StubDockerRuntime(FakeUserRuntime):
+        def __init__(self, **_kwargs: object) -> None:
+            super().__init__()
+
+        # Delegate every operation to the shared fake_runtime so tests can
+        # inspect a single instance.
+        async def read_agent_files(self, user_id):  # type: ignore[override]
+            return await fake_runtime.read_agent_files(user_id)
+
+        async def list_skills(self, user_id):  # type: ignore[override]
+            return await fake_runtime.list_skills(user_id)
+
+        async def list_mcp_servers(self, user_id):  # type: ignore[override]
+            return await fake_runtime.list_mcp_servers(user_id)
+
+        async def write_content_file(self, user_id, path, content):  # type: ignore[override]
+            return await fake_runtime.write_content_file(user_id, path, content)
+
+        async def read_file_bytes(self, user_id, path, max_bytes):  # type: ignore[override]
+            return await fake_runtime.read_file_bytes(user_id, path, max_bytes)
+
+        async def shell_exec(self, user_id, input):  # type: ignore[override]
+            return await fake_runtime.shell_exec(user_id, input)
+
+        async def shell_spawn(self, user_id, input):  # type: ignore[override]
+            return await fake_runtime.shell_spawn(user_id, input)
+
+        async def shell_read(self, user_id, input):  # type: ignore[override]
+            return await fake_runtime.shell_read(user_id, input)
+
+        async def shell_kill(self, user_id, input):  # type: ignore[override]
+            return await fake_runtime.shell_kill(user_id, input)
+
+        async def file_read(self, user_id, input):  # type: ignore[override]
+            return await fake_runtime.file_read(user_id, input)
+
+        async def file_write(self, user_id, input):  # type: ignore[override]
+            return await fake_runtime.file_write(user_id, input)
+
+        async def file_edit(self, user_id, input):  # type: ignore[override]
+            return await fake_runtime.file_edit(user_id, input)
+
+        async def file_multi_edit(self, user_id, input):  # type: ignore[override]
+            return await fake_runtime.file_multi_edit(user_id, input)
+
+        async def file_glob(self, user_id, input):  # type: ignore[override]
+            return await fake_runtime.file_glob(user_id, input)
+
+        async def file_grep(self, user_id, input):  # type: ignore[override]
+            return await fake_runtime.file_grep(user_id, input)
+
+        async def file_list(self, user_id, input):  # type: ignore[override]
+            return await fake_runtime.file_list(user_id, input)
+
+    class _StubOpenAIClient(LlmClient):
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        async def respond(self, request: LlmRequest) -> LlmResponse:
+            return await fake_llm.respond(request)
+
+    monkeypatch.setattr("harness_agent.app.DockerUserRuntime", _StubDockerRuntime)
+    monkeypatch.setattr("harness_agent.app.OpenAIResponsesClient", _StubOpenAIClient)
+    # Force the runner to estimate over threshold on its first turn so the
+    # compaction cascade is exercised end-to-end through HarnessApp wiring.
+    threshold_holder: dict[str, int] = {}
+    real_estimate = "harness_agent.handlers.estimate_request_tokens"
+
+    def _over_threshold(_request: LlmRequest) -> int:
+        return threshold_holder["value"] + 1
+
+    monkeypatch.setattr(real_estimate, _over_threshold)
+
+    config = HarnessConfig(
+        database=DatabaseConfig(path=tmp_path / "harness.sqlite3"),
+        llm=LlmConfig(
+            base_url="http://example.invalid",
+            api_key="not-used",
+            model="fake-model",
+            max_tokens_per_model=1_000,
+            compaction_reserve_tokens=0,
+            compaction_keep_last_user_messages=2,
+        ),
+        runtime=RuntimeConfig(docker=DockerConfig()),
+        browser_use=BrowserUseConfig(api_key="test"),
+    )
+
+    app = HarnessApp(config=config)
+    threshold_holder["value"] = app._config.llm.max_tokens_per_model - app._config.llm.compaction_reserve_tokens  # noqa: SLF001
+
+    # Pre-seed prior conversation history so the boundary algorithm
+    # (keep_last_user_messages=2) has room to pick a real boundary.
+    await app.projection.append_user_message(
+        user_id="u:1",
+        conversation_id="cli:e2e",
+        text="prior-1",
+    )
+    await app.projection.append_assistant_message(
+        user_id="u:1",
+        conversation_id="cli:e2e",
+        generation=0,
+        text="prior-a",
+    )
+    await app.projection.append_user_message(
+        user_id="u:1",
+        conversation_id="cli:e2e",
+        text="prior-2",
+    )
+
+    await app.bus.publish(
+        UserTextReceived(
+            user_id="u:1",
+            conversation_id="cli:e2e",
+            source="cli",
+            text="new question",
+        )
+    )
+
+    events = await app.event_store.list_events()
+    event_types = [event.type for event in events]
+    assert event_types == [
+        "user.text.received",
+        "agent.turn.requested",
+        "compaction.requested",
+        "compaction.snapshot.ready",
+        "compaction.summary.ready",
+        "compaction.committed",
+        "agent.generation.started",
+        "assistant.text.produced",
+    ]
+
+    compaction_committed_index = event_types.index("compaction.committed")
+    assistant_index = event_types.index("assistant.text.produced")
+    assert compaction_committed_index < assistant_index
+
+    # The CompactionCommitted event names the archive path, and the
+    # CompactionArchiveHandler must have invoked file_write with the same path
+    # before the next turn produced AssistantTextProduced.
+    committed_event = events[compaction_committed_index]
+    assert committed_event.type == "compaction.committed"
+    archive_path = committed_event.archive_path  # type: ignore[union-attr]
+    assert archive_path.startswith("/workspace/.old-sessions/")
+    assert fake_runtime.file_write_calls, "archive handler did not call file_write"
+    written_paths = [call.path for call in fake_runtime.file_write_calls]
+    assert archive_path in written_paths
+
+    final_text = events[assistant_index].text  # type: ignore[union-attr]
+    assert final_text == "hello after compaction"
+
+    # Two LLM calls: one for the compaction summary, one for the assistant reply.
+    assert len(fake_llm.requests) == 2

@@ -39,7 +39,7 @@ from harness_agent.projections import SQLiteConversationProjection
 from harness_agent.runtime import FakeUserRuntime, RuntimeToolResult
 from harness_agent.store import SQLiteEventStore
 from harness_agent.subagents import SQLiteSubAgentStore, SubAgentService
-from harness_agent.tool_executor import ToolCallExecutor, ToolCallResultWaiter
+from harness_agent.tool_executor import ToolCallExecutor
 from harness_agent.tools import (
     AgentResultInput,
     AgentRunInput,
@@ -114,7 +114,6 @@ async def test_agent_run_subagent_can_write_file_and_return_result(tmp_path: Pat
         ]
     )
     bus = EventBus(store)
-    tool_results = ToolCallResultWaiter()
     sub_agents = SubAgentService(bus=bus, store=sub_agent_store)
     tool_executor = ToolCallExecutor(
         runtime=runtime,
@@ -126,15 +125,14 @@ async def test_agent_run_subagent_can_write_file_and_return_result(tmp_path: Pat
         llm=llm,
         tool_registry=default_tool_registry(),
         projection=projection,
-        tool_results=tool_results,
         sub_agent_lookup=sub_agents,
     )
     bus.subscribe(UserTextReceived, conversation_projector.handle_user_text)
     bus.subscribe(AssistantTextProduced, conversation_projector.handle_assistant_text)
     _wire_sub_agents(bus, sub_agents)
     bus.subscribe(ToolCallRequested, tool_executor.handle_tool_call_requested)
-    bus.subscribe(ToolCallCompleted, tool_results.handle_tool_call_completed)
     bus.subscribe(ToolCallCompleted, conversation_projector.handle_tool_call_completed)
+    bus.subscribe(ToolCallCompleted, agent_turn_handler.handle_tool_call_completed)
     bus.subscribe(UserTextReceived, agent_turn_handler.handle_user_text)
     bus.subscribe(AgentTurnRequested, agent_turn_handler.handle_agent_turn)
 
@@ -236,7 +234,6 @@ browser_use_service: BrowserUseService, web_fetch_waiter: WebFetchExtractionWait
         ]
     )
     bus = EventBus(store)
-    tool_results = ToolCallResultWaiter()
     sub_agents = SubAgentService(bus=bus, store=sub_agent_store)
     tool_executor = ToolCallExecutor(
         runtime=runtime,
@@ -248,15 +245,14 @@ browser_use_service: BrowserUseService, web_fetch_waiter: WebFetchExtractionWait
         llm=llm,
         tool_registry=default_tool_registry(),
         projection=projection,
-        tool_results=tool_results,
         sub_agent_lookup=sub_agents,
     )
     bus.subscribe(UserTextReceived, conversation_projector.handle_user_text)
     bus.subscribe(AssistantTextProduced, conversation_projector.handle_assistant_text)
     _wire_sub_agents(bus, sub_agents)
     bus.subscribe(ToolCallRequested, tool_executor.handle_tool_call_requested)
-    bus.subscribe(ToolCallCompleted, tool_results.handle_tool_call_completed)
     bus.subscribe(ToolCallCompleted, conversation_projector.handle_tool_call_completed)
+    bus.subscribe(ToolCallCompleted, agent_turn_handler.handle_tool_call_completed)
     bus.subscribe(UserTextReceived, agent_turn_handler.handle_user_text)
     bus.subscribe(AgentTurnRequested, agent_turn_handler.handle_agent_turn)
 
@@ -306,7 +302,6 @@ async def test_agent_result_returns_unknown_agent_as_tool_error(tmp_path: Path, 
         ]
     )
     bus = EventBus(store)
-    tool_results = ToolCallResultWaiter()
     sub_agents = SubAgentService(bus=bus, store=sub_agent_store)
     tool_executor = ToolCallExecutor(
         runtime=runtime,
@@ -317,14 +312,13 @@ async def test_agent_result_returns_unknown_agent_as_tool_error(tmp_path: Path, 
         llm=llm,
         tool_registry=default_tool_registry(),
         projection=projection,
-        tool_results=tool_results,
         sub_agent_lookup=sub_agents,
     )
     bus.subscribe(UserTextReceived, ConversationProjector(projection).handle_user_text)
     _wire_sub_agents(bus, sub_agents)
     bus.subscribe(ToolCallRequested, tool_executor.handle_tool_call_requested)
-    bus.subscribe(ToolCallCompleted, tool_results.handle_tool_call_completed)
     bus.subscribe(ToolCallCompleted, ConversationProjector(projection).handle_tool_call_completed)
+    bus.subscribe(ToolCallCompleted, agent_turn_handler.handle_tool_call_completed)
     bus.subscribe(UserTextReceived, agent_turn_handler.handle_user_text)
     bus.subscribe(AgentTurnRequested, agent_turn_handler.handle_agent_turn)
 
@@ -472,7 +466,6 @@ async def test_subagent_timeout_is_failed_event(tmp_path: Path) -> None:
         llm=hanging_llm,
         tool_registry=default_tool_registry(),
         projection=projection,
-        tool_results=ToolCallResultWaiter(),
         sub_agent_lookup=sub_agents,
     )
     bus.subscribe(UserTextReceived, ConversationProjector(projection).handle_user_text)
@@ -540,7 +533,6 @@ async def test_subagent_child_turn_error_publishes_failed_event(tmp_path: Path, 
         child_error="upstream model exploded",
     )
     bus = EventBus(store)
-    tool_results = ToolCallResultWaiter()
     sub_agents = SubAgentService(bus=bus, store=sub_agent_store)
     tool_executor = ToolCallExecutor(
         runtime=runtime,
@@ -552,15 +544,14 @@ async def test_subagent_child_turn_error_publishes_failed_event(tmp_path: Path, 
         llm=llm,
         tool_registry=default_tool_registry(),
         projection=projection,
-        tool_results=tool_results,
         sub_agent_lookup=sub_agents,
     )
     bus.subscribe(UserTextReceived, conversation_projector.handle_user_text)
     bus.subscribe(AssistantTextProduced, conversation_projector.handle_assistant_text)
     _wire_sub_agents(bus, sub_agents)
     bus.subscribe(ToolCallRequested, tool_executor.handle_tool_call_requested)
-    bus.subscribe(ToolCallCompleted, tool_results.handle_tool_call_completed)
     bus.subscribe(ToolCallCompleted, conversation_projector.handle_tool_call_completed)
+    bus.subscribe(ToolCallCompleted, agent_turn_handler.handle_tool_call_completed)
     bus.subscribe(UserTextReceived, agent_turn_handler.handle_user_text)
     bus.subscribe(AgentTurnRequested, agent_turn_handler.handle_agent_turn)
 
@@ -668,7 +659,6 @@ async def test_spawn_returns_running_snapshot_even_if_child_completes_fast(
     )
     llm = FakeLlmClient([AssistantText(text="instant child reply")])
     bus = EventBus(store)
-    tool_results = ToolCallResultWaiter()
     sub_agents = SubAgentService(bus=bus, store=sub_agent_store)
     conversation_projector = ConversationProjector(projection)
     agent_turn_handler = AgentTurnHandler(
@@ -677,7 +667,6 @@ async def test_spawn_returns_running_snapshot_even_if_child_completes_fast(
         llm=llm,
         tool_registry=default_tool_registry(),
         projection=projection,
-        tool_results=tool_results,
         sub_agent_lookup=sub_agents,
     )
     bus.subscribe(UserTextReceived, conversation_projector.handle_user_text)

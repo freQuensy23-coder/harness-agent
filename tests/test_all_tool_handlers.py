@@ -20,7 +20,7 @@ from harness_agent.scheduler import SQLiteScheduleStore
 from harness_agent.store import SQLiteEventStore
 from harness_agent.subagents import SubAgentRecord, NullSubAgentLookup, SubAgentService
 from harness_agent.tasks import SQLiteTaskStore
-from harness_agent.tool_executor import ToolCallExecutor, ToolCallResultWaiter
+from harness_agent.tool_executor import ToolCallExecutor
 from harness_agent.tools import (
     AgentCancelInput,
     AgentListInput,
@@ -148,7 +148,6 @@ async def test_every_exposed_tool_completes_through_agent_turn_handler(tmp_path:
             ),
         ]
     )
-    tool_results = ToolCallResultWaiter()
     mcp_manager = FakeMcpManager()
     handler = AgentTurnHandler(
         bus=bus,
@@ -157,7 +156,7 @@ async def test_every_exposed_tool_completes_through_agent_turn_handler(tmp_path:
         tool_registry=registry,
         projection=projection,
         mcp_manager=mcp_manager,
-        tool_results=tool_results, sub_agent_lookup=NullSubAgentLookup())
+        sub_agent_lookup=NullSubAgentLookup())
     from harness_agent.web_fetch import WebFetchExtractionWaiter
     web_fetch_waiter = WebFetchExtractionWaiter()
     tool_executor = ToolCallExecutor(
@@ -171,7 +170,8 @@ async def test_every_exposed_tool_completes_through_agent_turn_handler(tmp_path:
     fake_web = FakeWebFetcher()
     bus.subscribe(UserTextReceived, projector.handle_user_text)
     bus.subscribe(ToolCallRequested, tool_executor.handle_tool_call_requested)
-    bus.subscribe(ToolCallCompleted, tool_results.handle_tool_call_completed)
+    bus.subscribe(ToolCallCompleted, ConversationProjector(projection).handle_tool_call_completed)
+    bus.subscribe(ToolCallCompleted, handler.handle_tool_call_completed)
     bus.subscribe(UserTextReceived, handler.handle_user_text)
     bus.subscribe(AgentTurnRequested, handler.handle_agent_turn)
     bus.subscribe(events.WebFetchExtractionRequested, fake_web.handle_extraction_requested)

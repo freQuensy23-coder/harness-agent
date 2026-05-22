@@ -25,6 +25,9 @@ class LlmConfig(BaseModel):
     base_url: str = "https://openrouter.ai/api/v1"
     api_key: str = "replace-me"
     model: str = "z-ai/glm-5v-turbo"
+    max_tokens_per_model: int = 128_000
+    compaction_reserve_tokens: int = 15_000
+    compaction_keep_last_user_messages: int = 2
 
 
 class TelegramConfig(BaseModel):

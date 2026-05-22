@@ -73,7 +73,6 @@ async def test_file_write_read_edit_and_shell_exec_are_routed(tmp_path: Path, br
     )
     bus = EventBus(store)
     task_store = SQLiteTaskStore(tmp_path / "tasks.sqlite3")
-    tool_results = ToolCallResultWaiter()
     tool_executor = ToolCallExecutor(runtime=runtime, task_store=task_store, browser_use_service=browser_use_service, bus=bus, web_fetch_waiter=web_fetch_waiter, schedule_store=schedule_store, sub_agents=sub_agents)
     agent_turn_handler = AgentTurnHandler(
         bus=bus,
@@ -81,10 +80,11 @@ async def test_file_write_read_edit_and_shell_exec_are_routed(tmp_path: Path, br
         llm=llm,
         tool_registry=default_tool_registry(),
         projection=projection,
-        tool_results=tool_results, sub_agent_lookup=NullSubAgentLookup())
+        sub_agent_lookup=NullSubAgentLookup())
     bus.subscribe(UserTextReceived, ConversationProjector(projection).handle_user_text)
     bus.subscribe(ToolCallRequested, tool_executor.handle_tool_call_requested)
-    bus.subscribe(ToolCallCompleted, tool_results.handle_tool_call_completed)
+    bus.subscribe(ToolCallCompleted, ConversationProjector(projection).handle_tool_call_completed)
+    bus.subscribe(ToolCallCompleted, agent_turn_handler.handle_tool_call_completed)
     bus.subscribe(UserTextReceived, agent_turn_handler.handle_user_text)
     bus.subscribe(
         AgentTurnRequested,
@@ -170,7 +170,6 @@ async def test_task_tool_is_persisted(tmp_path: Path, browser_use_service: Brows
         ]
     )
     bus = EventBus(store)
-    tool_results = ToolCallResultWaiter()
     tool_executor = ToolCallExecutor(runtime=runtime, task_store=task_store, browser_use_service=browser_use_service, bus=bus, web_fetch_waiter=web_fetch_waiter, schedule_store=schedule_store, sub_agents=sub_agents)
     agent_turn_handler = AgentTurnHandler(
         bus=bus,
@@ -178,10 +177,11 @@ async def test_task_tool_is_persisted(tmp_path: Path, browser_use_service: Brows
         llm=llm,
         tool_registry=default_tool_registry(),
         projection=projection,
-        tool_results=tool_results, sub_agent_lookup=NullSubAgentLookup())
+        sub_agent_lookup=NullSubAgentLookup())
     bus.subscribe(UserTextReceived, ConversationProjector(projection).handle_user_text)
     bus.subscribe(ToolCallRequested, tool_executor.handle_tool_call_requested)
-    bus.subscribe(ToolCallCompleted, tool_results.handle_tool_call_completed)
+    bus.subscribe(ToolCallCompleted, ConversationProjector(projection).handle_tool_call_completed)
+    bus.subscribe(ToolCallCompleted, agent_turn_handler.handle_tool_call_completed)
     bus.subscribe(UserTextReceived, agent_turn_handler.handle_user_text)
     bus.subscribe(
         AgentTurnRequested,
@@ -722,7 +722,6 @@ async def test_web_fetch_result_does_not_expose_raw_markdown_to_main_history(tmp
     store = SQLiteEventStore(tmp_path / "events.sqlite3")
     projection = SQLiteConversationProjection(tmp_path / "messages.sqlite3")
     bus = EventBus(store)
-    tool_results = ToolCallResultWaiter()
     llm = FakeLlmClient(
         [
             LlmToolCall(
@@ -751,7 +750,7 @@ async def test_web_fetch_result_does_not_expose_raw_markdown_to_main_history(tmp
         llm=llm,
         tool_registry=default_tool_registry(),
         projection=projection,
-        tool_results=tool_results, sub_agent_lookup=NullSubAgentLookup())
+        sub_agent_lookup=NullSubAgentLookup())
     fetcher = HttpxWebFetcher(llm=web_llm, transport=transport)
     web_fetch_waiter = WebFetchExtractionWaiter()
     tool_executor = ToolCallExecutor(
@@ -761,8 +760,8 @@ async def test_web_fetch_result_does_not_expose_raw_markdown_to_main_history(tmp
         bus=bus, task_store=task_store, schedule_store=schedule_store, sub_agents=sub_agents)
     bus.subscribe(UserTextReceived, ConversationProjector(projection).handle_user_text)
     bus.subscribe(ToolCallRequested, tool_executor.handle_tool_call_requested)
-    bus.subscribe(ToolCallCompleted, tool_results.handle_tool_call_completed)
     bus.subscribe(ToolCallCompleted, ConversationProjector(projection).handle_tool_call_completed)
+    bus.subscribe(ToolCallCompleted, handler.handle_tool_call_completed)
     bus.subscribe(UserTextReceived, handler.handle_user_text)
     bus.subscribe(AgentTurnRequested, handler.handle_agent_turn)
     bus.subscribe(events.WebFetchExtractionRequested, fetcher.handle_extraction_requested)
