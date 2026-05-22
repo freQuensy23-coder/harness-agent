@@ -1,6 +1,6 @@
 from typing import Any, Literal, cast
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 class ShellExecInput(BaseModel):
@@ -110,6 +110,12 @@ class ScheduleOnceInput(BaseModel):
     message: str
     run_at_utc: str | None = None
     delay_seconds: int | None = Field(default=None, ge=0)
+
+    @model_validator(mode="after")
+    def reject_conflicting_time_selectors(self) -> "ScheduleOnceInput":
+        if self.run_at_utc is not None and self.delay_seconds is not None:
+            raise ValueError("provide at most one of run_at_utc or delay_seconds")
+        return self
 
 
 class ScheduleCronInput(BaseModel):
@@ -355,18 +361,20 @@ def parse_known_tool_input(name: str, payload: Any) -> ToolInput:
 
 def default_tool_registry(
     *,
+    include_web_fetch: bool = True,
+    include_image_generation: bool = True,
+    include_tasks: bool = True,
+    include_schedules: bool = True,
+    include_agents: bool = True,
     include_memory: bool = True,
     include_session_search: bool = True,
 ) -> ToolRegistry:
     """Build the registry of tools exposed to the model.
 
-    `memory` and `session.search` are conditionally included so callers
-    that have no MemoryService / SessionSearchService configured can
-    omit them. The two flags are independent — exposing one without the
-    other is supported.
+    The web, image, task, schedule, and sub-agent groups are filtered by
+    callers that intentionally run without those subsystems.
     """
-    return ToolRegistry(
-        tools=[
+    tools = [
             ToolSpec(
                 name="shell.exec",
                 description="Run a shell command in the user's workspace.",
@@ -585,7 +593,42 @@ def default_tool_registry(
                 input_model=AgentCancelInput,
             ),
         ]
-    ).filter_tools(
-        include_memory=include_memory,
-        include_session_search=include_session_search,
-    )
+    disabled: set[str] = set()
+    if not include_web_fetch:
+        disabled.add("web.fetch")
+    if not include_image_generation:
+        disabled.update({"image.generate", "image.status"})
+    if not include_tasks:
+        disabled.update(
+            {
+                "task.create",
+                "task.get",
+                "task.list",
+                "task.update",
+                "task.stop",
+            }
+        )
+    if not include_schedules:
+        disabled.update(
+            {
+                "schedule.once",
+                "schedule.cron",
+                "schedule.list",
+                "schedule.cancel",
+            }
+        )
+    if not include_agents:
+        disabled.update(
+            {
+                "agent.run",
+                "agent.spawn",
+                "agent.result",
+                "agent.list",
+                "agent.cancel",
+            }
+        )
+    if not include_memory:
+        disabled.add("memory")
+    if not include_session_search:
+        disabled.add("session.search")
+    return ToolRegistry(tools=[tool for tool in tools if tool.name not in disabled])

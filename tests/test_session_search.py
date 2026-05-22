@@ -11,6 +11,7 @@ from harness_agent.events import (
     ToolCallRequested,
     UserTextReceived,
 )
+from harness_agent.memory_service import MemoryService
 from harness_agent.llm import AssistantText, FakeLlmClient
 from harness_agent.runtime import RuntimeToolResult
 from harness_agent.runtime.fake import FakeUserRuntime
@@ -20,6 +21,26 @@ from harness_agent.store import SQLiteEventStore
 from harness_agent.tool_executor import ToolCallExecutor
 from harness_agent.tools import SessionSearchInput, ShellExecInput
 from harness_agent.turns import ConversationTurnCoordinator
+
+
+def tool_executor_for_test(
+    *,
+    runtime,
+    memory_service=None,
+    session_search=None,
+    session_search_llm=None,
+    **kwargs,
+):
+    return ToolCallExecutor(
+        runtime=runtime,
+        memory_service=memory_service or MemoryService(runtime=runtime),
+        session_search=session_search
+        or SessionSearchService(
+            runtime=runtime,
+            llm=session_search_llm or FakeLlmClient([]),
+        ),
+        **kwargs,
+    )
 
 
 async def _coord_at(conversation_id: str, generation: int) -> ConversationTurnCoordinator:
@@ -482,7 +503,7 @@ async def test_session_search_through_tool_call_executor(tmp_path: Path) -> None
     )
     llm = FakeLlmClient([AssistantText(text="Earlier the user asked about deploy.")])
     service = SessionSearchService(runtime=runtime, llm=llm)
-    executor = ToolCallExecutor(runtime=runtime, session_search=service)
+    executor = tool_executor_for_test(runtime=runtime, session_search=service)
     store = SQLiteEventStore(tmp_path / "events.sqlite3")
     bus = EventBus(store)
     bus.subscribe(ToolCallRequested, executor.handle_tool_call_requested)

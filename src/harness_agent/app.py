@@ -72,7 +72,6 @@ from harness_agent.image_jobs import (
     ImageJobService,
     SQLiteImageJobStore,
 )
-from harness_agent.tools import default_tool_registry
 from harness_agent.web_fetch import HttpxWebFetcher
 
 
@@ -98,6 +97,10 @@ class HarnessApp:
         self.task_store = SQLiteTaskStore(tasks_path)
         self.bus = EventBus(self.event_store)
         self.turn_coordinator = ConversationTurnCoordinator()
+        self.scheduler_service = SchedulerService(
+            pump=SchedulerPump(store=self.schedule_store, bus=self.bus),
+            poll_seconds=self._config.scheduler.poll_seconds,
+        )
         self.runtime = DockerUserRuntime(
             image=config.runtime.docker.image,
             container_prefix=config.runtime.docker.container_prefix,
@@ -136,7 +139,6 @@ class HarnessApp:
             runtime=self.runtime,
         )
         self.telegram: AiogramTelegramAdapter | None = None
-        self.scheduler_service: SchedulerService | None = None
         self._cli_replies: dict[str, Queue[str]] = {}
         self._wire()
 
@@ -166,15 +168,8 @@ class HarnessApp:
             raise RuntimeError("telegram.enabled is false")
         if self._config.telegram.bot_token is None:
             raise RuntimeError("telegram.bot_token is required when telegram is enabled")
-        self.telegram = AiogramTelegramAdapter(
-            token=self._config.telegram.bot_token,
-            bus=self.bus,
-        )
+        self.telegram = AiogramTelegramAdapter(token=self._config.telegram.bot_token, bus=self.bus)
         self.telegram.register_outbound_handlers()
-        self.scheduler_service = SchedulerService(
-            pump=SchedulerPump(store=self.schedule_store, bus=self.bus),
-            poll_seconds=self._config.scheduler.poll_seconds,
-        )
         await self.scheduler_service.start()
         logger.info("Starting Telegram polling")
         try:
@@ -193,17 +188,6 @@ class HarnessApp:
             max_tokens_per_model=self._config.llm.max_tokens_per_model,
             reserve_tokens=self._config.llm.compaction_reserve_tokens,
             keep_last_user_messages=self._config.llm.compaction_keep_last_user_messages,
-        )
-        agent_turn_handler = AgentTurnHandler(
-            bus=self.bus,
-            context_builder=ContextBuilder(runtime=self.runtime),
-            llm=self.llm,
-            tool_registry=default_tool_registry(),
-            projection=self.projection,
-            mcp_manager=self.mcp_manager,
-            turn_coordinator=self.turn_coordinator,
-            sub_agent_lookup=self.sub_agents,
-            compaction_config=compaction_config,
         )
         compaction_service = CompactionService(
             projection=self.projection,
@@ -230,6 +214,17 @@ class HarnessApp:
             memory_service=self.memory_service,
             session_search=self.session_search_service,
         )
+        agent_turn_handler = AgentTurnHandler(
+            bus=self.bus,
+            context_builder=ContextBuilder(runtime=self.runtime),
+            llm=self.llm,
+            tool_registry=tool_call_executor.tool_registry(),
+            projection=self.projection,
+            mcp_manager=self.mcp_manager,
+            turn_coordinator=self.turn_coordinator,
+            sub_agent_lookup=self.sub_agents,
+            compaction_config=compaction_config,
+        )
         scheduler_due_handler = SchedulerDueHandler()
         session_log_writer = SessionLogWriter(
             runtime=self.runtime,
@@ -239,7 +234,7 @@ class HarnessApp:
             bus=self.bus,
             llm=self.llm,
             projection=self.projection,
-            tool_registry=default_tool_registry(),
+            tool_registry=tool_call_executor.tool_registry(),
             turn_coordinator=self.turn_coordinator,
             nudge_interval=self._config.memory.nudge_interval,
             max_iterations=self._config.memory.review_max_iterations,

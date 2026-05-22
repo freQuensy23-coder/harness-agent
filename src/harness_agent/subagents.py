@@ -201,7 +201,7 @@ class SQLiteSubAgentStore:
         result: str | None,
         error: str | None,
     ) -> SubAgentRecord:
-        record = await self._transition_row(
+        record = await self._transition_running(
             agent_id=agent_id,
             status=status,
             result=result,
@@ -221,69 +221,57 @@ class SQLiteSubAgentStore:
         result: str | None,
         error: str | None,
     ) -> SubAgentRecord | None:
-        return await self._transition_row(
+        now = datetime.now(UTC)
+        await self._ensure_schema()
+        async with aiosqlite.connect(self._path) as db:
+            await db.execute(
+                """
+                update sub_agents
+                set status = ?, result = ?, error = ?, updated_at = ?
+                where id = ?
+                  and user_id = ?
+                  and parent_conversation_id = ?
+                  and status = ?
+                """,
+                (
+                    status,
+                    result,
+                    error,
+                    now.isoformat(),
+                    agent_id,
+                    user_id,
+                    parent_conversation_id,
+                    "running",
+                ),
+            )
+            await db.commit()
+        return await self.get_for_parent(
             agent_id=agent_id,
-            status=status,
-            result=result,
-            error=error,
             user_id=user_id,
             parent_conversation_id=parent_conversation_id,
         )
 
-    async def _transition_row(
+    async def _transition_running(
         self,
         *,
         agent_id: str,
         status: SubAgentStatus,
         result: str | None,
         error: str | None,
-        user_id: str | None = None,
-        parent_conversation_id: str | None = None,
     ) -> SubAgentRecord | None:
-        if user_id is not None and parent_conversation_id is None:
-            raise ValueError("parent_conversation_id is required")
         now = datetime.now(UTC)
         await self._ensure_schema()
         async with aiosqlite.connect(self._path) as db:
-            if user_id is None:
-                await db.execute(
-                    """
-                    update sub_agents
-                    set status = ?, result = ?, error = ?, updated_at = ?
-                    where id = ? and status = ?
-                    """,
-                    (status, result, error, now.isoformat(), agent_id, "running"),
-                )
-            else:
-                await db.execute(
-                    """
-                    update sub_agents
-                    set status = ?, result = ?, error = ?, updated_at = ?
-                    where id = ?
-                      and user_id = ?
-                      and parent_conversation_id = ?
-                      and status = ?
-                    """,
-                    (
-                        status,
-                        result,
-                        error,
-                        now.isoformat(),
-                        agent_id,
-                        user_id,
-                        parent_conversation_id,
-                        "running",
-                    ),
-                )
+            await db.execute(
+                """
+                update sub_agents
+                set status = ?, result = ?, error = ?, updated_at = ?
+                where id = ? and status = ?
+                """,
+                (status, result, error, now.isoformat(), agent_id, "running"),
+            )
             await db.commit()
-        if user_id is None:
-            return await self.get(agent_id)
-        assert parent_conversation_id is not None
-        return await self.get_for_parent(
-            agent_id=agent_id,
-            user_id=user_id,
-            parent_conversation_id=parent_conversation_id,
-        )
+        return await self.get(agent_id)
 
     async def _ensure_schema(self) -> None:
         self._path.parent.mkdir(parents=True, exist_ok=True)
