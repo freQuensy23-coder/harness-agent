@@ -38,7 +38,7 @@ from harness_agent.projections import SQLiteConversationProjection
 from harness_agent.runtime import FakeUserRuntime, RuntimeToolResult
 from harness_agent.session_search_service import SessionSearchService
 from harness_agent.store import SQLiteEventStore
-from harness_agent.tool_executor import ToolCallExecutor, ToolCallResultWaiter
+from harness_agent.tool_executor import ToolCallExecutor
 from harness_agent.turns import ConversationTurnCoordinator
 from harness_agent.tools import (
     ImageGenerateInput,
@@ -282,7 +282,6 @@ async def test_image_status_attaches_image_when_completed(tmp_path: Path) -> Non
             AssistantText(text="done"),
         ]
     )
-    tool_results = ToolCallResultWaiter()
     coordinator = ConversationTurnCoordinator()
     handler = AgentTurnHandler(
         bus=bus,
@@ -298,7 +297,6 @@ async def test_image_status_attaches_image_when_completed(tmp_path: Path) -> Non
         ConversationProjector(projection, turn_coordinator=coordinator).handle_user_text,
     )
     bus.subscribe(ToolCallRequested, tool_executor.handle_tool_call_requested)
-    bus.subscribe(ToolCallCompleted, tool_results.handle_tool_call_completed)
     bus.subscribe(
         ToolCallCompleted,
         ConversationProjector(
@@ -744,7 +742,6 @@ async def test_full_event_driven_image_flow_lands_image_in_next_turn_context(
             AssistantText(text="here is your image"),
         ]
     )
-    tool_results = ToolCallResultWaiter()
     coordinator = ConversationTurnCoordinator()
     handler = AgentTurnHandler(
         bus=bus,
@@ -760,7 +757,6 @@ async def test_full_event_driven_image_flow_lands_image_in_next_turn_context(
         ConversationProjector(projection, turn_coordinator=coordinator).handle_user_text,
     )
     bus.subscribe(ToolCallRequested, tool_executor.handle_tool_call_requested)
-    bus.subscribe(ToolCallCompleted, tool_results.handle_tool_call_completed)
     bus.subscribe(
         ToolCallCompleted,
         ConversationProjector(
