@@ -35,6 +35,7 @@ from harness_agent.handlers import (
     TelegramReplyHandler,
 )
 from harness_agent.identity import StaticIdentityResolver
+from harness_agent.memory_service import MemoryService
 from harness_agent.llm import (
     AssistantText,
     AssistantMessage,
@@ -54,9 +55,30 @@ from harness_agent.runtime import (
     RuntimeToolResult,
 )
 from harness_agent.store import SQLiteEventStore
+from harness_agent.session_search_service import SessionSearchService
 from harness_agent.tool_executor import ToolCallExecutor, ToolCallResultWaiter
 from harness_agent.turns import ConversationTurnCoordinator
 from harness_agent.tools import ShellExecInput, default_tool_registry
+
+
+def tool_executor_for_test(
+    *,
+    runtime,
+    memory_service=None,
+    session_search=None,
+    session_search_llm=None,
+    **kwargs,
+):
+    return ToolCallExecutor(
+        runtime=runtime,
+        memory_service=memory_service or MemoryService(runtime=runtime),
+        session_search=session_search
+        or SessionSearchService(
+            runtime=runtime,
+            llm=session_search_llm or FakeLlmClient([]),
+        ),
+        **kwargs,
+    )
 
 
 @pytest.mark.asyncio
@@ -82,14 +104,17 @@ async def test_telegram_say_hi_builds_context_from_runtime_and_replies(tmp_path:
     replies: list[tuple[int, str]] = []
 
     bus = EventBus(store)
+    coordinator = ConversationTurnCoordinator()
+    tool_results = ToolCallResultWaiter()
     identity_handler = IdentityHandler(StaticIdentityResolver())
-    conversation_projector = ConversationProjector(projection)
+    conversation_projector = ConversationProjector(projection, turn_coordinator=coordinator)
     agent_turn_handler = AgentTurnHandler(
         bus=bus,
         context_builder=ContextBuilder(runtime=runtime),
         llm=llm,
         tool_registry=default_tool_registry(),
         projection=projection,
+        turn_coordinator=coordinator,
     )
     bus.subscribe(TelegramTextReceived, identity_handler.handle_telegram_text)
     bus.subscribe(UserTextReceived, conversation_projector.handle_user_text)
@@ -134,6 +159,7 @@ async def test_telegram_say_hi_builds_context_from_runtime_and_replies(tmp_path:
     assert "Persistent memory:" in request.system
     assert "- image.generate starts an async Gemini" in request.system
     assert "- image.status returns the job status" in request.system
+    assert "- schedule.once schedules one future synthetic user message." in request.system
     assert request.messages == [UserMessage(text="Say hi")]
     assert [tool.name for tool in request.tools] == [
         "shell.exec",
@@ -206,22 +232,23 @@ async def test_tool_call_executes_in_runtime_without_exposing_docker(tmp_path: P
     )
 
     bus = EventBus(store)
-    conversation_projector = ConversationProjector(projection)
+    coordinator = ConversationTurnCoordinator()
+    conversation_projector = ConversationProjector(projection, turn_coordinator=coordinator)
     tool_results = ToolCallResultWaiter()
-    tool_executor = ToolCallExecutor(runtime=runtime)
+    tool_executor = tool_executor_for_test(runtime=runtime)
     agent_turn_handler = AgentTurnHandler(
         bus=bus,
         context_builder=ContextBuilder(runtime=runtime),
         llm=llm,
         tool_registry=default_tool_registry(),
         projection=projection,
-        tool_results=tool_results,
+        turn_coordinator=coordinator,
     )
     bus.subscribe(UserTextReceived, conversation_projector.handle_user_text)
     bus.subscribe(AssistantTextProduced, conversation_projector.handle_assistant_text)
     bus.subscribe(ToolCallRequested, tool_executor.handle_tool_call_requested)
     bus.subscribe(ToolCallCompleted, tool_results.handle_tool_call_completed)
-    bus.subscribe(ToolCallCompleted, ConversationProjector(projection).handle_tool_call_completed)
+    bus.subscribe(ToolCallCompleted, ConversationProjector(projection, turn_coordinator=coordinator).handle_tool_call_completed)
     bus.subscribe(ToolCallCompleted, agent_turn_handler.handle_tool_call_completed)
     bus.subscribe(UserTextReceived, agent_turn_handler.handle_user_text)
     bus.subscribe(
@@ -289,13 +316,15 @@ async def test_stuck_tool_does_not_block_next_turn_for_same_conversation(tmp_pat
         ]
     )
     bus = EventBus(store)
-    conversation_projector = ConversationProjector(projection)
+    coordinator = ConversationTurnCoordinator()
+    conversation_projector = ConversationProjector(projection, turn_coordinator=coordinator)
     agent_turn_handler = AgentTurnHandler(
         bus=bus,
         context_builder=ContextBuilder(runtime=runtime),
         llm=llm,
         tool_registry=default_tool_registry(),
         projection=projection,
+        turn_coordinator=coordinator,
     )
     tool_started = asyncio.Event()
     release_tool = asyncio.Event()
@@ -421,13 +450,16 @@ async def test_agent_turn_uses_persisted_conversation_history(tmp_path: Path) ->
     )
     llm = FakeLlmClient([AssistantText(text="first"), AssistantText(text="second")])
     bus = EventBus(store)
-    conversation_projector = ConversationProjector(projection)
+    coordinator = ConversationTurnCoordinator()
+    tool_results = ToolCallResultWaiter()
+    conversation_projector = ConversationProjector(projection, turn_coordinator=coordinator)
     agent_turn_handler = AgentTurnHandler(
         bus=bus,
         context_builder=ContextBuilder(runtime=runtime),
         llm=llm,
         tool_registry=default_tool_registry(),
         projection=projection,
+        turn_coordinator=coordinator,
     )
     bus.subscribe(UserTextReceived, conversation_projector.handle_user_text)
     bus.subscribe(AssistantTextProduced, conversation_projector.handle_assistant_text)
@@ -481,7 +513,7 @@ async def test_tool_calls_and_results_are_persisted_in_llm_history(tmp_path: Pat
     bus = EventBus(store)
     coordinator = ConversationTurnCoordinator()
     tool_results = ToolCallResultWaiter()
-    tool_executor = ToolCallExecutor(runtime=runtime)
+    tool_executor = tool_executor_for_test(runtime=runtime)
     conversation_projector = ConversationProjector(projection, turn_coordinator=coordinator)
     agent_turn_handler = AgentTurnHandler(
         bus=bus,
@@ -490,7 +522,6 @@ async def test_tool_calls_and_results_are_persisted_in_llm_history(tmp_path: Pat
         tool_registry=default_tool_registry(),
         projection=projection,
         turn_coordinator=coordinator,
-        tool_results=tool_results,
     )
     bus.subscribe(UserTextReceived, conversation_projector.handle_user_text)
     bus.subscribe(AssistantTextProduced, conversation_projector.handle_assistant_text)
@@ -569,7 +600,7 @@ async def test_tool_history_bytes_are_identical_in_next_llm_request(tmp_path: Pa
     bus = EventBus(store)
     coordinator = ConversationTurnCoordinator()
     tool_results = ToolCallResultWaiter()
-    tool_executor = ToolCallExecutor(runtime=runtime)
+    tool_executor = tool_executor_for_test(runtime=runtime)
     conversation_projector = ConversationProjector(projection, turn_coordinator=coordinator)
     agent_turn_handler = AgentTurnHandler(
         bus=bus,
@@ -578,7 +609,6 @@ async def test_tool_history_bytes_are_identical_in_next_llm_request(tmp_path: Pa
         tool_registry=default_tool_registry(),
         projection=projection,
         turn_coordinator=coordinator,
-        tool_results=tool_results,
     )
     bus.subscribe(UserTextReceived, conversation_projector.handle_user_text)
     bus.subscribe(AssistantTextProduced, conversation_projector.handle_assistant_text)
@@ -628,6 +658,7 @@ async def test_new_message_supersedes_running_turn_before_tool_side_effect(tmp_p
     )
     llm = BlockingToolThenTextLlm()
     bus = EventBus(store)
+    tool_results = ToolCallResultWaiter()
     coordinator = ConversationTurnCoordinator()
     replies: list[str] = []
     conversation_projector = ConversationProjector(projection, turn_coordinator=coordinator)
@@ -743,7 +774,8 @@ async def test_runner_publishes_compaction_requested_when_estimate_over_threshol
     )
     llm = FakeLlmClient([AssistantText(text="ok")])
     bus = EventBus(store)
-    conversation_projector = ConversationProjector(projection)
+    coordinator = ConversationTurnCoordinator()
+    conversation_projector = ConversationProjector(projection, turn_coordinator=coordinator)
     compaction_config = CompactionConfig(max_tokens_per_model=1_000, reserve_tokens=0)
     agent_turn_handler = AgentTurnHandler(
         bus=bus,
@@ -751,6 +783,7 @@ async def test_runner_publishes_compaction_requested_when_estimate_over_threshol
         llm=llm,
         tool_registry=default_tool_registry(),
         projection=projection,
+        turn_coordinator=coordinator,
         compaction_config=compaction_config,
     )
 
@@ -813,7 +846,8 @@ async def test_runner_re_reads_messages_after_compaction_chain_returns(
     )
     llm = FakeLlmClient([AssistantText(text="ok")])
     bus = EventBus(store)
-    conversation_projector = ConversationProjector(projection)
+    coordinator = ConversationTurnCoordinator()
+    conversation_projector = ConversationProjector(projection, turn_coordinator=coordinator)
     compaction_config = CompactionConfig(max_tokens_per_model=1_000, reserve_tokens=0)
     agent_turn_handler = AgentTurnHandler(
         bus=bus,
@@ -821,6 +855,7 @@ async def test_runner_re_reads_messages_after_compaction_chain_returns(
         llm=llm,
         tool_registry=default_tool_registry(),
         projection=projection,
+        turn_coordinator=coordinator,
         compaction_config=compaction_config,
     )
 
@@ -880,7 +915,8 @@ async def test_runner_does_not_publish_compaction_when_under_threshold(
     )
     llm = FakeLlmClient([AssistantText(text="ok")])
     bus = EventBus(store)
-    conversation_projector = ConversationProjector(projection)
+    coordinator = ConversationTurnCoordinator()
+    conversation_projector = ConversationProjector(projection, turn_coordinator=coordinator)
     compaction_config = CompactionConfig(max_tokens_per_model=1_000, reserve_tokens=0)
     agent_turn_handler = AgentTurnHandler(
         bus=bus,
@@ -888,6 +924,7 @@ async def test_runner_does_not_publish_compaction_when_under_threshold(
         llm=llm,
         tool_registry=default_tool_registry(),
         projection=projection,
+        turn_coordinator=coordinator,
         compaction_config=compaction_config,
     )
 
@@ -1034,10 +1071,10 @@ async def test_supersede_during_compaction_does_not_commit_stale_summary(
     rows = await projection.list_all_context_items("cli:supersede")
     assert all(r.item_kind != "context_summary" for r in rows)
 
-    # The second turn's LLM request saw the full uncompacted history. In the
-    # event-driven flow the stale gen-1 continuation may complete after gen 2,
-    # so select by generation instead of request order.
-    assert len(runner_llm.requests) >= 2
+    # The second turn's LLM request saw the full uncompacted history, and the
+    # superseded gen-1 foreground continuation never reaches the LLM after the
+    # blocked compaction cascade resumes.
+    assert [request.generation for request in runner_llm.requests] == [2]
     second_turn_request = next(
         request for request in runner_llm.requests if request.generation == 2
     )

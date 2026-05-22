@@ -18,7 +18,7 @@ from pathlib import Path
 import pytest
 
 from harness_agent.bus import EventBus
-from harness_agent.context import AgentFileSet, ContextBuilder, Skill
+from harness_agent.context import AgentFileSet, ContextBuilder, Skill, system_prompt_with_tools
 from harness_agent.events import (
     AssistantTextProduced,
     EventBase,
@@ -38,12 +38,33 @@ from harness_agent.runtime.fake import FakeUserRuntime
 from harness_agent.runtime.paths import safe_conversation_id_part
 from harness_agent.session_search_service import truncate_around_terms
 from harness_agent.store import SQLiteEventStore
+from harness_agent.session_search_service import SessionSearchService
 from harness_agent.tool_executor import ToolCallExecutor
 from harness_agent.tools import (
     MemoryToolInput,
     default_tool_registry,
 )
 from harness_agent.turns import ConversationTurnCoordinator
+
+
+def tool_executor_for_test(
+    *,
+    runtime,
+    memory_service=None,
+    session_search=None,
+    session_search_llm=None,
+    **kwargs,
+):
+    return ToolCallExecutor(
+        runtime=runtime,
+        memory_service=memory_service or MemoryService(runtime=runtime),
+        session_search=session_search
+        or SessionSearchService(
+            runtime=runtime,
+            llm=session_search_llm or FakeLlmClient([]),
+        ),
+        **kwargs,
+    )
 
 
 # ---------- MEMORY.md is reachable in the system prompt ----------
@@ -79,8 +100,11 @@ async def test_context_builder_omits_empty_memory_payload() -> None:
     # The three set files appear in order with `\n\n` between them; no
     # blank slot for a missing memory block.
     assert "S\n\nA\n\nU\n\nT" in context.system
-    # ...but the user-facing guidance that names the file does appear.
-    assert "Persistent memory:" in context.system
+    # Tool guidance is appended by the turn handler when it knows the tool
+    # surface, not by the raw context builder.
+    assert "Persistent memory:" not in context.system
+    prompt = system_prompt_with_tools(context.system, default_tool_registry().tools)
+    assert "Persistent memory:" in prompt
 
 
 # ---------- ToolRegistry include flags ----------
@@ -90,6 +114,49 @@ def test_default_registry_includes_memory_and_session_search() -> None:
     names = {tool.name for tool in default_tool_registry().tools}
     assert "memory" in names
     assert "session.search" in names
+
+
+def test_filter_tools_no_filter_returns_same_registry() -> None:
+    registry = default_tool_registry()
+
+    assert registry.filter_tools() is registry
+
+
+def test_filter_tools_can_exclude_memory_only() -> None:
+    names = {
+        tool.name
+        for tool in default_tool_registry()
+        .filter_tools(include_memory=False)
+        .tools
+    }
+
+    assert "memory" not in names
+    assert "session.search" in names
+
+
+def test_filter_tools_can_exclude_session_search_only() -> None:
+    names = {
+        tool.name
+        for tool in default_tool_registry()
+        .filter_tools(include_session_search=False)
+        .tools
+    }
+
+    assert "session.search" not in names
+    assert "memory" in names
+
+
+def test_filter_tools_can_exclude_memory_and_session_search() -> None:
+    names = {
+        tool.name
+        for tool in default_tool_registry()
+        .filter_tools(include_memory=False, include_session_search=False)
+        .tools
+    }
+
+    assert "memory" not in names
+    assert "session.search" not in names
+    assert "shell.exec" in names
 
 
 def test_registry_can_exclude_memory_only() -> None:
@@ -188,7 +255,7 @@ async def test_review_ignores_memory_completion_for_stale_generation(
         user_id="alex", conversation_id="conv-1", generation=2, text="hello"
     )
 
-    executor = ToolCallExecutor(
+    executor = tool_executor_for_test(
         runtime=runtime,
         memory_service=MemoryService(runtime=runtime),
     )

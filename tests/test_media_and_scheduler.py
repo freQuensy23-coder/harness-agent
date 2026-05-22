@@ -1,8 +1,10 @@
+import asyncio
 import base64
 import hashlib
 import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import cast
 
 import pytest
 
@@ -26,6 +28,7 @@ from harness_agent.handlers import (
     IdentityHandler,
 )
 from harness_agent.identity import StaticIdentityResolver
+from harness_agent.memory_service import MemoryService
 from harness_agent.llm import (
     AssistantText,
     FakeLlmClient,
@@ -36,16 +39,44 @@ from harness_agent.llm import (
 )
 from harness_agent.projections import SQLiteConversationProjection
 from harness_agent.runtime import FakeUserRuntime
-from harness_agent.scheduler import SchedulerDueHandler, SchedulerPump, SQLiteScheduleStore
+from harness_agent.scheduler import (
+    SchedulerDueHandler,
+    SchedulerPump,
+    SchedulerService,
+    SQLiteScheduleStore,
+)
 from harness_agent.store import SQLiteEventStore
 from harness_agent.tasks import SQLiteTaskStore
+from harness_agent.session_search_service import SessionSearchService
 from harness_agent.tool_executor import ToolCallExecutor, ToolCallResultWaiter
+from harness_agent.turns import ConversationTurnCoordinator
 from harness_agent.tools import (
     FileReadInput,
     ScheduleCronInput,
     ScheduleOnceInput,
     default_tool_registry,
 )
+
+
+def tool_executor_for_test(
+    *,
+    runtime,
+    memory_service=None,
+    session_search=None,
+    session_search_llm=None,
+    **kwargs,
+):
+    return ToolCallExecutor(
+        runtime=runtime,
+        memory_service=memory_service or MemoryService(runtime=runtime),
+        session_search=session_search
+        or SessionSearchService(
+            runtime=runtime,
+            llm=session_search_llm or FakeLlmClient([]),
+        ),
+        **kwargs,
+    )
+
 
 
 def test_runtime_layer_has_no_llm_context_import() -> None:
@@ -65,15 +96,18 @@ async def test_telegram_image_is_saved_and_passed_to_llm_context(tmp_path: Path)
     )
     llm = FakeLlmClient([AssistantText(text="seen")])
     bus = EventBus(store)
+    coordinator = ConversationTurnCoordinator()
+    tool_results = ToolCallResultWaiter()
     identity_handler = IdentityHandler(StaticIdentityResolver())
     content_handler = ContentIngestionHandler(runtime=runtime)
-    conversation_projector = ConversationProjector(projection)
+    conversation_projector = ConversationProjector(projection, turn_coordinator=coordinator)
     agent_turn_handler = AgentTurnHandler(
         bus=bus,
         context_builder=ContextBuilder(runtime=runtime),
         llm=llm,
         tool_registry=default_tool_registry(),
         projection=projection,
+        turn_coordinator=coordinator,
     )
     bus.subscribe(TelegramTextReceived, identity_handler.handle_telegram_text)
     bus.subscribe(UserTextReceived, content_handler.handle_user_text)
@@ -138,15 +172,18 @@ async def test_telegram_file_is_saved_and_referenced_without_file_bytes_in_llm(t
     )
     llm = FakeLlmClient([AssistantText(text="ok")])
     bus = EventBus(store)
+    coordinator = ConversationTurnCoordinator()
+    tool_results = ToolCallResultWaiter()
     identity_handler = IdentityHandler(StaticIdentityResolver())
     content_handler = ContentIngestionHandler(runtime=runtime)
-    conversation_projector = ConversationProjector(projection)
+    conversation_projector = ConversationProjector(projection, turn_coordinator=coordinator)
     agent_turn_handler = AgentTurnHandler(
         bus=bus,
         context_builder=ContextBuilder(runtime=runtime),
         llm=llm,
         tool_registry=default_tool_registry(),
         projection=projection,
+        turn_coordinator=coordinator,
     )
     bus.subscribe(TelegramTextReceived, identity_handler.handle_telegram_text)
     bus.subscribe(UserTextReceived, content_handler.handle_user_text)
@@ -205,16 +242,17 @@ async def test_file_read_on_image_injects_image_into_next_llm_context(tmp_path: 
         ]
     )
     bus = EventBus(store)
+    coordinator = ConversationTurnCoordinator()
     tool_results = ToolCallResultWaiter()
-    tool_executor = ToolCallExecutor(runtime=runtime)
-    conversation_projector = ConversationProjector(projection)
+    tool_executor = tool_executor_for_test(runtime=runtime)
+    conversation_projector = ConversationProjector(projection, turn_coordinator=coordinator)
     agent_turn_handler = AgentTurnHandler(
         bus=bus,
         context_builder=ContextBuilder(runtime=runtime),
         llm=llm,
         tool_registry=default_tool_registry(),
         projection=projection,
-        tool_results=tool_results,
+        turn_coordinator=coordinator,
     )
     bus.subscribe(UserTextReceived, conversation_projector.handle_user_text)
     bus.subscribe(ToolCallRequested, tool_executor.handle_tool_call_requested)
@@ -284,16 +322,17 @@ async def test_file_read_missing_file_returns_tool_result(tmp_path: Path) -> Non
         ]
     )
     bus = EventBus(store)
+    coordinator = ConversationTurnCoordinator()
     tool_results = ToolCallResultWaiter()
-    tool_executor = ToolCallExecutor(runtime=runtime)
-    conversation_projector = ConversationProjector(projection)
+    tool_executor = tool_executor_for_test(runtime=runtime)
+    conversation_projector = ConversationProjector(projection, turn_coordinator=coordinator)
     agent_turn_handler = AgentTurnHandler(
         bus=bus,
         context_builder=ContextBuilder(runtime=runtime),
         llm=llm,
         tool_registry=default_tool_registry(),
         projection=projection,
-        tool_results=tool_results,
+        turn_coordinator=coordinator,
     )
     bus.subscribe(UserTextReceived, conversation_projector.handle_user_text)
     bus.subscribe(ToolCallRequested, tool_executor.handle_tool_call_requested)
@@ -362,8 +401,9 @@ async def test_agent_can_create_delayed_and_cron_schedules_via_tools(tmp_path: P
         ]
     )
     bus = EventBus(store)
+    coordinator = ConversationTurnCoordinator()
     tool_results = ToolCallResultWaiter()
-    tool_executor = ToolCallExecutor(
+    tool_executor = tool_executor_for_test(
         runtime=runtime,
         task_store=task_store,
         schedule_store=schedule_store,
@@ -374,12 +414,12 @@ async def test_agent_can_create_delayed_and_cron_schedules_via_tools(tmp_path: P
         llm=llm,
         tool_registry=default_tool_registry(),
         projection=projection,
-        tool_results=tool_results,
+        turn_coordinator=coordinator,
     )
-    bus.subscribe(UserTextReceived, ConversationProjector(projection).handle_user_text)
+    bus.subscribe(UserTextReceived, ConversationProjector(projection, turn_coordinator=coordinator).handle_user_text)
     bus.subscribe(ToolCallRequested, tool_executor.handle_tool_call_requested)
     bus.subscribe(ToolCallCompleted, tool_results.handle_tool_call_completed)
-    bus.subscribe(ToolCallCompleted, ConversationProjector(projection).handle_tool_call_completed)
+    bus.subscribe(ToolCallCompleted, ConversationProjector(projection, turn_coordinator=coordinator).handle_tool_call_completed)
     bus.subscribe(ToolCallCompleted, agent_turn_handler.handle_tool_call_completed)
     bus.subscribe(UserTextReceived, agent_turn_handler.handle_user_text)
     bus.subscribe(AgentTurnRequested, agent_turn_handler.handle_agent_turn)
@@ -442,3 +482,69 @@ async def test_scheduler_due_event_becomes_fake_user_message(tmp_path: Path) -> 
     ]
     refreshed = await schedule_store.get(schedule.id)
     assert refreshed.status == "completed"
+
+
+@pytest.mark.asyncio
+async def test_claim_due_cron_advances_next_run_from_stored_metadata(tmp_path: Path) -> None:
+    now = datetime(2026, 5, 19, 12, 0, tzinfo=UTC)
+    schedule_store = SQLiteScheduleStore(tmp_path / "schedules.sqlite3", now=lambda: now)
+    schedule = await schedule_store.create_cron(
+        user_id="u:1",
+        conversation_id="tg:456",
+        message="[cron] tick",
+        reply_target=TelegramReplyTarget(chat_id=456),
+        cron="* * * * *",
+        timezone="UTC",
+    )
+
+    claimed = await schedule_store.claim_due(datetime(2026, 5, 19, 12, 1, tzinfo=UTC))
+
+    assert len(claimed) == 1
+    assert claimed[0].id == schedule.id
+    assert claimed[0].kind == "cron"
+    assert claimed[0].cron == "* * * * *"
+    assert claimed[0].timezone == "UTC"
+    refreshed = await schedule_store.get(schedule.id)
+    assert refreshed.status == "active"
+    assert refreshed.next_run_at == datetime(2026, 5, 19, 12, 2, tzinfo=UTC)
+
+
+class CountingPump:
+    def __init__(self) -> None:
+        self.ticks = 0
+        self._tick_event = asyncio.Event()
+
+    async def tick(self) -> None:
+        self.ticks += 1
+        self._tick_event.set()
+        await asyncio.sleep(0)
+
+    async def wait_for_tick_after(self, previous_ticks: int) -> None:
+        while self.ticks <= previous_ticks:
+            self._tick_event.clear()
+            await asyncio.wait_for(self._tick_event.wait(), timeout=1)
+
+
+@pytest.mark.asyncio
+async def test_scheduler_service_duplicate_start_stop_and_restart() -> None:
+    pump = CountingPump()
+    service = SchedulerService(pump=cast(SchedulerPump, pump), poll_seconds=0.01)
+
+    await service.start()
+    await pump.wait_for_tick_after(0)
+    first_task = service._task
+    await service.start()
+
+    assert service._task is first_task
+
+    await service.stop()
+    stopped_at = pump.ticks
+    assert service._task is None
+    await asyncio.sleep(0.03)
+    assert pump.ticks == stopped_at
+
+    await service.start()
+    await pump.wait_for_tick_after(stopped_at)
+    assert service._task is not None
+    assert service._task is not first_task
+    await service.stop()

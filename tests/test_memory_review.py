@@ -22,9 +22,30 @@ from harness_agent.projections import SQLiteConversationProjection
 from harness_agent.runtime import RuntimeToolResult
 from harness_agent.runtime.fake import FakeUserRuntime
 from harness_agent.store import SQLiteEventStore
+from harness_agent.session_search_service import SessionSearchService
 from harness_agent.tool_executor import ToolCallExecutor
 from harness_agent.tools import MemoryToolInput, default_tool_registry
 from harness_agent.turns import ConversationTurnCoordinator
+
+
+def tool_executor_for_test(
+    *,
+    runtime,
+    memory_service=None,
+    session_search=None,
+    session_search_llm=None,
+    **kwargs,
+):
+    return ToolCallExecutor(
+        runtime=runtime,
+        memory_service=memory_service or MemoryService(runtime=runtime),
+        session_search=session_search
+        or SessionSearchService(
+            runtime=runtime,
+            llm=session_search_llm or FakeLlmClient([]),
+        ),
+        **kwargs,
+    )
 
 
 async def _coord_at(conversation_id: str, generation: int) -> ConversationTurnCoordinator:
@@ -60,7 +81,7 @@ def _collect_review_events(events: list[EventBase]) -> list[MemoryReviewComplete
 
 
 def _wire_executor(bus: EventBus, runtime: FakeUserRuntime) -> ToolCallExecutor:
-    executor = ToolCallExecutor(
+    executor = tool_executor_for_test(
         runtime=runtime,
         memory_service=MemoryService(runtime=runtime),
     )

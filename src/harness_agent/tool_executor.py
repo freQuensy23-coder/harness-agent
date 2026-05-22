@@ -59,7 +59,9 @@ from harness_agent.tools import (
     TaskListInput,
     TaskStopInput,
     TaskUpdateInput,
+    ToolRegistry,
     WebFetchInput,
+    default_tool_registry,
 )
 from harness_agent.web_fetch import WebFetcher
 
@@ -102,14 +104,14 @@ class ToolCallExecutor:
         self,
         *,
         runtime: UserRuntime,
+        memory_service: MemoryService,
+        session_search: SessionSearchService,
         task_store: SQLiteTaskStore | None = None,
         schedule_store: SQLiteScheduleStore | None = None,
         web_fetcher: WebFetcher | None = None,
         image_jobs: ImageJobService | None = None,
         mcp_manager: McpManager | None = None,
         sub_agents: SubAgentService | None = None,
-        memory_service: MemoryService | None = None,
-        session_search: SessionSearchService | None = None,
         max_model_output_chars: int = 20_000,
     ) -> None:
         self._runtime = runtime
@@ -133,29 +135,56 @@ class ToolCallExecutor:
             "file.glob": self._file_glob,
             "file.grep": self._file_grep,
             "file.list": self._file_list,
-            "web.fetch": self._web_fetch,
-            "image.generate": self._image_generate,
-            "task.create": self._task_create,
-            "task.get": self._task_get,
-            "task.list": self._task_list,
-            "task.update": self._task_update,
-            "task.stop": self._task_stop,
-            "schedule.once": self._schedule_once,
-            "schedule.cron": self._schedule_cron,
-            "schedule.list": self._schedule_list,
-            "schedule.cancel": self._schedule_cancel,
             "skill.list": self._skill_list,
             "skill.read": self._skill_read,
-            "agent.run": self._agent_run,
-            "agent.spawn": self._agent_spawn,
-            "agent.result": self._agent_result,
-            "agent.list": self._agent_list,
-            "agent.cancel": self._agent_cancel,
+            "memory": self._memory,
+            "session.search": self._session_search,
         }
-        if memory_service is not None:
-            self._tool_executors["memory"] = self._memory
-        if session_search is not None:
-            self._tool_executors["session.search"] = self._session_search
+        if self._web_fetcher is not None:
+            self._tool_executors["web.fetch"] = self._web_fetch
+        if self._image_jobs is not None:
+            self._tool_executors.update(
+                {
+                    "image.generate": self._image_generate,
+                }
+            )
+        if self._task_store is not None:
+            self._tool_executors.update(
+                {
+                    "task.create": self._task_create,
+                    "task.get": self._task_get,
+                    "task.list": self._task_list,
+                    "task.update": self._task_update,
+                    "task.stop": self._task_stop,
+                }
+            )
+        if self._schedule_store is not None:
+            self._tool_executors.update(
+                {
+                    "schedule.once": self._schedule_once,
+                    "schedule.cron": self._schedule_cron,
+                    "schedule.list": self._schedule_list,
+                    "schedule.cancel": self._schedule_cancel,
+                }
+            )
+        if self._sub_agents is not None:
+            self._tool_executors.update(
+                {
+                    "agent.run": self._agent_run,
+                    "agent.spawn": self._agent_spawn,
+                    "agent.result": self._agent_result,
+                    "agent.list": self._agent_list,
+                    "agent.cancel": self._agent_cancel,
+                }
+            )
+    def tool_registry(self) -> ToolRegistry:
+        return default_tool_registry(
+            include_web_fetch=self._web_fetcher is not None,
+            include_image_generation=self._image_jobs is not None,
+            include_tasks=self._task_store is not None,
+            include_schedules=self._schedule_store is not None,
+            include_agents=self._sub_agents is not None,
+        )
 
     async def handle_tool_call_requested(self, event: ToolCallRequested) -> EventBatch:
         try:
@@ -236,9 +265,9 @@ class ToolCallExecutor:
             return await self._file_read_for_model(event.user_id, event)
         if event.tool_name == "image.status":
             return await self._image_status_for_model(event.user_id, event)
+        if event.tool_name.startswith("mcp."):
+            return ToolExecutionResult(result=await self._mcp_call(event))
         if event.tool_name not in self._tool_executors:
-            if event.tool_name.startswith("mcp."):
-                return ToolExecutionResult(result=await self._mcp_call(event))
             raise ValueError(f"Unsupported tool call: {event.tool_name}")
         return ToolExecutionResult(
             result=await self._tool_executors[event.tool_name](event.user_id, event)
@@ -702,8 +731,6 @@ class ToolCallExecutor:
         user_id: str,
         event: ToolCallRequested,
     ) -> RuntimeToolResult:
-        if self._memory_service is None:
-            raise RuntimeError("memory service is not configured")
         return await self._memory_service.execute(
             user_id, MemoryToolInput.model_validate(event.input)
         )
@@ -713,8 +740,6 @@ class ToolCallExecutor:
         user_id: str,
         event: ToolCallRequested,
     ) -> RuntimeToolResult:
-        if self._session_search_service is None:
-            raise RuntimeError("session search service is not configured")
         return await self._session_search_service.execute(
             user_id=user_id,
             current_conversation_id=event.conversation_id,

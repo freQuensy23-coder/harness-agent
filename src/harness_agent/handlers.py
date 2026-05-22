@@ -4,7 +4,7 @@ from uuid import uuid4
 from harness_agent.bus import EventBus
 from harness_agent.compaction import CompactionConfig
 from harness_agent.content import content_ref_from_bytes
-from harness_agent.context import ContextBuilder
+from harness_agent.context import ContextBuilder, system_prompt_with_tools
 from harness_agent.events import (
     AgentGenerationStarted,
     AgentTurnRequested,
@@ -81,7 +81,7 @@ class ConversationProjector:
         self,
         projection: SQLiteConversationProjection,
         *,
-        turn_coordinator: ConversationTurnCoordinator | None = None,
+        turn_coordinator: ConversationTurnCoordinator,
     ) -> None:
         self._projection = projection
         self._turn_coordinator = turn_coordinator
@@ -131,8 +131,6 @@ class ConversationProjector:
         return ()
 
     async def _can_project_generation(self, conversation_id: str, generation: int) -> bool:
-        if self._turn_coordinator is None:
-            return True
         return await self._turn_coordinator.is_current(conversation_id, generation)
 
 
@@ -160,8 +158,7 @@ class AgentTurnHandler:
         tool_registry: ToolRegistry,
         projection: SQLiteConversationProjection,
         mcp_manager: McpManager | None = None,
-        turn_coordinator: ConversationTurnCoordinator | None = None,
-        tool_results: object | None = None,
+        turn_coordinator: ConversationTurnCoordinator,
         sub_agent_lookup: SubAgentLookup | None = None,
         compaction_config: CompactionConfig | None = None,
     ) -> None:
@@ -171,8 +168,6 @@ class AgentTurnHandler:
         self._tool_registry = tool_registry
         self._projection = projection
         self._mcp_manager = mcp_manager
-        if turn_coordinator is None:
-            turn_coordinator = ConversationTurnCoordinator()
         self._turn_coordinator = turn_coordinator
         self._sub_agent_lookup = sub_agent_lookup
         self._compaction_config = compaction_config
@@ -232,7 +227,10 @@ class AgentTurnHandler:
             conversation_id=conversation_id,
         )
         tools = await self._tools_for_user(user_id, sub_agent_record)
-        system_prompt = _system_prompt_for_turn(context.system, sub_agent_record)
+        system_prompt = _system_prompt_for_turn(
+            system_prompt_with_tools(context.system, tools),
+            sub_agent_record,
+        )
 
         request = LlmRequest(
             user_id=user_id,
@@ -256,6 +254,12 @@ class AgentTurnHandler:
                 )
             )
             messages = await self._projection.list_llm_messages(conversation_id)
+            if await self._stop_if_superseded(
+                user_id=user_id,
+                conversation_id=conversation_id,
+                generation=generation,
+            ):
+                return ()
             request = LlmRequest(
                 user_id=user_id,
                 conversation_id=conversation_id,

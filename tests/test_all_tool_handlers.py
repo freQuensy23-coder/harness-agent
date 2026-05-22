@@ -16,6 +16,7 @@ from harness_agent.events import (
     UserTextReceived,
 )
 from harness_agent.handlers import AgentTurnHandler, ConversationProjector
+from harness_agent.memory_service import MemoryService
 from harness_agent.llm import AssistantText, FakeLlmClient, LlmToolCall
 from harness_agent.projections import SQLiteConversationProjection
 from harness_agent.runtime import FakeUserRuntime, RuntimeToolResult
@@ -25,7 +26,9 @@ from harness_agent.subagents import SubAgentRecord
 from harness_agent.image_generate import GeneratedImage, ImageGenerator
 from harness_agent.image_jobs import ImageJobService, SQLiteImageJobStore
 from harness_agent.tasks import SQLiteTaskStore
+from harness_agent.session_search_service import SessionSearchService
 from harness_agent.tool_executor import ToolCallExecutor, ToolCallResultWaiter
+from harness_agent.turns import ConversationTurnCoordinator
 from harness_agent.tools import (
     AgentCancelInput,
     AgentListInput,
@@ -63,6 +66,27 @@ from harness_agent.tools import (
     WebFetchInput,
     default_tool_registry,
 )
+
+
+def tool_executor_for_test(
+    *,
+    runtime,
+    memory_service=None,
+    session_search=None,
+    session_search_llm=None,
+    **kwargs,
+):
+    return ToolCallExecutor(
+        runtime=runtime,
+        memory_service=memory_service or MemoryService(runtime=runtime),
+        session_search=session_search
+        or SessionSearchService(
+            runtime=runtime,
+            llm=session_search_llm or FakeLlmClient([]),
+        ),
+        **kwargs,
+    )
+
 
 
 @pytest.mark.asyncio
@@ -154,6 +178,7 @@ async def test_every_exposed_tool_completes_through_agent_turn_handler(tmp_path:
     ]
     llm = FakeLlmClient(responses)
     bus = EventBus(store)
+    coordinator = ConversationTurnCoordinator()
     registry = ToolRegistry(
         tools=[
             *default_tool_registry().tools,
@@ -176,8 +201,8 @@ async def test_every_exposed_tool_completes_through_agent_turn_handler(tmp_path:
         llm=llm,
         tool_registry=registry,
         projection=projection,
+        turn_coordinator=coordinator,
         mcp_manager=mcp_manager,
-        tool_results=tool_results,
     )
     image_job_store = SQLiteImageJobStore(tmp_path / "image_jobs.sqlite3")
     image_jobs = ImageJobService(
@@ -190,7 +215,7 @@ async def test_every_exposed_tool_completes_through_agent_turn_handler(tmp_path:
     bus.subscribe(ImageJobStarted, image_jobs.handle_started)
     bus.subscribe(ImageJobCompleted, image_jobs.handle_completed)
     bus.subscribe(ImageJobFailed, image_jobs.handle_failed)
-    tool_executor = ToolCallExecutor(
+    tool_executor = tool_executor_for_test(
         runtime=runtime,
         task_store=task_store,
         schedule_store=schedule_store,
@@ -199,11 +224,11 @@ async def test_every_exposed_tool_completes_through_agent_turn_handler(tmp_path:
         mcp_manager=mcp_manager,
         sub_agents=FakeSubAgentService(),
     )
-    projector = ConversationProjector(projection)
+    projector = ConversationProjector(projection, turn_coordinator=coordinator)
     bus.subscribe(UserTextReceived, projector.handle_user_text)
     bus.subscribe(ToolCallRequested, tool_executor.handle_tool_call_requested)
     bus.subscribe(ToolCallCompleted, tool_results.handle_tool_call_completed)
-    bus.subscribe(ToolCallCompleted, ConversationProjector(projection).handle_tool_call_completed)
+    bus.subscribe(ToolCallCompleted, ConversationProjector(projection, turn_coordinator=coordinator).handle_tool_call_completed)
     bus.subscribe(ToolCallCompleted, handler.handle_tool_call_completed)
     bus.subscribe(UserTextReceived, handler.handle_user_text)
     bus.subscribe(AgentTurnRequested, handler.handle_agent_turn)

@@ -20,17 +20,27 @@ ScheduleKind = Literal["once", "cron"]
 ScheduleStatus = Literal["active", "completed", "cancelled"]
 
 
-class ScheduledMessage(BaseModel):
+class ScheduledMessageBase(BaseModel):
     id: str
     user_id: str
     conversation_id: str
-    kind: ScheduleKind
     status: ScheduleStatus
     message: str
     next_run_at: datetime
     reply_target: ReplyTarget | None = None
-    cron: str | None = None
-    timezone: str | None = None
+
+
+class OnceScheduledMessage(ScheduledMessageBase):
+    kind: Literal["once"] = "once"
+
+
+class CronScheduledMessage(ScheduledMessageBase):
+    kind: Literal["cron"] = "cron"
+    cron: str
+    timezone: str
+
+
+ScheduledMessage = OnceScheduledMessage | CronScheduledMessage
 
 
 class SQLiteScheduleStore:
@@ -222,8 +232,8 @@ class SQLiteScheduleStore:
                         """,
                         (
                             next_cron_run(
-                                cron=schedule.cron or "",
-                                timezone=schedule.timezone or "UTC",
+                                cron=schedule.cron,
+                                timezone=schedule.timezone,
                                 after=now,
                             ).isoformat(),
                             schedule.id,
@@ -285,18 +295,22 @@ class SQLiteScheduleStore:
         reply_target: ReplyTarget | None = None
         if row[7] is not None:
             reply_target = self._reply_target_adapter.validate_python(json.loads(row[7]))
-        return ScheduledMessage(
-            id=row[0],
-            user_id=row[1],
-            conversation_id=row[2],
-            kind=row[3],
-            status=row[4],
-            message=row[5],
-            next_run_at=datetime.fromisoformat(row[6]).astimezone(UTC),
-            reply_target=reply_target,
-            cron=row[8],
-            timezone=row[9],
-        )
+        common = {
+            "id": row[0],
+            "user_id": row[1],
+            "conversation_id": row[2],
+            "status": row[4],
+            "message": row[5],
+            "next_run_at": datetime.fromisoformat(row[6]).astimezone(UTC),
+            "reply_target": reply_target,
+        }
+        if row[3] == "once":
+            return OnceScheduledMessage(**common)
+        if row[3] == "cron":
+            if row[8] is None or row[9] is None:
+                raise RuntimeError(f"cron schedule {row[0]} is missing cron metadata")
+            return CronScheduledMessage(**common, cron=row[8], timezone=row[9])
+        raise ValueError(f"unknown schedule kind: {row[3]}")
 
     async def _ensure_schema(self) -> None:
         self._path.parent.mkdir(parents=True, exist_ok=True)
@@ -367,14 +381,18 @@ class SchedulerService:
         self._task: asyncio.Task[None] | None = None
 
     async def start(self) -> None:
+        if self._task is not None and not self._task.done():
+            return
         self._task = asyncio.create_task(self._run())
 
     async def stop(self) -> None:
         if self._task is None:
             return
-        self._task.cancel()
+        task = self._task
+        self._task = None
+        task.cancel()
         try:
-            await self._task
+            await task
         except asyncio.CancelledError:
             pass
 

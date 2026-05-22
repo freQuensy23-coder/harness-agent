@@ -1,7 +1,6 @@
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
 
 import aiosqlite
 from pydantic import TypeAdapter
@@ -18,7 +17,6 @@ from harness_agent.runtime import RuntimeToolResult
 from harness_agent.tools import ToolInput
 
 
-MessageRole = Literal["user", "assistant"]
 CONTEXT_SUMMARY_KIND = "context_summary"
 
 
@@ -41,32 +39,6 @@ class SQLiteConversationProjection:
     def __init__(self, path: Path) -> None:
         self._path = path
         self._message_adapter: TypeAdapter[LlmMessage] = TypeAdapter(LlmMessage)
-
-    async def append_message(
-        self,
-        *,
-        user_id: str,
-        conversation_id: str,
-        role: MessageRole,
-        text: str,
-        generation: int | None = None,
-    ) -> None:
-        if role == "user":
-            await self.append_user_message(
-                user_id=user_id,
-                conversation_id=conversation_id,
-                text=text,
-            )
-            return
-        if role == "assistant":
-            await self.append_assistant_message(
-                user_id=user_id,
-                conversation_id=conversation_id,
-                generation=0 if generation is None else generation,
-                text=text,
-            )
-            return
-        raise ValueError(f"unsupported message role: {role}")
 
     async def append_user_message(
         self,
