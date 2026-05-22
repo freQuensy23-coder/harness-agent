@@ -213,7 +213,6 @@ class HarnessApp:
         self.memory_review = MemoryReviewService(
             bus=self.bus,
             llm=self.llm,
-            tool_results=self.tool_results,
             projection=self.projection,
             tool_registry=default_tool_registry(),
             turn_coordinator=self.turn_coordinator,

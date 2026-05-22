@@ -38,7 +38,7 @@ from harness_agent.runtime.fake import FakeUserRuntime
 from harness_agent.runtime.paths import safe_conversation_id_part
 from harness_agent.session_search_service import truncate_around_terms
 from harness_agent.store import SQLiteEventStore
-from harness_agent.tool_executor import ToolCallExecutor, ToolCallResultWaiter
+from harness_agent.tool_executor import ToolCallExecutor
 from harness_agent.tools import (
     MemoryToolInput,
     default_tool_registry,
@@ -177,7 +177,6 @@ async def test_review_ignores_memory_completion_for_stale_generation(
     projection = SQLiteConversationProjection(tmp_path / "messages.sqlite3")
     store = SQLiteEventStore(tmp_path / "events.sqlite3")
     bus = EventBus(store)
-    tool_results = ToolCallResultWaiter()
     coordinator = ConversationTurnCoordinator()
     # Open conversation, request gen=1 then gen=2; gen=1 is now stale.
     await coordinator.request_generation("conv-1")
@@ -194,13 +193,11 @@ async def test_review_ignores_memory_completion_for_stale_generation(
         memory_service=MemoryService(runtime=runtime),
     )
     bus.subscribe(ToolCallRequested, executor.handle_tool_call_requested)
-    bus.subscribe(ToolCallCompleted, tool_results.handle_tool_call_completed)
 
     llm = FakeLlmClient([AssistantText(text="Nothing to save.")])
     service = MemoryReviewService(
         bus=bus,
         llm=llm,
-        tool_results=tool_results,
         projection=projection,
         tool_registry=default_tool_registry(),
         turn_coordinator=coordinator,

@@ -22,7 +22,7 @@ from harness_agent.projections import SQLiteConversationProjection
 from harness_agent.runtime import RuntimeToolResult
 from harness_agent.runtime.fake import FakeUserRuntime
 from harness_agent.store import SQLiteEventStore
-from harness_agent.tool_executor import ToolCallExecutor, ToolCallResultWaiter
+from harness_agent.tool_executor import ToolCallExecutor
 from harness_agent.tools import MemoryToolInput, default_tool_registry
 from harness_agent.turns import ConversationTurnCoordinator
 
@@ -59,17 +59,12 @@ def _collect_review_events(events: list[EventBase]) -> list[MemoryReviewComplete
     return [event for event in events if isinstance(event, MemoryReviewCompleted)]
 
 
-def _wire_executor(
-    bus: EventBus,
-    runtime: FakeUserRuntime,
-    tool_results: ToolCallResultWaiter,
-) -> ToolCallExecutor:
+def _wire_executor(bus: EventBus, runtime: FakeUserRuntime) -> ToolCallExecutor:
     executor = ToolCallExecutor(
         runtime=runtime,
         memory_service=MemoryService(runtime=runtime),
     )
     bus.subscribe(ToolCallRequested, executor.handle_tool_call_requested)
-    bus.subscribe(ToolCallCompleted, tool_results.handle_tool_call_completed)
     return executor
 
 
@@ -79,8 +74,7 @@ async def test_review_fires_after_threshold_and_persists_memory(tmp_path: Path) 
     projection = SQLiteConversationProjection(tmp_path / "messages.sqlite3")
     store = SQLiteEventStore(tmp_path / "events.sqlite3")
     bus = EventBus(store)
-    tool_results = ToolCallResultWaiter()
-    _wire_executor(bus, runtime, tool_results)
+    _wire_executor(bus, runtime)
     await _seed_conversation(projection, "conv-1")
 
     llm = FakeLlmClient(
@@ -101,7 +95,6 @@ async def test_review_fires_after_threshold_and_persists_memory(tmp_path: Path) 
     service = MemoryReviewService(
         bus=bus,
         llm=llm,
-        tool_results=tool_results,
         projection=projection,
         tool_registry=default_tool_registry(),
         turn_coordinator=coordinator,
@@ -138,8 +131,7 @@ async def test_review_records_nothing_to_save_note(tmp_path: Path) -> None:
     projection = SQLiteConversationProjection(tmp_path / "messages.sqlite3")
     store = SQLiteEventStore(tmp_path / "events.sqlite3")
     bus = EventBus(store)
-    tool_results = ToolCallResultWaiter()
-    _wire_executor(bus, runtime, tool_results)
+    _wire_executor(bus, runtime)
     await _seed_conversation(projection, "conv-1")
 
     llm = FakeLlmClient([AssistantText(text="Nothing to save.")])
@@ -147,7 +139,6 @@ async def test_review_records_nothing_to_save_note(tmp_path: Path) -> None:
     service = MemoryReviewService(
         bus=bus,
         llm=llm,
-        tool_results=tool_results,
         projection=projection,
         tool_registry=default_tool_registry(),
         turn_coordinator=coordinator,
@@ -176,8 +167,7 @@ async def test_review_counter_resets_on_memory_tool_call(tmp_path: Path) -> None
     projection = SQLiteConversationProjection(tmp_path / "messages.sqlite3")
     store = SQLiteEventStore(tmp_path / "events.sqlite3")
     bus = EventBus(store)
-    tool_results = ToolCallResultWaiter()
-    _wire_executor(bus, runtime, tool_results)
+    _wire_executor(bus, runtime)
     await _seed_conversation(projection, "conv-1")
 
     llm = FakeLlmClient([])  # would raise if review fires
@@ -185,7 +175,6 @@ async def test_review_counter_resets_on_memory_tool_call(tmp_path: Path) -> None
     service = MemoryReviewService(
         bus=bus,
         llm=llm,
-        tool_results=tool_results,
         projection=projection,
         tool_registry=default_tool_registry(),
         turn_coordinator=coordinator,
@@ -229,8 +218,7 @@ async def test_counters_are_per_conversation(tmp_path: Path) -> None:
     projection = SQLiteConversationProjection(tmp_path / "messages.sqlite3")
     store = SQLiteEventStore(tmp_path / "events.sqlite3")
     bus = EventBus(store)
-    tool_results = ToolCallResultWaiter()
-    _wire_executor(bus, runtime, tool_results)
+    _wire_executor(bus, runtime)
     await _seed_conversation(projection, "conv-A")
     await _seed_conversation(projection, "conv-B")
 
@@ -241,7 +229,6 @@ async def test_counters_are_per_conversation(tmp_path: Path) -> None:
     service = MemoryReviewService(
         bus=bus,
         llm=llm,
-        tool_results=tool_results,
         projection=projection,
         tool_registry=default_tool_registry(),
         turn_coordinator=coordinator,
@@ -276,8 +263,7 @@ async def test_foreground_memory_tool_call_suppresses_next_assistant_increment(
     projection = SQLiteConversationProjection(tmp_path / "messages.sqlite3")
     store = SQLiteEventStore(tmp_path / "events.sqlite3")
     bus = EventBus(store)
-    tool_results = ToolCallResultWaiter()
-    _wire_executor(bus, runtime, tool_results)
+    _wire_executor(bus, runtime)
     await _seed_conversation(projection, "conv-1")
 
     llm = FakeLlmClient([])  # would raise if review fires
@@ -285,7 +271,6 @@ async def test_foreground_memory_tool_call_suppresses_next_assistant_increment(
     service = MemoryReviewService(
         bus=bus,
         llm=llm,
-        tool_results=tool_results,
         projection=projection,
         tool_registry=default_tool_registry(),
         turn_coordinator=coordinator,
@@ -344,8 +329,7 @@ async def test_in_flight_review_does_not_clobber_newer_foreground_increment(
     projection = SQLiteConversationProjection(tmp_path / "messages.sqlite3")
     store = SQLiteEventStore(tmp_path / "events.sqlite3")
     bus = EventBus(store)
-    tool_results = ToolCallResultWaiter()
-    _wire_executor(bus, runtime, tool_results)
+    _wire_executor(bus, runtime)
     await _seed_conversation(projection, "conv-1")
 
     gate = asyncio.Event()
@@ -375,7 +359,6 @@ async def test_in_flight_review_does_not_clobber_newer_foreground_increment(
     service = MemoryReviewService(
         bus=bus,
         llm=llm,  # type: ignore[arg-type]
-        tool_results=tool_results,
         projection=projection,
         tool_registry=default_tool_registry(),
         turn_coordinator=coordinator,
@@ -441,8 +424,7 @@ async def test_review_memory_mutations_are_emitted_on_event_bus(
     projection = SQLiteConversationProjection(tmp_path / "messages.sqlite3")
     store = SQLiteEventStore(tmp_path / "events.sqlite3")
     bus = EventBus(store)
-    tool_results = ToolCallResultWaiter()
-    _wire_executor(bus, runtime, tool_results)
+    _wire_executor(bus, runtime)
     await _seed_conversation(projection, "conv-1")
 
     llm = FakeLlmClient(
@@ -463,7 +445,6 @@ async def test_review_memory_mutations_are_emitted_on_event_bus(
     service = MemoryReviewService(
         bus=bus,
         llm=llm,
-        tool_results=tool_results,
         projection=projection,
         tool_registry=default_tool_registry(),
         turn_coordinator=coordinator,

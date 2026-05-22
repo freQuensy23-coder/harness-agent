@@ -63,7 +63,6 @@ class MemoryReviewService:
         *,
         bus: EventBus,
         llm: LlmClient,
-        tool_results: ToolCallResultWaiter,
         projection: SQLiteConversationProjection,
         tool_registry: ToolRegistry,
         turn_coordinator: ConversationTurnCoordinator,
@@ -72,7 +71,10 @@ class MemoryReviewService:
     ) -> None:
         self._bus = bus
         self._llm = llm
-        self._tool_results = tool_results
+        self._tool_results = ToolCallResultWaiter()
+        self._bus.subscribe(
+            ToolCallCompleted, self._tool_results.handle_tool_call_completed
+        )
         self._projection = projection
         self._tool_registry = tool_registry
         self._turn_coordinator = turn_coordinator
