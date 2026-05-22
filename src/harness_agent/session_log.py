@@ -1,15 +1,4 @@
-"""JSONL session log writer.
-
-Every user message, assistant message, and tool exchange in a conversation
-appends one JSON line to `/workspace/sessions/<conversation_id>.jsonl`
-inside the user's container. The `session.search` tool reads these files
-to recall focused summaries of past conversations.
-
-The writer subscribes to the same events `ConversationProjector` does, so
-its writes happen in lockstep with the SQLite-backed conversation history.
-"""
-
-from __future__ import annotations
+"""Per-conversation JSONL session log, subscribed to the event bus."""
 
 import json
 from typing import Literal
@@ -26,15 +15,10 @@ from harness_agent.runtime.paths import safe_conversation_id_part
 from harness_agent.turns import ConversationTurnCoordinator
 
 
-__all__ = [
-    "EventBatch",
-    "SessionLogWriter",
-    "safe_conversation_id_part",
-]
+__all__ = ["SessionLogWriter", "safe_conversation_id_part"]
 
 
 EventBatch = tuple[EventBase, ...]
-
 
 _Role = Literal["user", "assistant", "tool"]
 
@@ -42,9 +26,8 @@ _Role = Literal["user", "assistant", "tool"]
 class SessionLogWriter:
     """Append every conversation event to a per-conversation JSONL file.
 
-    Append failures from the runtime are surfaced as a typed
-    `SessionLogAppendFailed` event so observers can react instead of
-    finding silent gaps in the JSONL log.
+    Runtime append failures surface as `SessionLogAppendFailed` events
+    instead of silent gaps in the log.
     """
 
     def __init__(

@@ -1,16 +1,10 @@
 """Cross-session recall over JSONL session logs.
 
-Two-stage retrieval:
-
-1. Rank every JSONL session log by hit-count for the query terms.
-2. For each top match, summarise via the auxiliary LLM with a focused
-   prompt. The summarisation is mandatory — the service is intentionally
-   coupled to an LLM. The `session.search` tool must only be exposed
-   when an LLM is available, otherwise the agent would either see raw
-   transcripts (context bloat) or empty results.
+Two stages: rank logs by query hit count, then summarise the top-K
+through the auxiliary LLM. Raw transcripts never reach the agent — the
+contract is "summaries only" because the JSONL may capture tool stdout
+with secrets the user didn't expect to see verbatim.
 """
-
-from __future__ import annotations
 
 import json
 import re
@@ -52,12 +46,9 @@ class SessionSearchService:
         query = input.query.strip()
         if not query:
             return RuntimeToolResult(stderr="query is required.\n", exit_code=1)
-        terms = [token for token in re.split(r"\s+", query.lower()) if token]
-        if not terms:
-            terms = [query.lower()]
-        # The runtime contract returns RAW conversation IDs from
-        # list_session_logs; comparing raw-to-raw avoids the
-        # double-encoding trap (encoded id -> encode again -> miss).
+        terms = [t for t in re.split(r"\s+", query.lower()) if t] or [query.lower()]
+        # Runtime contract: list returns RAW conversation IDs, so we
+        # compare raw-to-raw and never double-encode.
         all_ids = await self._runtime.list_session_logs(user_id)
         candidates = [cid for cid in all_ids if cid != current_conversation_id]
         if not candidates:
@@ -77,8 +68,9 @@ class SessionSearchService:
             return _empty(query, "No matching sessions found.")
         results: list[dict[str, str]] = []
         for cid, content, score in top:
-            transcript = format_session_transcript(content)
-            transcript = truncate_around_terms(transcript, terms)
+            transcript = truncate_around_terms(
+                format_session_transcript(content), terms
+            )
             try:
                 summary = await self._summarize(
                     user_id=user_id,
@@ -87,17 +79,9 @@ class SessionSearchService:
                     transcript=transcript,
                 )
             except Exception as exc:
-                # Never fall back to raw transcript text — the contract is
-                # "summaries only, never raw transcripts", because tool
-                # output captured in the JSONL log may contain secrets or
-                # other PII the user wouldn't expect to see verbatim.
                 summary = f"[summary unavailable: {type(exc).__name__}]"
             results.append(
-                {
-                    "conversation_id": cid,
-                    "match_score": str(score),
-                    "summary": summary,
-                }
+                {"conversation_id": cid, "match_score": str(score), "summary": summary}
             )
         return RuntimeToolResult(
             stdout=json.dumps(
@@ -119,23 +103,24 @@ class SessionSearchService:
         query: str,
         transcript: str,
     ) -> str:
-        request = LlmRequest(
-            user_id=user_id,
-            conversation_id=conversation_id,
-            generation=0,
-            system=_SUMMARIZER_SYSTEM_PROMPT,
-            messages=[
-                LlmUserMessage(
-                    text=(
-                        f"Search topic: {query}\n\n"
-                        f"CONVERSATION TRANSCRIPT:\n{transcript}\n\n"
-                        f"Summarise the conversation focused on: {query}"
+        response = await self._llm.respond(
+            LlmRequest(
+                user_id=user_id,
+                conversation_id=conversation_id,
+                generation=0,
+                system=_SUMMARIZER_SYSTEM_PROMPT,
+                messages=[
+                    LlmUserMessage(
+                        text=(
+                            f"Search topic: {query}\n\n"
+                            f"CONVERSATION TRANSCRIPT:\n{transcript}\n\n"
+                            f"Summarise the conversation focused on: {query}"
+                        )
                     )
-                )
-            ],
-            tools=[],
+                ],
+                tools=[],
+            )
         )
-        response = await self._llm.respond(request)
         if response.kind == "assistant_text":
             return response.text
         return "[summary unavailable: model returned a tool call instead of text]"
@@ -144,12 +129,7 @@ class SessionSearchService:
 def _empty(query: str, message: str) -> RuntimeToolResult:
     return RuntimeToolResult(
         stdout=json.dumps(
-            {
-                "success": True,
-                "query": query,
-                "results": [],
-                "message": message,
-            },
+            {"success": True, "query": query, "results": [], "message": message},
             ensure_ascii=False,
         )
     )
@@ -164,7 +144,9 @@ def format_session_transcript(jsonl_content: str) -> str:
         try:
             entry = json.loads(raw)
         except json.JSONDecodeError:
-            lines.append(raw)
+            # A corrupt JSONL line must never leak raw text to the
+            # summariser — it could carry secrets from another session.
+            lines.append("[unparseable line]")
             continue
         role = str(entry.get("role", "")).upper() or "?"
         text = entry.get("text") or entry.get("content") or ""
@@ -183,11 +165,8 @@ def format_session_transcript(jsonl_content: str) -> str:
                 payload = (
                     f"{payload}\n[stderr] {stderr}" if payload else f"[stderr] {stderr}"
                 )
-            payload = (
-                payload
-                if len(payload) <= 400
-                else payload[:200] + "…[truncated]…" + payload[-200:]
-            )
+            if len(payload) > 400:
+                payload = payload[:200] + "…[truncated]…" + payload[-200:]
             header = f"[TOOL:{tool}]"
             if input_repr:
                 header = f"{header} input={input_repr}"

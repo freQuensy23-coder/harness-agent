@@ -1,12 +1,4 @@
-"""Memory mutation service.
-
-Owns the read-mutate-write loop for `MEMORY.md` / `USER.md`. The
-ToolCallExecutor's `memory` handler delegates here; the background
-MemoryReviewService does NOT call this directly — it publishes
-`ToolCallRequested` events that route to the executor and then back here.
-"""
-
-from __future__ import annotations
+"""Read-mutate-write loop for MEMORY.md / USER.md."""
 
 import asyncio
 import json
@@ -75,8 +67,6 @@ class MemoryService:
             "message": message,
             "entries": doc.entries,
             "entry_count": len(doc.entries),
-            "usage": (
-                f"{doc.usage_percent()}% — {doc.char_count:,}/{doc.limit:,} chars"
-            ),
+            "usage": f"{doc.usage_percent()}% — {doc.char_count:,}/{doc.limit:,} chars",
         }
         return RuntimeToolResult(stdout=json.dumps(payload, ensure_ascii=False))

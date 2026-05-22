@@ -1,23 +1,6 @@
-"""Background memory review.
-
-After every `nudge_interval` user turns the service fires an asyncio task
-that runs a shadow LLM turn restricted to the `memory` tool. The shadow
-turn never emits `AssistantTextProduced`; on completion it emits
-`MemoryReviewCompleted(actions, note)` for telemetry.
-
-Memory mutations from the review go through the same event bus as
-foreground tool calls: the service publishes a `ToolCallRequested` event
-with `generation=0` (review-scope marker) and awaits the matching
-`ToolCallCompleted` via `ToolCallResultWaiter`. The conversation projector
-and session log writer both skip non-current generations, so review-scope
-mutations are auditable on the event bus but never leak into the
-conversation transcript or the JSONL session log.
-"""
-
-from __future__ import annotations
+"""Background memory curation: shadow LLM turn restricted to the `memory` tool."""
 
 import asyncio
-import logging
 from collections import defaultdict
 from uuid import uuid4
 
@@ -41,9 +24,6 @@ from harness_agent.projections import SQLiteConversationProjection
 from harness_agent.tool_executor import ToolCallResultWaiter
 from harness_agent.tools import MemoryToolInput, ToolRegistry
 from harness_agent.turns import ConversationTurnCoordinator
-
-
-logger = logging.getLogger(__name__)
 
 
 EventBatch = tuple[EventBase, ...]
@@ -78,20 +58,6 @@ _REVIEW_USER_INSTRUCTION = (
 
 
 class MemoryReviewService:
-    """Counts user turns per conversation; spawns shadow reviews on threshold.
-
-    Counter is a `defaultdict[str, int]` keyed by `conversation_id`. It
-    increments on each `AssistantTextProduced` of the current generation
-    and resets to 0 when (a) the threshold fires, or (b) a foreground
-    memory tool call for the current generation completes. Review-scoped
-    (generation 0) memory completions are intentionally ignored — the
-    conversation may have advanced while the review was in flight and
-    resetting there would silently drop a newer foreground increment.
-    Stale-generation foreground completions are also ignored so this
-    service stays in lockstep with `ConversationProjector` and
-    `SessionLogWriter`.
-    """
-
     def __init__(
         self,
         *,
@@ -119,11 +85,10 @@ class MemoryReviewService:
     async def handle_assistant_text(self, event: AssistantTextProduced) -> EventBatch:
         if not await self._is_current(event.conversation_id, event.generation):
             return ()
-        # If a foreground memory tool call already fired in this same
-        # generation, the assistant's wrap-up text must NOT re-increment
-        # the counter. Without this guard, a foreground memory tool call
-        # followed by the assistant's final text could cross the threshold
-        # immediately and spawn a review of the work the model just did.
+        # A foreground memory tool call in the same generation already
+        # captured the "I learned something" signal — don't double-count
+        # the assistant's wrap-up text or we'd spawn a review of the work
+        # the model just did.
         key = (event.conversation_id, event.generation)
         if key in self._memory_used_in_generation:
             self._memory_used_in_generation.discard(key)
@@ -137,18 +102,13 @@ class MemoryReviewService:
     async def handle_tool_call_completed(self, event: ToolCallCompleted) -> EventBatch:
         if event.tool_name != "memory":
             return ()
+        # Review-scope mutations (generation 0) must not touch the
+        # counter — a newer foreground increment may have landed while
+        # the review was in flight, and resetting here would silently
+        # drop it.
         if event.generation == REVIEW_GENERATION:
-            # Review-scope mutation finished. Do NOT touch the counter:
-            # the conversation may have advanced while the review was in
-            # flight, and a newer foreground AssistantTextProduced may
-            # have already incremented the counter. Resetting here would
-            # silently drop that increment and delay the next review by
-            # one whole interval.
             return ()
         if not await self._is_current(event.conversation_id, event.generation):
-            # Stale foreground completion — the conversation has moved
-            # on to a newer generation. Mirror ConversationProjector and
-            # ignore it.
             return ()
         self._counters[event.conversation_id] = 0
         self._memory_used_in_generation.add(
@@ -157,10 +117,9 @@ class MemoryReviewService:
         return ()
 
     async def wait_until_idle(self) -> None:
-        """Wait for all in-flight review tasks to settle. Test helper."""
-        if not self._tasks:
-            return
-        await asyncio.gather(*self._tasks, return_exceptions=True)
+        """Test helper: await all in-flight review tasks."""
+        if self._tasks:
+            await asyncio.gather(*self._tasks, return_exceptions=True)
 
     def _spawn(self, user_id: str, conversation_id: str) -> None:
         task = asyncio.create_task(
@@ -171,87 +130,64 @@ class MemoryReviewService:
         task.add_done_callback(self._tasks.discard)
 
     async def _run_review(self, user_id: str, conversation_id: str) -> None:
-        try:
-            history = await self._projection.list_llm_messages(conversation_id)
-        except Exception as exc:  # pragma: no cover - defensive
-            logger.warning(
-                "memory review history fetch failed for %s: %s",
-                conversation_id,
-                exc,
-            )
-            return
+        history = await self._projection.list_llm_messages(conversation_id)
         if not history:
             return
-        try:
-            memory_tool = self._tool_registry.by_name("memory")
-        except KeyError:
-            logger.warning("memory tool not registered; skipping review")
-            return
+        memory_tool = self._tool_registry.by_name("memory")
         messages: list[LlmMessage] = list(history) + [
             UserMessage(text=_REVIEW_USER_INSTRUCTION)
         ]
         actions: list[str] = []
         note: str | None = None
         for _ in range(self._max_iterations):
-            request = LlmRequest(
-                user_id=user_id,
-                conversation_id=conversation_id,
-                generation=REVIEW_GENERATION,
-                system=_REVIEW_SYSTEM_PROMPT,
-                messages=messages,
-                tools=[memory_tool],
-            )
-            try:
-                response = await self._llm.respond(request)
-            except Exception as exc:  # pragma: no cover - defensive
-                logger.warning("memory review llm call failed: %s", exc)
-                return
-            if response.kind == "assistant_text":
-                note = response.text.strip() or None
-                break
-            if response.kind == "tool_call":
-                if response.name != "memory":
-                    logger.warning(
-                        "memory review attempted unauthorised tool %s",
-                        response.name,
-                    )
-                    break
-                if not isinstance(response.input, MemoryToolInput):
-                    logger.warning(
-                        "memory review got non-memory input payload: %r",
-                        response.input,
-                    )
-                    break
-                requested = ToolCallRequested(
+            response = await self._llm.respond(
+                LlmRequest(
                     user_id=user_id,
                     conversation_id=conversation_id,
                     generation=REVIEW_GENERATION,
-                    call_id=uuid4().hex,
-                    tool_name="memory",
-                    input=response.input,
+                    system=_REVIEW_SYSTEM_PROMPT,
+                    messages=messages,
+                    tools=[memory_tool],
                 )
-                self._tool_results.expect(requested)
-                await self._bus.publish(requested)
-                completed = await self._tool_results.wait(requested)
-                result = completed.result
-                actions.append(
-                    f"{response.input.action} {response.input.target}"
-                    if result.exit_code == 0
-                    else f"{response.input.action} {response.input.target} (rejected)"
-                )
-                messages = list(messages) + [
-                    AssistantToolCallMessage(
-                        call_id=requested.call_id,
-                        name=response.name,
-                        arguments=response.input.model_dump(mode="json"),
-                    ),
-                    ToolResultMessage(
-                        call_id=requested.call_id,
-                        name=response.name,
-                        content=result.render_for_llm("memory"),
-                    ),
-                ]
-                continue
+            )
+            if response.kind == "assistant_text":
+                note = response.text.strip() or None
+                break
+            if response.name != "memory" or not isinstance(
+                response.input, MemoryToolInput
+            ):
+                # The tool surface only lists `memory`; anything else is
+                # a model bug we don't try to recover from.
+                break
+            requested = ToolCallRequested(
+                user_id=user_id,
+                conversation_id=conversation_id,
+                generation=REVIEW_GENERATION,
+                call_id=uuid4().hex,
+                tool_name="memory",
+                input=response.input,
+            )
+            self._tool_results.expect(requested)
+            await self._bus.publish(requested)
+            completed = await self._tool_results.wait(requested)
+            result = completed.result
+            actions.append(
+                f"{response.input.action} {response.input.target}"
+                if result.exit_code == 0
+                else f"{response.input.action} {response.input.target} (rejected)"
+            )
+            messages = list(messages) + [
+                AssistantToolCallMessage(
+                    call_id=requested.call_id,
+                    name=response.name,
+                    arguments=response.input.model_dump(mode="json"),
+                ),
+                ToolResultMessage(
+                    call_id=requested.call_id,
+                    name=response.name,
+                    content=result.render_for_llm("memory"),
+                ),
+            ]
         if actions or note:
             await self._bus.publish(
                 MemoryReviewCompleted(
