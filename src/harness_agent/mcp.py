@@ -1,5 +1,6 @@
 import asyncio
 import json
+from collections.abc import Sequence
 from typing import Any, cast
 
 from pydantic import BaseModel, Field
@@ -125,10 +126,10 @@ class McpManager:
         self,
         *,
         runtime: DockerUserRuntime,
-        global_servers: list[McpServerConfig] | None = None,
+        global_servers: Sequence[McpServerConfig] = (),
     ) -> None:
         self._runtime = runtime
-        self._global_servers = [] if global_servers is None else list(global_servers)
+        self._global_servers = list(global_servers)
         self._sessions: dict[tuple[str, str], McpStdioSession] = {}
         self._tool_cache: dict[tuple[str, str], list[McpToolDefinition]] = {}
         self._server_cache: dict[tuple[str, str], McpServerConfig] = {}

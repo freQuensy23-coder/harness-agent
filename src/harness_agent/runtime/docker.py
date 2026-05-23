@@ -2,7 +2,6 @@ import asyncio
 import base64
 import json
 import posixpath
-import re
 import shlex
 from pathlib import Path
 from pathlib import PurePosixPath
@@ -15,6 +14,7 @@ from harness_agent.context import AgentFileSet, Skill
 from harness_agent.mcp_models import McpServerConfig, parse_mcp_server_yaml
 from harness_agent.memory import MemoryTarget
 from harness_agent.runtime.docker_runner import AsyncioDockerRunner
+from harness_agent.runtime.docker_state_files import DockerMemoryFiles, DockerSessionLog
 from harness_agent.runtime.models import (
     DockerProcessResult,
     RuntimeFileRead,
@@ -23,7 +23,7 @@ from harness_agent.runtime.models import (
 )
 from harness_agent.runtime.paths import (
     content_path,
-    safe_conversation_id_part,
+    safe_docker_user_part,
     workspace_path,
 )
 from harness_agent.runtime.protocols import DockerRunner, SpawnedProcessStore, UserRuntime
@@ -76,6 +76,8 @@ class DockerUserRuntime(UserRuntime):
             if spawned_process_store is not None
             else SQLiteSpawnedProcessStore(Path("./data/harness.runtime.sqlite3"))
         )
+        self._memory_files = DockerMemoryFiles(exec_in_container=self._exec)
+        self._session_log = DockerSessionLog(exec_in_container=self._exec)
 
     async def ensure_user_container(self, user_id: str) -> None:
         name = self._container_name(user_id)
@@ -406,15 +408,8 @@ class DockerUserRuntime(UserRuntime):
             raise RuntimeError(result.stderr)
         return result.stdout
 
-    @staticmethod
-    def _memory_path(target: MemoryTarget) -> str:
-        if target == "user":
-            return "/workspace/agent/USER.md"
-        return "/workspace/agent/MEMORY.md"
-
     async def read_memory_file(self, user_id: str, target: MemoryTarget) -> str:
-        path = self._memory_path(target)
-        return await self._read_text(user_id, path)
+        return await self._memory_files.read(user_id, target)
 
     async def write_memory_file(
         self,
@@ -422,33 +417,7 @@ class DockerUserRuntime(UserRuntime):
         target: MemoryTarget,
         content: str,
     ) -> None:
-        path = self._memory_path(target)
-        lock_path = f"{path}.lock"
-        # Single shell pipeline holds an exclusive flock for the duration of
-        # the read-from-stdin / atomic-rename. Concurrent docker exec calls
-        # serialize on the lock file inside the container.
-        script = (
-            "set -eu; "
-            f"d={shlex.quote(path)}; "
-            f"l={shlex.quote(lock_path)}; "
-            "touch \"$l\"; "
-            "( "
-            "  flock -x 9; "
-            "  tmp=$(mktemp \"$d.tmp.XXXXXX\"); "
-            "  trap 'rm -f \"$tmp\"' EXIT; "
-            "  cat > \"$tmp\"; "
-            "  mv \"$tmp\" \"$d\"; "
-            ") 9>\"$l\""
-        )
-        result = await self._exec(
-            user_id,
-            ["sh", "-lc", script],
-            stdin=content.encode("utf-8"),
-        )
-        if result.exit_code != 0:
-            raise RuntimeError(
-                result.stderr or f"failed to write memory file {path}"
-            )
+        await self._memory_files.write(user_id, target, content)
 
     async def append_session_log(
         self,
@@ -456,68 +425,13 @@ class DockerUserRuntime(UserRuntime):
         conversation_id: str,
         line: str,
     ) -> None:
-        # One JSONL line per message. We write under flock so concurrent
-        # writers (foreground turn vs background review) cannot interleave
-        # within one append. A non-zero exit from the container raises so
-        # the caller (SessionLogWriter) can publish a typed failure event
-        # rather than swallow it silently.
-        safe_id = safe_conversation_id_part(conversation_id)
-        if not safe_id:
-            return
-        path = f"/workspace/sessions/{safe_id}.jsonl"
-        lock_path = f"{path}.lock"
-        script = (
-            "set -eu; "
-            "mkdir -p /workspace/sessions; "
-            f"d={shlex.quote(path)}; "
-            f"l={shlex.quote(lock_path)}; "
-            "touch \"$l\"; "
-            "( flock -x 9; cat >> \"$d\"; ) 9>\"$l\""
-        )
-        result = await self._exec(
-            user_id,
-            ["sh", "-lc", script],
-            stdin=(line.rstrip("\n") + "\n").encode("utf-8"),
-        )
-        if result.exit_code != 0:
-            raise RuntimeError(
-                result.stderr
-                or f"session log append failed for {user_id}/{conversation_id}"
-            )
+        await self._session_log.append(user_id, conversation_id, line)
 
     async def list_session_logs(self, user_id: str) -> list[str]:
-        result = await self._exec(
-            user_id,
-            [
-                "sh",
-                "-lc",
-                "find /workspace/sessions -maxdepth 1 -name '*.jsonl' -type f | sort",
-            ],
-        )
-        if result.exit_code != 0:
-            return []
-        import urllib.parse
-
-        ids: list[str] = []
-        for line in result.stdout.splitlines():
-            stem = PurePosixPath(line.strip()).name
-            if stem.endswith(".jsonl"):
-                encoded = stem[: -len(".jsonl")]
-                # Reverse the encoding from `safe_conversation_id_part` so
-                # the contract is "list returns the raw conversation IDs".
-                ids.append(urllib.parse.unquote(encoded))
-        return ids
+        return await self._session_log.list(user_id)
 
     async def read_session_log(self, user_id: str, conversation_id: str) -> str:
-        safe_id = safe_conversation_id_part(conversation_id)
-        if not safe_id:
-            return ""
-        path = f"/workspace/sessions/{safe_id}.jsonl"
-        result = await self._exec(
-            user_id,
-            ["sh", "-lc", f"cat -- {shlex.quote(path)} 2>/dev/null || true"],
-        )
-        return result.stdout
+        return await self._session_log.read(user_id, conversation_id)
 
     async def _bootstrap_workspace(self, user_id: str) -> None:
         script = """
@@ -623,5 +537,4 @@ touch /workspace/agent/SOUL.md /workspace/agent/AGENTS.md /workspace/agent/USER.
             await self.ensure_user_container(user_id)
 
     def _container_name(self, user_id: str) -> str:
-        safe_user_id = re.sub(r"[^a-zA-Z0-9_.-]+", "-", user_id).strip("-")
-        return f"{self._container_prefix}-{safe_user_id}"
+        return f"{self._container_prefix}-{safe_docker_user_part(user_id)}"

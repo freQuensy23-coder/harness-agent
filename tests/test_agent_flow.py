@@ -1242,6 +1242,7 @@ async def test_e2e_compaction_cascade_in_order(
         "compaction.snapshot.ready",
         "compaction.summary.ready",
         "compaction.committed",
+        "compaction.archive.written",
         "agent.generation.started",
         "assistant.text.produced",
     ]

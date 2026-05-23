@@ -1,5 +1,6 @@
 import asyncio
 import json
+import sqlite3
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -9,6 +10,7 @@ from zoneinfo import ZoneInfo
 
 import aiosqlite
 from croniter import croniter
+from loguru import logger
 from pydantic import BaseModel, TypeAdapter
 
 from harness_agent.bus import EventBus
@@ -41,6 +43,19 @@ class CronScheduledMessage(ScheduledMessageBase):
 
 
 ScheduledMessage = OnceScheduledMessage | CronScheduledMessage
+
+
+class PendingDue(BaseModel):
+    """One entry in the durable outbox: state has already been advanced
+    in `scheduled_messages` (one-shot → completed, cron → next_run_at
+    shifted), but the corresponding `ScheduledMessageDue` event has
+    not yet been published. The pump drains these on each tick."""
+    due_id: str
+    schedule_id: str
+    user_id: str
+    conversation_id: str
+    text: str
+    reply_target: ReplyTarget | None = None
 
 
 class SQLiteScheduleStore:
@@ -173,7 +188,7 @@ class SQLiteScheduleStore:
     ) -> ScheduledMessage:
         await self._ensure_schema()
         async with aiosqlite.connect(self._path) as db:
-            await db.execute(
+            cursor = await db.execute(
                 """
                 update scheduled_messages
                 set status = 'cancelled'
@@ -183,10 +198,41 @@ class SQLiteScheduleStore:
                 """,
                 (schedule_id, user_id, conversation_id),
             )
+            if cursor.rowcount == 0:
+                await db.rollback()
+                raise KeyError(schedule_id)
             await db.commit()
-        return await self.get(schedule_id)
+            rows = await fetchall_rows(
+                db,
+                """
+                select
+                    id,
+                    user_id,
+                    conversation_id,
+                    kind,
+                    status,
+                    message,
+                    next_run_at,
+                    reply_target_json,
+                    cron,
+                    timezone
+                from scheduled_messages
+                where id = ?
+                  and user_id = ?
+                  and conversation_id = ?
+                """,
+                (schedule_id, user_id, conversation_id),
+            )
+        if not rows:
+            raise KeyError(schedule_id)
+        return self._row_to_schedule(rows[0])
 
     async def claim_due(self, now: datetime) -> list[ScheduledMessage]:
+        """Advance the state of every due schedule AND write a pending due
+        entry to the outbox — atomically in one SQLite transaction. The
+        pump publishes from the outbox afterwards; if the process crashes
+        between this commit and the publish, the outbox row survives and
+        the next tick will re-publish it."""
         await self._ensure_schema()
         now = now.astimezone(UTC)
         async with aiosqlite.connect(self._path) as db:
@@ -239,8 +285,73 @@ class SQLiteScheduleStore:
                             schedule.id,
                         ),
                     )
+                await db.execute(
+                    """
+                    insert into scheduled_due_outbox (
+                        id,
+                        schedule_id,
+                        user_id,
+                        conversation_id,
+                        text,
+                        reply_target_json,
+                        created_at
+                    )
+                    values (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        uuid4().hex,
+                        schedule.id,
+                        schedule.user_id,
+                        schedule.conversation_id,
+                        schedule.message,
+                        schedule.reply_target.model_dump_json()
+                        if schedule.reply_target is not None
+                        else None,
+                        now.isoformat(),
+                    ),
+                )
             await db.commit()
         return schedules
+
+    async def list_pending_due(self) -> list[PendingDue]:
+        """Read all outbox rows in creation order. Used by the pump to
+        re-publish anything that the previous tick committed but did not
+        get to publish (process crash, restart, etc.)."""
+        await self._ensure_schema()
+        async with aiosqlite.connect(self._path) as db:
+            rows = await fetchall_rows(
+                db,
+                """
+                select id, schedule_id, user_id, conversation_id, text, reply_target_json
+                from scheduled_due_outbox
+                order by created_at asc, id asc
+                """,
+                (),
+            )
+        out: list[PendingDue] = []
+        for row in rows:
+            reply_target: ReplyTarget | None = None
+            if row[5] is not None:
+                reply_target = self._reply_target_adapter.validate_python(json.loads(row[5]))
+            out.append(
+                PendingDue(
+                    due_id=row[0],
+                    schedule_id=row[1],
+                    user_id=row[2],
+                    conversation_id=row[3],
+                    text=row[4],
+                    reply_target=reply_target,
+                )
+            )
+        return out
+
+    async def mark_due_published(self, due_id: str) -> None:
+        async with aiosqlite.connect(self._path) as db:
+            await db.execute(
+                "delete from scheduled_due_outbox where id = ?",
+                (due_id,),
+            )
+            await db.commit()
 
     async def _insert(
         self,
@@ -344,6 +455,19 @@ class SQLiteScheduleStore:
                 )
                 """
             )
+            await db.execute(
+                """
+                create table if not exists scheduled_due_outbox (
+                    id text primary key,
+                    schedule_id text not null,
+                    user_id text not null,
+                    conversation_id text not null,
+                    text text not null,
+                    reply_target_json text,
+                    created_at text not null
+                )
+                """
+            )
             await db.commit()
 
 
@@ -373,17 +497,37 @@ class SchedulerPump:
         self._now = utc_now if now is None else now
 
     async def tick(self) -> None:
-        schedules = await self._store.claim_due(self._now())
-        for schedule in schedules:
-            await self._bus.publish(
-                ScheduledMessageDue(
-                    schedule_id=schedule.id,
-                    user_id=schedule.user_id,
-                    conversation_id=schedule.conversation_id,
-                    text=schedule.message,
-                    reply_target=schedule.reply_target,
-                )
+        await self._store.claim_due(self._now())
+        for pending in await self._store.list_pending_due():
+            event = ScheduledMessageDue(
+                id=pending.due_id,
+                schedule_id=pending.schedule_id,
+                user_id=pending.user_id,
+                conversation_id=pending.conversation_id,
+                text=pending.text,
+                reply_target=pending.reply_target,
             )
+            try:
+                await self._bus.publish(event)
+            except sqlite3.IntegrityError:
+                # The outbox row survived a crash inside bus.publish on
+                # a prior attempt: ScheduledMessageDue is already in the
+                # event store, but downstream handlers (projection write,
+                # session log, agent turn) may or may not have completed.
+                # We mark this row published anyway — re-dispatching the
+                # whole cascade would double the projected user message,
+                # session-log entries, and any agent generation already
+                # in flight. The wider crash window (between claim_due's
+                # commit and bus.publish being called at all) is still
+                # covered by the outbox; this catch only sacrifices the
+                # narrow in-publish window.
+                logger.warning(
+                    "scheduled.message.due {} already in event store; "
+                    "skipping handler re-dispatch to avoid duplicating "
+                    "projection / session-log / agent-turn side effects",
+                    event.id,
+                )
+            await self._store.mark_due_published(pending.due_id)
 
 
 class SchedulerService:
@@ -407,6 +551,7 @@ class SchedulerService:
             await task
         except asyncio.CancelledError:
             pass
+        self._task = None
 
     async def _run(self) -> None:
         while True:

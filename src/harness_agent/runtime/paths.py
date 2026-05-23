@@ -17,6 +17,35 @@ def safe_conversation_id_part(conversation_id: str) -> str:
     return urllib.parse.quote(conversation_id, safe="-._~")
 
 
+def safe_docker_user_part(user_id: str) -> str:
+    """Encode a user_id into an injective Docker-name-safe form.
+
+    Docker container names match `[a-zA-Z0-9_.-]+` (after the first
+    char). Percent-encoding is unusable because `%` is rejected, so we
+    use `_` as the escape: literal `_` doubles to `__`, and any byte
+    outside the Docker-safe set becomes `_HH`. Every `_` in the output
+    is followed either by another `_` (literal) or by two hex digits
+    (escaped byte), so distinct user_ids never collapse to the same
+    container name.
+    """
+    out: list[str] = []
+    for byte in user_id.encode("utf-8"):
+        if byte == 0x5F:
+            out.append("__")
+        elif (
+            0x30 <= byte <= 0x39
+            or 0x41 <= byte <= 0x5A
+            or 0x61 <= byte <= 0x7A
+            or byte == 0x2E
+            or byte == 0x2D
+        ):
+            out.append(chr(byte))
+        else:
+            out.append(f"_{byte:02x}")
+    encoded = "".join(out)
+    return encoded or "_"
+
+
 def workspace_path(path: str) -> str:
     normalized = posixpath.normpath(path)
     if not normalized.startswith("/"):

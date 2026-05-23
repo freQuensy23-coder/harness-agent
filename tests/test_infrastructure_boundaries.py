@@ -1,5 +1,6 @@
 import base64
 import json
+import re
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -14,6 +15,7 @@ from harness_agent.config import load_config
 from harness_agent.context import Skill
 from harness_agent.events import AssistantTextProduced, TelegramReplyTarget
 from harness_agent.runtime import DockerProcessResult, DockerUserRuntime, SQLiteSpawnedProcessStore
+from harness_agent.runtime.paths import safe_docker_user_part
 from harness_agent.tools import (
     FileWriteInput,
     ShellExecInput,
@@ -148,6 +150,35 @@ async def test_telegram_adapter_shows_typing_on_generation_start() -> None:
     ]
 
 
+def test_safe_docker_user_part_keeps_distinct_unsafe_ids_distinct() -> None:
+    """The old `re.sub("[^a-zA-Z0-9_.-]+", "-")` encoder collapsed every
+    run of unsafe chars to a single `-`, so `u:a/b`, `u:a:b`, `u:a b`
+    all became `u-a-b`. Different users would then share one Docker
+    container and leak runtime state into each other."""
+    encoded = {
+        safe_docker_user_part(raw)
+        for raw in ("u:a/b", "u:a:b", "u:a b", "u-a-b", "u_a_b")
+    }
+    assert len(encoded) == 5
+
+
+def test_safe_docker_user_part_emits_only_docker_safe_chars() -> None:
+    docker_name_part = re.compile(r"\A[a-zA-Z0-9_.-]+\Z")
+    raw_ids = ["u:1", "u/1", "u 1", "u%1", "юзер", "u_1", "1.2.3", ""]
+    for raw in raw_ids:
+        encoded = safe_docker_user_part(raw)
+        assert docker_name_part.fullmatch(encoded), (raw, encoded)
+
+
+def test_safe_docker_user_part_doubles_literal_underscore() -> None:
+    # Escape character `_` must double, otherwise a literal `_3a` and
+    # an encoded byte `0x3a` would both appear as `_3a`.
+    assert safe_docker_user_part("_") == "__"
+    assert safe_docker_user_part("u_1") == "u__1"
+    assert safe_docker_user_part("u:1") == "u_3a1"
+    assert safe_docker_user_part("u__1") != safe_docker_user_part("u:1")
+
+
 @pytest.mark.asyncio
 async def test_docker_runtime_routes_shell_without_changing_tool_name() -> None:
     runner = RecordingDockerRunner(
@@ -163,7 +194,7 @@ async def test_docker_runtime_routes_shell_without_changing_tool_name() -> None:
     assert result.stdout == "ok\n"
     assert runner.calls == [
         (
-            ["docker", "exec", "-w", "/workspace", "harness-u-123", "sh", "-lc", "pwd"],
+            ["docker", "exec", "-w", "/workspace", "harness-u_3a123", "sh", "-lc", "pwd"],
             None,
         )
     ]
@@ -180,7 +211,7 @@ async def test_docker_runtime_writes_memory_file_with_flock_and_atomic_rename() 
 
     assert len(runner.calls) == 1
     argv, stdin = runner.calls[0]
-    assert argv[:6] == ["docker", "exec", "-i", "harness-u-123", "sh", "-lc"]
+    assert argv[:6] == ["docker", "exec", "-i", "harness-u_3a123", "sh", "-lc"]
     script = argv[6]
     assert "/workspace/agent/MEMORY.md" in script
     assert "/workspace/agent/MEMORY.md.lock" in script
@@ -283,7 +314,7 @@ async def test_docker_runtime_writes_file_with_stdin() -> None:
                 "docker",
                 "exec",
                 "-i",
-                "harness-u-123",
+                "harness-u_3a123",
                 "sh",
                 "-lc",
                 "mkdir -p -- /workspace && cat > /workspace/hello.py",
@@ -343,7 +374,7 @@ async def test_docker_runtime_recovers_spawned_processes_after_restart(tmp_path:
     record = await store.get(process_id=process_id, user_id="u:123")
     assert record is not None
     assert record.command == "while true; do echo alive; sleep 1; done"
-    assert record.container_name == "harness-u-123"
+    assert record.container_name == "harness-u_3a123"
     assert record.stdout_offset == 0
 
     read_payload = {

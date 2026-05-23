@@ -509,6 +509,51 @@ async def test_claim_due_cron_advances_next_run_from_stored_metadata(tmp_path: P
     assert refreshed.next_run_at == datetime(2026, 5, 19, 12, 2, tzinfo=UTC)
 
 
+@pytest.mark.asyncio
+async def test_schedule_cancel_rejects_wrong_user_and_conversation(tmp_path: Path) -> None:
+    """Before the fix, cancel() scoped the UPDATE by user/conversation
+    but then `get(schedule_id)` read by id only — a wrong-scope caller
+    saw `status='active'` returned as if the cancel had succeeded, and
+    the real schedule kept firing."""
+    now = datetime(2026, 5, 19, 12, 0, tzinfo=UTC)
+    store = SQLiteScheduleStore(tmp_path / "schedules.sqlite3", now=lambda: now)
+    schedule = await store.create_once(
+        user_id="u:owner",
+        conversation_id="tg:owner",
+        message="ping",
+        reply_target=TelegramReplyTarget(chat_id=1),
+        delay_seconds=60,
+    )
+
+    # Wrong user.
+    with pytest.raises(KeyError):
+        await store.cancel(
+            schedule_id=schedule.id,
+            user_id="u:intruder",
+            conversation_id="tg:owner",
+        )
+
+    # Wrong conversation under the right user.
+    with pytest.raises(KeyError):
+        await store.cancel(
+            schedule_id=schedule.id,
+            user_id="u:owner",
+            conversation_id="tg:other",
+        )
+
+    # Schedule is still active after both rejected attempts.
+    untouched = await store.get(schedule.id)
+    assert untouched.status == "active"
+
+    # The legitimate owner can still cancel under matching scope.
+    cancelled = await store.cancel(
+        schedule_id=schedule.id,
+        user_id="u:owner",
+        conversation_id="tg:owner",
+    )
+    assert cancelled.status == "cancelled"
+
+
 class CountingPump:
     def __init__(self) -> None:
         self.ticks = 0
@@ -523,6 +568,187 @@ class CountingPump:
         while self.ticks <= previous_ticks:
             self._tick_event.clear()
             await asyncio.wait_for(self._tick_event.wait(), timeout=1)
+
+
+@pytest.mark.asyncio
+async def test_scheduler_due_survives_crash_between_state_advance_and_publish(
+    tmp_path: Path,
+) -> None:
+    """Before the outbox fix, claim_due committed the state advance to
+    SQLite and then SchedulerPump.tick() published ScheduledMessageDue
+    in a separate step. A crash between those two steps marked the
+    schedule fired in the database while no event ever reached the
+    user. The fix moves the would-be due event into a transactional
+    outbox so the next tick can re-publish it."""
+    now_value = datetime(2026, 5, 19, 12, 0, tzinfo=UTC)
+    store = SQLiteScheduleStore(tmp_path / "schedules.sqlite3", now=lambda: now_value)
+    await store.create_once(
+        user_id="u:1",
+        conversation_id="tg:1",
+        message="take your pill",
+        reply_target=TelegramReplyTarget(chat_id=1),
+        delay_seconds=0,
+    )
+
+    # First "process": claim succeeds, publish raises (simulated crash).
+    crashing_bus: list[ScheduledMessageDue] = []
+
+    class _CrashingBus:
+        async def publish(
+            self, event: ScheduledMessageDue, *, idempotent_replay: bool = False
+        ) -> None:
+            crashing_bus.append(event)
+            raise RuntimeError("simulated crash mid-publish")
+
+    pump_crashing = SchedulerPump(
+        store=store,
+        bus=_CrashingBus(),  # type: ignore[arg-type]
+        now=lambda: now_value + timedelta(seconds=1),
+    )
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        await pump_crashing.tick()
+
+    # Schedule state was advanced (the "data loss" pre-fix would stop here).
+    schedules = await store.list_for_conversation(user_id="u:1", conversation_id="tg:1")
+    assert len(schedules) == 1
+    assert schedules[0].status == "completed"
+    # Outbox row survives the crash — recovery is possible.
+    pending = await store.list_pending_due()
+    assert len(pending) == 1
+    assert pending[0].text == "take your pill"
+
+    # Second "process": fresh bus replays the outbox.
+    event_store = SQLiteEventStore(tmp_path / "events.sqlite3")
+    real_bus = EventBus(event_store)
+    captured: list[UserTextReceived] = []
+
+    async def capture(event: UserTextReceived) -> tuple:
+        captured.append(event)
+        return ()
+
+    bus_handler = SchedulerDueHandler()
+    real_bus.subscribe(ScheduledMessageDue, bus_handler.handle_due)
+    real_bus.subscribe(UserTextReceived, capture)
+
+    pump_recovered = SchedulerPump(
+        store=store,
+        bus=real_bus,
+        now=lambda: now_value + timedelta(seconds=10),
+    )
+    await pump_recovered.tick()
+
+    assert [(e.source, e.text) for e in captured] == [("scheduler", "take your pill")]
+    # Outbox drained — no more pending entries.
+    assert await store.list_pending_due() == []
+
+
+@pytest.mark.asyncio
+async def test_outbox_at_most_once_when_crash_happens_inside_bus_publish(
+    tmp_path: Path,
+) -> None:
+    """Crash inside bus.publish, after ScheduledMessageDue is in the
+    event store but before SchedulerDueHandler runs: the retry catches
+    the duplicate-id IntegrityError, marks the outbox row published,
+    and does NOT re-dispatch handlers (at-most-once for this window)."""
+    now_value = datetime(2026, 5, 19, 12, 0, tzinfo=UTC)
+    store = SQLiteScheduleStore(tmp_path / "schedules.sqlite3", now=lambda: now_value)
+    await store.create_once(
+        user_id="u:1",
+        conversation_id="tg:1",
+        message="take your pill",
+        reply_target=TelegramReplyTarget(chat_id=1),
+        delay_seconds=0,
+    )
+    event_store = SQLiteEventStore(tmp_path / "events.sqlite3")
+    bus = EventBus(event_store)
+
+    flaky_attempts: list[ScheduledMessageDue] = []
+
+    async def flaky_handler(event: ScheduledMessageDue) -> tuple:
+        flaky_attempts.append(event)
+        if len(flaky_attempts) == 1:
+            raise RuntimeError("simulated crash mid-publish")
+        return ()
+
+    # flaky subscribes first so it raises before SchedulerDueHandler runs
+    # on the first attempt — the exact in-publish window codex flagged.
+    bus.subscribe(ScheduledMessageDue, flaky_handler)
+    bus.subscribe(ScheduledMessageDue, SchedulerDueHandler().handle_due)
+
+    pump = SchedulerPump(
+        store=store,
+        bus=bus,
+        now=lambda: now_value + timedelta(seconds=1),
+    )
+
+    # First tick: ScheduledMessageDue persisted, flaky crashes, outbox stays.
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        await pump.tick()
+    assert [e.type for e in await event_store.list_events()] == [
+        "scheduled.message.due"
+    ]
+    assert len(await store.list_pending_due()) == 1
+
+    # Second tick: IntegrityError on the duplicate ScheduledMessageDue
+    # is caught, mark_due_published runs, handlers are NOT re-dispatched.
+    # UserTextReceived does NOT appear — at-most-once, by design.
+    await pump.tick()
+    assert [e.type for e in await event_store.list_events()] == [
+        "scheduled.message.due"
+    ]
+    assert await store.list_pending_due() == []
+    assert len(flaky_attempts) == 1
+
+
+@pytest.mark.asyncio
+async def test_outbox_recovers_when_crash_happens_before_bus_publish(
+    tmp_path: Path,
+) -> None:
+    """Crash between claim_due's commit and bus.publish being called:
+    the outbox row survives and the next tick delivers fully through
+    SchedulerDueHandler to UserTextReceived."""
+    now_value = datetime(2026, 5, 19, 12, 0, tzinfo=UTC)
+    store = SQLiteScheduleStore(tmp_path / "schedules.sqlite3", now=lambda: now_value)
+    await store.create_once(
+        user_id="u:1",
+        conversation_id="tg:1",
+        message="take your pill",
+        reply_target=TelegramReplyTarget(chat_id=1),
+        delay_seconds=0,
+    )
+
+    # Simulate "claim_due ran but the process died before tick's publish
+    # loop got going" by calling claim_due directly.
+    await store.claim_due(now_value + timedelta(seconds=1))
+    assert len(await store.list_pending_due()) == 1
+
+    # Restart: fresh bus and pump drain the outbox cleanly.
+    event_store = SQLiteEventStore(tmp_path / "events.sqlite3")
+    bus = EventBus(event_store)
+    bus.subscribe(ScheduledMessageDue, SchedulerDueHandler().handle_due)
+    captured: list[UserTextReceived] = []
+
+    async def capture(event: UserTextReceived) -> tuple:
+        captured.append(event)
+        return ()
+
+    bus.subscribe(UserTextReceived, capture)
+
+    pump = SchedulerPump(
+        store=store,
+        bus=bus,
+        now=lambda: now_value + timedelta(seconds=2),
+    )
+    await pump.tick()
+
+    assert [(e.source, e.text) for e in captured] == [
+        ("scheduler", "take your pill")
+    ]
+    assert sorted(e.type for e in await event_store.list_events()) == [
+        "scheduled.message.due",
+        "user.text.received",
+    ]
+    assert await store.list_pending_due() == []
 
 
 @pytest.mark.asyncio

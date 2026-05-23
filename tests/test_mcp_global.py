@@ -114,6 +114,23 @@ async def test_manager_without_globals_behaves_like_before() -> None:
     assert [s.name for s in servers] == ["local"]
 
 
+@pytest.mark.asyncio
+async def test_manager_accepts_immutable_sequence_for_global_servers() -> None:
+    """global_servers is typed Sequence[McpServerConfig], so a tuple of
+    configs is just as valid as a list. The previous `list | None`
+    signature falsely implied callers had to pass a list (or pass None
+    to mean nothing) — both of which were misleading."""
+    runtime = _FakeRuntime(user_servers=[])
+    manager = McpManager(
+        runtime=runtime,  # type: ignore[arg-type]
+        global_servers=(McpServerConfig(name="notion", command=["python", "/g.py"]),),
+    )
+
+    servers = await manager._servers_for_user("u:1")
+
+    assert [s.name for s in servers] == ["notion"]
+
+
 def test_parse_mcp_server_yaml_returns_config_for_valid_input() -> None:
     server = parse_mcp_server_yaml(
         "name: local\ncommand: [python, /workspace/mcp.py]\n",
