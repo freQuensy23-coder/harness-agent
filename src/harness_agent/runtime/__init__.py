@@ -1,5 +1,4 @@
-from harness_agent.runtime.docker import DockerUserRuntime
-from harness_agent.runtime.docker_runner import AsyncioDockerRunner
+from harness_agent.runtime.docker import AsyncioDockerRunner, DockerUserRuntime
 from harness_agent.runtime.fake import FakeUserRuntime
 from harness_agent.runtime.models import (
     DockerProcessResult,
