@@ -484,6 +484,7 @@ async def test_scheduler_due_event_becomes_fake_user_message(tmp_path: Path) -> 
     assert refreshed.status == "completed"
 
 
+@pytest.mark.asyncio
 async def test_claim_due_cron_advances_next_run_from_stored_metadata(tmp_path: Path) -> None:
     now = datetime(2026, 5, 19, 12, 0, tzinfo=UTC)
     schedule_store = SQLiteScheduleStore(tmp_path / "schedules.sqlite3", now=lambda: now)

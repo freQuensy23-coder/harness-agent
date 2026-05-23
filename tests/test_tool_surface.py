@@ -377,7 +377,7 @@ async def test_oversized_tool_output_paths_are_injective_for_unsafe_ids() -> Non
             RuntimeToolResult(stdout="z" * 30_001),
         ]
     )
-    executor = ToolCallExecutor(runtime=runtime, max_model_output_chars=20_000)
+    executor = tool_executor_for_test(runtime=runtime, max_model_output_chars=20_000)
 
     for cid in ("tg:big", "tg/big", "tg-big"):
         await executor.handle_tool_call_requested(
