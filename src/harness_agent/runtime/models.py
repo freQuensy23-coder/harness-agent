@@ -1,3 +1,5 @@
+from collections.abc import Awaitable, Callable
+
 from pydantic import BaseModel, Field
 
 from harness_agent.content import WorkspaceFile
@@ -45,3 +47,10 @@ class SpawnedProcessRecord(BaseModel):
     exit_code_path: str
     stdout_offset: int = 0
     stderr_offset: int = 0
+
+
+# Bound method on the DockerUserRuntime facade that runs an argv inside
+# the user's container (handles `ensure_user_container` plumbing). Each
+# `docker/*` collaborator takes this callable instead of reaching into
+# the facade, keeping the dependency direction one-way.
+ExecInContainer = Callable[..., Awaitable[DockerProcessResult]]

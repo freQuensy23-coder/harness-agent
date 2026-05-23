@@ -9,10 +9,9 @@ from collections.abc import Awaitable, Callable
 from loguru import logger
 
 from harness_agent.mcp_models import McpServerConfig, parse_mcp_server_yaml
-from harness_agent.runtime.models import DockerProcessResult
+from harness_agent.runtime.models import ExecInContainer
 
 
-ExecInContainer = Callable[..., Awaitable[DockerProcessResult]]
 ReadText = Callable[[str, str], Awaitable[str]]
 
 

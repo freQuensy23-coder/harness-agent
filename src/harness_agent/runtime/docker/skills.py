@@ -10,11 +10,10 @@ from pathlib import PurePosixPath
 from loguru import logger
 
 from harness_agent.context import Skill
-from harness_agent.runtime.models import DockerProcessResult
+from harness_agent.runtime.models import ExecInContainer
 from harness_agent.runtime.skills import parse_skill_markdown
 
 
-ExecInContainer = Callable[..., Awaitable[DockerProcessResult]]
 ReadText = Callable[[str, str], Awaitable[str]]
 
 

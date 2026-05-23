@@ -12,6 +12,7 @@ from uuid import uuid4
 
 from harness_agent.runtime.models import (
     DockerProcessResult,
+    ExecInContainer,
     RuntimeToolResult,
     SpawnedProcessRecord,
 )
@@ -30,7 +31,6 @@ from harness_agent.tools import (
 )
 
 
-ExecInContainer = Callable[..., Awaitable[DockerProcessResult]]
 RunInContainer = Callable[..., Awaitable[DockerProcessResult]]
 RunInContainerDetached = Callable[..., Awaitable[DockerProcessResult]]
 MaybeEnsure = Callable[[str], Awaitable[None]]

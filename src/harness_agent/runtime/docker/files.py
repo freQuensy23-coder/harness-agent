@@ -9,11 +9,10 @@ are performed with a single `docker exec` per call via the shared
 import base64
 import posixpath
 import shlex
-from collections.abc import Awaitable, Callable
 
 from harness_agent.content import WorkspaceFile
 from harness_agent.runtime.models import (
-    DockerProcessResult,
+    ExecInContainer,
     RuntimeFileRead,
     RuntimeToolResult,
 )
@@ -27,9 +26,6 @@ from harness_agent.tools import (
     FileReadInput,
     FileWriteInput,
 )
-
-
-ExecInContainer = Callable[..., Awaitable[DockerProcessResult]]
 
 
 class DockerFiles:

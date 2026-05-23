@@ -14,12 +14,13 @@ from loguru import logger
 from harness_agent.context import AgentFileSet, Skill
 from harness_agent.mcp_models import McpServerConfig
 from harness_agent.memory import MemoryTarget
-from harness_agent.runtime.docker_files import DockerFiles
-from harness_agent.runtime.docker_mcp_discovery import DockerMcpDiscovery
-from harness_agent.runtime.docker_runner import AsyncioDockerRunner
-from harness_agent.runtime.docker_shell import DockerShell
-from harness_agent.runtime.docker_skills import DockerSkills
-from harness_agent.runtime.docker_state_files import DockerMemoryFiles, DockerSessionLog
+from harness_agent.runtime.docker.files import DockerFiles
+from harness_agent.runtime.docker.mcp_discovery import DockerMcpDiscovery
+from harness_agent.runtime.docker.memory import DockerMemoryFiles
+from harness_agent.runtime.docker.runner import AsyncioDockerRunner
+from harness_agent.runtime.docker.session_log import DockerSessionLog
+from harness_agent.runtime.docker.shell import DockerShell
+from harness_agent.runtime.docker.skills import DockerSkills
 from harness_agent.runtime.models import (
     DockerProcessResult,
     RuntimeFileRead,
