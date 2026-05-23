@@ -646,20 +646,10 @@ async def test_scheduler_due_survives_crash_between_state_advance_and_publish(
 async def test_outbox_at_most_once_when_crash_happens_inside_bus_publish(
     tmp_path: Path,
 ) -> None:
-    """Codex-flagged narrow crash window: process dies *inside*
-    bus.publish, after ScheduledMessageDue lands in the event store
-    but before the SchedulerDueHandler / UserTextReceived chain
-    completes. On retry the pump catches the IntegrityError on the
-    duplicate ScheduledMessageDue and marks the outbox row published
-    WITHOUT re-dispatching handlers.
-
-    This is an intentional at-most-once trade-off for this narrow
-    window: re-dispatching would double the projection write, session
-    log line, and any in-flight agent generation, which is worse than
-    occasionally losing one reminder when both a crash and a partial
-    publish hit at the same micro-second. The wider crash window —
-    between claim_due's commit and bus.publish being called at all —
-    is covered by the outbox and tested separately."""
+    """Crash inside bus.publish, after ScheduledMessageDue is in the
+    event store but before SchedulerDueHandler runs: the retry catches
+    the duplicate-id IntegrityError, marks the outbox row published,
+    and does NOT re-dispatch handlers (at-most-once for this window)."""
     now_value = datetime(2026, 5, 19, 12, 0, tzinfo=UTC)
     store = SQLiteScheduleStore(tmp_path / "schedules.sqlite3", now=lambda: now_value)
     await store.create_once(
@@ -714,10 +704,9 @@ async def test_outbox_at_most_once_when_crash_happens_inside_bus_publish(
 async def test_outbox_recovers_when_crash_happens_before_bus_publish(
     tmp_path: Path,
 ) -> None:
-    """The wider, more common crash window: claim_due commits state +
-    outbox row, but the process dies before bus.publish is called at
-    all. The next tick re-reads the outbox and delivers fully —
-    UserTextReceived is produced on the retry."""
+    """Crash between claim_due's commit and bus.publish being called:
+    the outbox row survives and the next tick delivers fully through
+    SchedulerDueHandler to UserTextReceived."""
     now_value = datetime(2026, 5, 19, 12, 0, tzinfo=UTC)
     store = SQLiteScheduleStore(tmp_path / "schedules.sqlite3", now=lambda: now_value)
     await store.create_once(
