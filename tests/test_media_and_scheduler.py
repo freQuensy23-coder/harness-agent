@@ -594,7 +594,9 @@ async def test_scheduler_due_survives_crash_between_state_advance_and_publish(
     crashing_bus: list[ScheduledMessageDue] = []
 
     class _CrashingBus:
-        async def publish(self, event: ScheduledMessageDue) -> None:
+        async def publish(
+            self, event: ScheduledMessageDue, *, idempotent_replay: bool = False
+        ) -> None:
             crashing_bus.append(event)
             raise RuntimeError("simulated crash mid-publish")
 
@@ -641,69 +643,66 @@ async def test_scheduler_due_survives_crash_between_state_advance_and_publish(
 
 
 @pytest.mark.asyncio
-async def test_scheduler_outbox_replay_is_idempotent_on_event_store(
+async def test_scheduler_redelivers_user_text_when_handler_crashes_after_store_append(
     tmp_path: Path,
 ) -> None:
-    """If a previous attempt published the event but crashed before
-    deleting the outbox row, re-publishing must NOT produce a duplicate
-    ScheduledMessageDue in the event store (the event id is deterministic
-    from the outbox row, so the unique constraint in events.id catches
-    it and tick() proceeds to delete the outbox row idempotently)."""
+    """Codex-flagged window: a process can die *inside* bus.publish, after
+    ScheduledMessageDue lands in the event store but before
+    SchedulerDueHandler runs. Retry must still produce UserTextReceived
+    exactly once. The fix is bus.publish(idempotent_replay=True) on the
+    pump side plus a deterministic UserTextReceived.id so the cascade is
+    append-idempotent."""
     now_value = datetime(2026, 5, 19, 12, 0, tzinfo=UTC)
     store = SQLiteScheduleStore(tmp_path / "schedules.sqlite3", now=lambda: now_value)
     await store.create_once(
         user_id="u:1",
         conversation_id="tg:1",
-        message="ping",
+        message="take your pill",
         reply_target=TelegramReplyTarget(chat_id=1),
         delay_seconds=0,
     )
     event_store = SQLiteEventStore(tmp_path / "events.sqlite3")
-    real_bus = EventBus(event_store)
+    bus = EventBus(event_store)
+
+    flaky_attempts: list[ScheduledMessageDue] = []
+
+    async def flaky_handler(event: ScheduledMessageDue) -> tuple:
+        flaky_attempts.append(event)
+        if len(flaky_attempts) == 1:
+            # Simulate process death after store.append but before later
+            # handlers in the chain get a chance to run.
+            raise RuntimeError("simulated crash mid-publish")
+        return ()
+
+    # flaky subscribes first so it raises before SchedulerDueHandler runs
+    # on the first attempt — that is the exact window codex flagged.
+    bus.subscribe(ScheduledMessageDue, flaky_handler)
+    bus.subscribe(ScheduledMessageDue, SchedulerDueHandler().handle_due)
+
     pump = SchedulerPump(
         store=store,
-        bus=real_bus,
+        bus=bus,
         now=lambda: now_value + timedelta(seconds=1),
     )
 
-    await pump.tick()
-    # Manually re-introduce the outbox entry to simulate "published but not
-    # marked-published" — easiest way to force the duplicate path.
-    pending_after_first = await store.list_pending_due()
-    assert pending_after_first == []
-    events_after_first = [e for e in await event_store.list_events() if e.type == "scheduled.message.due"]
-    assert len(events_after_first) == 1
-    replayed_event = events_after_first[0]
+    # First tick: ScheduledMessageDue persists, handler crashes, outbox stays.
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        await pump.tick()
 
-    # Re-insert the same outbox row using the same id; next tick will try
-    # to publish a ScheduledMessageDue with the same id again.
-    import aiosqlite
-    async with aiosqlite.connect(tmp_path / "schedules.sqlite3") as db:
-        await db.execute(
-            """
-            insert into scheduled_due_outbox(
-                id, schedule_id, user_id, conversation_id, text, reply_target_json, created_at
-            ) values (?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                replayed_event.id,
-                "(any)",
-                "u:1",
-                "tg:1",
-                "ping",
-                None,
-                now_value.isoformat(),
-            ),
-        )
-        await db.commit()
+    types_after_crash = [e.type for e in await event_store.list_events()]
+    assert types_after_crash == ["scheduled.message.due"]
+    assert len(await store.list_pending_due()) == 1
 
+    # Second tick: idempotent_replay swallows the IntegrityError on
+    # store.append and dispatches handlers; flaky succeeds; the real
+    # SchedulerDueHandler emits UserTextReceived with the deterministic
+    # id `scheduler-due:<due.id>` so it appends exactly once.
     await pump.tick()
 
-    # Still exactly one ScheduledMessageDue in the event store.
-    events_after_replay = [e for e in await event_store.list_events() if e.type == "scheduled.message.due"]
-    assert len(events_after_replay) == 1
-    # Outbox drained.
+    final_types = sorted(e.type for e in await event_store.list_events())
+    assert final_types == ["scheduled.message.due", "user.text.received"]
     assert await store.list_pending_due() == []
+    assert len(flaky_attempts) == 2
 
 
 @pytest.mark.asyncio

@@ -1,6 +1,5 @@
 import asyncio
 import json
-import sqlite3
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -472,8 +471,15 @@ class SQLiteScheduleStore:
 
 class SchedulerDueHandler:
     async def handle_due(self, event: ScheduledMessageDue) -> tuple[EventBase, ...]:
+        # Deterministic UserTextReceived id derived from the outbox-owned
+        # ScheduledMessageDue id so that an idempotent_replay re-dispatch
+        # produces the same downstream event — the event store rejects the
+        # duplicate, the bus dispatches its handlers anyway, and the user
+        # ends up with exactly one synthetic message even if the previous
+        # attempt crashed between store.append and handler dispatch.
         return (
             UserTextReceived(
+                id=f"scheduler-due:{event.id}",
                 user_id=event.user_id,
                 conversation_id=event.conversation_id,
                 source="scheduler",
@@ -496,13 +502,7 @@ class SchedulerPump:
         self._now = utc_now if now is None else now
 
     async def tick(self) -> None:
-        # Step 1: atomically advance state + add new due entries to the
-        # outbox. After this commit, the outbox is the durable record of
-        # "this schedule fired and owes a ScheduledMessageDue event".
         await self._store.claim_due(self._now())
-        # Step 2: drain the outbox. On a fresh tick this is just the rows
-        # we wrote in step 1; on a restart after crash it ALSO contains
-        # whatever the previous process committed but did not publish.
         for pending in await self._store.list_pending_due():
             event = ScheduledMessageDue(
                 id=pending.due_id,
@@ -512,13 +512,13 @@ class SchedulerPump:
                 text=pending.text,
                 reply_target=pending.reply_target,
             )
-            try:
-                await self._bus.publish(event)
-            except sqlite3.IntegrityError:
-                # Event with this id is already in the event store —
-                # a previous attempt published but crashed before the
-                # mark_due_published below. Idempotent: treat as done.
-                pass
+            # idempotent_replay re-dispatches handlers even when the
+            # event id is already in the store, so a previous attempt
+            # that crashed between store.append and handler dispatch
+            # still delivers UserTextReceived on retry. The downstream
+            # SchedulerDueHandler keys UserTextReceived's id on this
+            # event's id so the cascade is also append-idempotent.
+            await self._bus.publish(event, idempotent_replay=True)
             await self._store.mark_due_published(pending.due_id)
 
 

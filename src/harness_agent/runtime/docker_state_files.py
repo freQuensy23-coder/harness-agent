@@ -1,12 +1,5 @@
-"""Helpers for the per-user memory files (`MEMORY.md`, `USER.md`) and
-session-log JSONL files inside the Docker workspace.
-
-Extracted out of `DockerUserRuntime` so the central runtime class stays
-focused on container/shell/file primitives. Each helper holds a
-reference to the runtime's `_exec(user_id, argv, *, stdin=...)` callable
-and reuses the same docker-exec plumbing — there is no duplicate path
-to the container.
-"""
+"""Per-user state files inside the Docker workspace: agent memory
+(`MEMORY.md`, `USER.md`) and conversation session-log JSONL files."""
 
 import shlex
 import urllib.parse
