@@ -643,15 +643,23 @@ async def test_scheduler_due_survives_crash_between_state_advance_and_publish(
 
 
 @pytest.mark.asyncio
-async def test_scheduler_redelivers_user_text_when_handler_crashes_after_store_append(
+async def test_outbox_at_most_once_when_crash_happens_inside_bus_publish(
     tmp_path: Path,
 ) -> None:
-    """Codex-flagged window: a process can die *inside* bus.publish, after
-    ScheduledMessageDue lands in the event store but before
-    SchedulerDueHandler runs. Retry must still produce UserTextReceived
-    exactly once. The fix is bus.publish(idempotent_replay=True) on the
-    pump side plus a deterministic UserTextReceived.id so the cascade is
-    append-idempotent."""
+    """Codex-flagged narrow crash window: process dies *inside*
+    bus.publish, after ScheduledMessageDue lands in the event store
+    but before the SchedulerDueHandler / UserTextReceived chain
+    completes. On retry the pump catches the IntegrityError on the
+    duplicate ScheduledMessageDue and marks the outbox row published
+    WITHOUT re-dispatching handlers.
+
+    This is an intentional at-most-once trade-off for this narrow
+    window: re-dispatching would double the projection write, session
+    log line, and any in-flight agent generation, which is worse than
+    occasionally losing one reminder when both a crash and a partial
+    publish hit at the same micro-second. The wider crash window —
+    between claim_due's commit and bus.publish being called at all —
+    is covered by the outbox and tested separately."""
     now_value = datetime(2026, 5, 19, 12, 0, tzinfo=UTC)
     store = SQLiteScheduleStore(tmp_path / "schedules.sqlite3", now=lambda: now_value)
     await store.create_once(
@@ -669,13 +677,11 @@ async def test_scheduler_redelivers_user_text_when_handler_crashes_after_store_a
     async def flaky_handler(event: ScheduledMessageDue) -> tuple:
         flaky_attempts.append(event)
         if len(flaky_attempts) == 1:
-            # Simulate process death after store.append but before later
-            # handlers in the chain get a chance to run.
             raise RuntimeError("simulated crash mid-publish")
         return ()
 
     # flaky subscribes first so it raises before SchedulerDueHandler runs
-    # on the first attempt — that is the exact window codex flagged.
+    # on the first attempt — the exact in-publish window codex flagged.
     bus.subscribe(ScheduledMessageDue, flaky_handler)
     bus.subscribe(ScheduledMessageDue, SchedulerDueHandler().handle_due)
 
@@ -685,24 +691,75 @@ async def test_scheduler_redelivers_user_text_when_handler_crashes_after_store_a
         now=lambda: now_value + timedelta(seconds=1),
     )
 
-    # First tick: ScheduledMessageDue persists, handler crashes, outbox stays.
+    # First tick: ScheduledMessageDue persisted, flaky crashes, outbox stays.
     with pytest.raises(RuntimeError, match="simulated crash"):
         await pump.tick()
-
-    types_after_crash = [e.type for e in await event_store.list_events()]
-    assert types_after_crash == ["scheduled.message.due"]
+    assert [e.type for e in await event_store.list_events()] == [
+        "scheduled.message.due"
+    ]
     assert len(await store.list_pending_due()) == 1
 
-    # Second tick: idempotent_replay swallows the IntegrityError on
-    # store.append and dispatches handlers; flaky succeeds; the real
-    # SchedulerDueHandler emits UserTextReceived with the deterministic
-    # id `scheduler-due:<due.id>` so it appends exactly once.
+    # Second tick: IntegrityError on the duplicate ScheduledMessageDue
+    # is caught, mark_due_published runs, handlers are NOT re-dispatched.
+    # UserTextReceived does NOT appear — at-most-once, by design.
+    await pump.tick()
+    assert [e.type for e in await event_store.list_events()] == [
+        "scheduled.message.due"
+    ]
+    assert await store.list_pending_due() == []
+    assert len(flaky_attempts) == 1
+
+
+@pytest.mark.asyncio
+async def test_outbox_recovers_when_crash_happens_before_bus_publish(
+    tmp_path: Path,
+) -> None:
+    """The wider, more common crash window: claim_due commits state +
+    outbox row, but the process dies before bus.publish is called at
+    all. The next tick re-reads the outbox and delivers fully —
+    UserTextReceived is produced on the retry."""
+    now_value = datetime(2026, 5, 19, 12, 0, tzinfo=UTC)
+    store = SQLiteScheduleStore(tmp_path / "schedules.sqlite3", now=lambda: now_value)
+    await store.create_once(
+        user_id="u:1",
+        conversation_id="tg:1",
+        message="take your pill",
+        reply_target=TelegramReplyTarget(chat_id=1),
+        delay_seconds=0,
+    )
+
+    # Simulate "claim_due ran but the process died before tick's publish
+    # loop got going" by calling claim_due directly.
+    await store.claim_due(now_value + timedelta(seconds=1))
+    assert len(await store.list_pending_due()) == 1
+
+    # Restart: fresh bus and pump drain the outbox cleanly.
+    event_store = SQLiteEventStore(tmp_path / "events.sqlite3")
+    bus = EventBus(event_store)
+    bus.subscribe(ScheduledMessageDue, SchedulerDueHandler().handle_due)
+    captured: list[UserTextReceived] = []
+
+    async def capture(event: UserTextReceived) -> tuple:
+        captured.append(event)
+        return ()
+
+    bus.subscribe(UserTextReceived, capture)
+
+    pump = SchedulerPump(
+        store=store,
+        bus=bus,
+        now=lambda: now_value + timedelta(seconds=2),
+    )
     await pump.tick()
 
-    final_types = sorted(e.type for e in await event_store.list_events())
-    assert final_types == ["scheduled.message.due", "user.text.received"]
+    assert [(e.source, e.text) for e in captured] == [
+        ("scheduler", "take your pill")
+    ]
+    assert sorted(e.type for e in await event_store.list_events()) == [
+        "scheduled.message.due",
+        "user.text.received",
+    ]
     assert await store.list_pending_due() == []
-    assert len(flaky_attempts) == 2
 
 
 @pytest.mark.asyncio

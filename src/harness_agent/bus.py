@@ -1,5 +1,4 @@
 import asyncio
-import sqlite3
 from collections.abc import Awaitable, Callable, Iterable
 from typing import Any, cast
 
@@ -28,28 +27,8 @@ class EventBus:
     def send(self, event: AgentEvent) -> asyncio.Task[None]:
         return asyncio.create_task(self.publish(event))
 
-    async def publish(
-        self,
-        event: AgentEvent,
-        *,
-        idempotent_replay: bool = False,
-    ) -> None:
-        """Persist `event` and dispatch handlers.
-
-        `idempotent_replay=True` opts the caller into outbox-style retry
-        semantics: if the event id is already in the store (a previous
-        attempt crashed between append and handler dispatch), the append
-        is treated as a no-op and handlers are dispatched anyway. The
-        flag propagates into recursively-published follow-ups, so
-        downstream events with deterministic ids stay idempotent too.
-        Callers using this path must ensure handler effects are
-        idempotent (typically via deterministic event ids).
-        """
-        try:
-            await self._store.append(event)
-        except sqlite3.IntegrityError:
-            if not idempotent_replay:
-                raise
+    async def publish(self, event: AgentEvent) -> None:
+        await self._store.append(event)
         pending: list[EventBase] = []
         event_class = event.__class__
         if event_class in self._handlers:
@@ -57,7 +36,4 @@ class EventBus:
                 result = await handler(event)
                 pending.extend(result)
         for next_event in pending:
-            await self.publish(
-                cast(AgentEvent, next_event),
-                idempotent_replay=idempotent_replay,
-            )
+            await self.publish(cast(AgentEvent, next_event))

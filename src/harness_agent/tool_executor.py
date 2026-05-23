@@ -752,10 +752,15 @@ def _tool_call_key(event: ToolCallRequested | ToolCallCompleted) -> ToolCallKey:
 
 
 def _tool_result_path(event: ToolCallRequested) -> str:
+    # Use `/` between components: safe_conversation_id_part percent-escapes
+    # any `/` inside the encoded conversation_id / call_id, so `/` only
+    # ever appears as our separator. A flat `-` join would collide on
+    # tuples like (conv="cli-1", gen=2, call="a") vs (conv="cli", gen=1,
+    # call="2-a") because `-` is in the percent-encoding safe set.
     return (
         "/workspace/content/tool-results/"
-        f"{safe_conversation_id_part(event.conversation_id)}-"
-        f"{event.generation}-"
+        f"{safe_conversation_id_part(event.conversation_id)}/"
+        f"{event.generation}/"
         f"{safe_conversation_id_part(event.call_id)}.txt"
     )
 

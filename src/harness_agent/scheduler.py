@@ -1,5 +1,6 @@
 import asyncio
 import json
+import sqlite3
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -9,6 +10,7 @@ from zoneinfo import ZoneInfo
 
 import aiosqlite
 from croniter import croniter
+from loguru import logger
 from pydantic import BaseModel, TypeAdapter
 
 from harness_agent.bus import EventBus
@@ -471,15 +473,8 @@ class SQLiteScheduleStore:
 
 class SchedulerDueHandler:
     async def handle_due(self, event: ScheduledMessageDue) -> tuple[EventBase, ...]:
-        # Deterministic UserTextReceived id derived from the outbox-owned
-        # ScheduledMessageDue id so that an idempotent_replay re-dispatch
-        # produces the same downstream event — the event store rejects the
-        # duplicate, the bus dispatches its handlers anyway, and the user
-        # ends up with exactly one synthetic message even if the previous
-        # attempt crashed between store.append and handler dispatch.
         return (
             UserTextReceived(
-                id=f"scheduler-due:{event.id}",
                 user_id=event.user_id,
                 conversation_id=event.conversation_id,
                 source="scheduler",
@@ -512,13 +507,26 @@ class SchedulerPump:
                 text=pending.text,
                 reply_target=pending.reply_target,
             )
-            # idempotent_replay re-dispatches handlers even when the
-            # event id is already in the store, so a previous attempt
-            # that crashed between store.append and handler dispatch
-            # still delivers UserTextReceived on retry. The downstream
-            # SchedulerDueHandler keys UserTextReceived's id on this
-            # event's id so the cascade is also append-idempotent.
-            await self._bus.publish(event, idempotent_replay=True)
+            try:
+                await self._bus.publish(event)
+            except sqlite3.IntegrityError:
+                # The outbox row survived a crash inside bus.publish on
+                # a prior attempt: ScheduledMessageDue is already in the
+                # event store, but downstream handlers (projection write,
+                # session log, agent turn) may or may not have completed.
+                # We mark this row published anyway — re-dispatching the
+                # whole cascade would double the projected user message,
+                # session-log entries, and any agent generation already
+                # in flight. The wider crash window (between claim_due's
+                # commit and bus.publish being called at all) is still
+                # covered by the outbox; this catch only sacrifices the
+                # narrow in-publish window.
+                logger.warning(
+                    "scheduled.message.due {} already in event store; "
+                    "skipping handler re-dispatch to avoid duplicating "
+                    "projection / session-log / agent-turn side effects",
+                    event.id,
+                )
             await self._store.mark_due_published(pending.due_id)
 
 
