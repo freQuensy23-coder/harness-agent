@@ -1,37 +1,28 @@
-import asyncio
+"""Router that dispatches `ToolCallRequested` events to per-domain handlers."""
+
 from collections.abc import Awaitable, Callable
-from datetime import UTC, datetime
 
-from pydantic import BaseModel, Field
-
-from harness_agent.content import (
-    ContentRef,
-    content_ref_from_bytes,
-    content_ref_from_workspace_file,
-)
-from harness_agent.events import EventBase, ToolCallCompleted, ToolCallError, ToolCallRequested
-from harness_agent.image_jobs import (
-    ImageJobService,
-    render_image_job_record,
-)
+from harness_agent.content import content_ref_from_workspace_file
+from harness_agent.events import ToolCallCompleted, ToolCallError, ToolCallRequested
+from harness_agent.image_jobs import ImageJobService
 from harness_agent.mcp import McpManager
 from harness_agent.memory_service import MemoryService
 from harness_agent.runtime import RuntimeToolResult, UserRuntime
-from harness_agent.runtime.paths import safe_conversation_id_part
 from harness_agent.scheduler import SQLiteScheduleStore
 from harness_agent.session_search_service import SessionSearchService
-from harness_agent.subagents import (
-    SubAgentService,
-    render_sub_agent_record,
-    render_sub_agent_records,
+from harness_agent.subagents import SubAgentService
+from harness_agent.tasks import SQLiteTaskStore
+from harness_agent.tool_call_results import ToolExecutionResult
+from harness_agent.tool_call_waiter import (
+    EventBatch,
+    ToolCallResultWaiter,
+    tool_result_spill_path,
 )
-from harness_agent.tasks import SQLiteTaskStore, tasks_to_json
+from harness_agent.tool_image_handlers import ImageToolHandlers
+from harness_agent.tool_schedule_handlers import ScheduleToolHandlers
+from harness_agent.tool_sub_agent_handlers import SubAgentToolHandlers
+from harness_agent.tool_task_handlers import TaskToolHandlers
 from harness_agent.tools import (
-    AgentCancelInput,
-    AgentListInput,
-    AgentResultInput,
-    AgentRunInput,
-    AgentSpawnInput,
     FileEditInput,
     FileGlobInput,
     FileGrepInput,
@@ -39,14 +30,8 @@ from harness_agent.tools import (
     FileMultiEditInput,
     FileReadInput,
     FileWriteInput,
-    ImageGenerateInput,
-    ImageStatusInput,
     McpToolInput,
     MemoryToolInput,
-    ScheduleCancelInput,
-    ScheduleCronInput,
-    ScheduleListInput,
-    ScheduleOnceInput,
     SessionSearchInput,
     ShellExecInput,
     ShellKillInput,
@@ -54,11 +39,6 @@ from harness_agent.tools import (
     ShellSpawnInput,
     SkillListInput,
     SkillReadInput,
-    TaskCreateInput,
-    TaskGetInput,
-    TaskListInput,
-    TaskStopInput,
-    TaskUpdateInput,
     ToolRegistry,
     WebFetchInput,
     default_tool_registry,
@@ -66,40 +46,16 @@ from harness_agent.tools import (
 from harness_agent.web_fetch import WebFetcher
 
 
-EventBatch = tuple[EventBase, ...]
+# Re-exports preserved so existing call sites keep working.
+__all__ = ["ToolCallExecutor", "ToolCallResultWaiter", "ToolExecutionResult"]
+
+
 ToolExecutor = Callable[[str, ToolCallRequested], Awaitable[RuntimeToolResult]]
-ToolCallKey = tuple[str, int, str]
-
-
-class ToolExecutionResult(BaseModel):
-    result: RuntimeToolResult
-    attachments: list[ContentRef] = Field(default_factory=list[ContentRef])
-
-
-class ToolCallResultWaiter:
-    def __init__(self) -> None:
-        self._pending: dict[ToolCallKey, asyncio.Future[ToolCallCompleted]] = {}
-
-    def expect(self, event: ToolCallRequested) -> None:
-        self._pending[_tool_call_key(event)] = asyncio.get_running_loop().create_future()
-
-    async def wait(self, event: ToolCallRequested) -> ToolCallCompleted:
-        key = _tool_call_key(event)
-        future = self._pending[key]
-        try:
-            return await future
-        finally:
-            del self._pending[key]
-
-    async def handle_tool_call_completed(self, event: ToolCallCompleted) -> EventBatch:
-        key = _tool_call_key(event)
-        future = self._pending.get(key)
-        if future is not None and not future.done():
-            future.set_result(event)
-        return ()
 
 
 class ToolCallExecutor:
+    """Routes tool calls to runtime, shell/file, web, image, MCP, and domain handlers."""
+
     def __init__(
         self,
         *,
@@ -115,15 +71,16 @@ class ToolCallExecutor:
         max_model_output_chars: int = 20_000,
     ) -> None:
         self._runtime = runtime
-        self._task_store = task_store
-        self._schedule_store = schedule_store
         self._web_fetcher = web_fetcher
-        self._image_jobs = image_jobs
         self._mcp_manager = mcp_manager
-        self._sub_agents = sub_agents
         self._memory_service = memory_service
         self._session_search_service = session_search
         self._max_model_output_chars = max_model_output_chars
+        self._image_handlers: ImageToolHandlers | None = (
+            ImageToolHandlers(runtime=runtime, image_jobs=image_jobs)
+            if image_jobs is not None
+            else None
+        )
         self._tool_executors: dict[str, ToolExecutor] = {
             "shell.exec": self._shell_exec,
             "shell.spawn": self._shell_spawn,
@@ -142,41 +99,46 @@ class ToolCallExecutor:
         }
         if self._web_fetcher is not None:
             self._tool_executors["web.fetch"] = self._web_fetch
-        if self._image_jobs is not None:
+        if self._image_handlers is not None:
+            self._tool_executors["image.generate"] = self._image_handlers.generate
+        if task_store is not None:
+            tasks = TaskToolHandlers(task_store=task_store)
             self._tool_executors.update(
                 {
-                    "image.generate": self._image_generate,
+                    "task.create": tasks.create,
+                    "task.get": tasks.get,
+                    "task.list": tasks.list,
+                    "task.update": tasks.update,
+                    "task.stop": tasks.stop,
                 }
             )
-        if self._task_store is not None:
+        if schedule_store is not None:
+            schedules = ScheduleToolHandlers(schedule_store=schedule_store)
             self._tool_executors.update(
                 {
-                    "task.create": self._task_create,
-                    "task.get": self._task_get,
-                    "task.list": self._task_list,
-                    "task.update": self._task_update,
-                    "task.stop": self._task_stop,
+                    "schedule.once": schedules.once,
+                    "schedule.cron": schedules.cron,
+                    "schedule.list": schedules.list,
+                    "schedule.cancel": schedules.cancel,
                 }
             )
-        if self._schedule_store is not None:
+        if sub_agents is not None:
+            agents = SubAgentToolHandlers(sub_agents=sub_agents)
             self._tool_executors.update(
                 {
-                    "schedule.once": self._schedule_once,
-                    "schedule.cron": self._schedule_cron,
-                    "schedule.list": self._schedule_list,
-                    "schedule.cancel": self._schedule_cancel,
+                    "agent.run": agents.run,
+                    "agent.spawn": agents.spawn,
+                    "agent.result": agents.result,
+                    "agent.list": agents.list,
+                    "agent.cancel": agents.cancel,
                 }
             )
-        if self._sub_agents is not None:
-            self._tool_executors.update(
-                {
-                    "agent.run": self._agent_run,
-                    "agent.spawn": self._agent_spawn,
-                    "agent.result": self._agent_result,
-                    "agent.list": self._agent_list,
-                    "agent.cancel": self._agent_cancel,
-                }
-            )
+        # `tool_registry()` advertises tools only when their dep is wired.
+        self._task_store = task_store
+        self._schedule_store = schedule_store
+        self._image_jobs = image_jobs
+        self._sub_agents = sub_agents
+
     def tool_registry(self) -> ToolRegistry:
         return default_tool_registry(
             include_web_fetch=self._web_fetcher is not None,
@@ -232,6 +194,21 @@ class ToolCallExecutor:
             ),
         )
 
+    async def _execute_tool(self, event: ToolCallRequested) -> ToolExecutionResult:
+        if event.tool_name == "file.read":
+            return await self._file_read_for_model(event.user_id, event)
+        if event.tool_name == "image.status":
+            if self._image_handlers is None:
+                raise RuntimeError("image job service is not configured")
+            return await self._image_handlers.status(event.user_id, event)
+        if event.tool_name.startswith("mcp."):
+            return ToolExecutionResult(result=await self._mcp_call(event))
+        if event.tool_name not in self._tool_executors:
+            raise ValueError(f"Unsupported tool call: {event.tool_name}")
+        return ToolExecutionResult(
+            result=await self._tool_executors[event.tool_name](event.user_id, event)
+        )
+
     async def _spill_oversized_result(
         self,
         event: ToolCallRequested,
@@ -240,7 +217,7 @@ class ToolCallExecutor:
         rendered = execution.result.render_for_llm(event.tool_name)
         if len(rendered) <= self._max_model_output_chars:
             return execution
-        path = _tool_result_path(event)
+        path = tool_result_spill_path(event)
         write = await self._runtime.write_content_file(
             event.user_id,
             path,
@@ -260,19 +237,6 @@ class ToolCallExecutor:
             attachments=execution.attachments,
         )
 
-    async def _execute_tool(self, event: ToolCallRequested) -> ToolExecutionResult:
-        if event.tool_name == "file.read":
-            return await self._file_read_for_model(event.user_id, event)
-        if event.tool_name == "image.status":
-            return await self._image_status_for_model(event.user_id, event)
-        if event.tool_name.startswith("mcp."):
-            return ToolExecutionResult(result=await self._mcp_call(event))
-        if event.tool_name not in self._tool_executors:
-            raise ValueError(f"Unsupported tool call: {event.tool_name}")
-        return ToolExecutionResult(
-            result=await self._tool_executors[event.tool_name](event.user_id, event)
-        )
-
     async def _mcp_call(self, event: ToolCallRequested) -> RuntimeToolResult:
         if self._mcp_manager is None:
             raise RuntimeError("mcp manager is not configured")
@@ -283,32 +247,16 @@ class ToolCallExecutor:
             arguments=input.arguments,
         )
 
-    async def _shell_exec(
-        self,
-        user_id: str,
-        event: ToolCallRequested,
-    ) -> RuntimeToolResult:
+    async def _shell_exec(self, user_id: str, event: ToolCallRequested) -> RuntimeToolResult:
         return await self._runtime.shell_exec(user_id, ShellExecInput.model_validate(event.input))
 
-    async def _shell_spawn(
-        self,
-        user_id: str,
-        event: ToolCallRequested,
-    ) -> RuntimeToolResult:
+    async def _shell_spawn(self, user_id: str, event: ToolCallRequested) -> RuntimeToolResult:
         return await self._runtime.shell_spawn(user_id, ShellSpawnInput.model_validate(event.input))
 
-    async def _shell_read(
-        self,
-        user_id: str,
-        event: ToolCallRequested,
-    ) -> RuntimeToolResult:
+    async def _shell_read(self, user_id: str, event: ToolCallRequested) -> RuntimeToolResult:
         return await self._runtime.shell_read(user_id, ShellReadInput.model_validate(event.input))
 
-    async def _shell_kill(
-        self,
-        user_id: str,
-        event: ToolCallRequested,
-    ) -> RuntimeToolResult:
+    async def _shell_kill(self, user_id: str, event: ToolCallRequested) -> RuntimeToolResult:
         return await self._runtime.shell_kill(user_id, ShellKillInput.model_validate(event.input))
 
     async def _file_read_for_model(
@@ -317,11 +265,7 @@ class ToolCallExecutor:
         event: ToolCallRequested,
     ) -> ToolExecutionResult:
         input = FileReadInput.model_validate(event.input)
-        read = await self._runtime.read_file_bytes(
-            user_id,
-            input.path,
-            input.max_bytes,
-        )
+        read = await self._runtime.read_file_bytes(user_id, input.path, input.max_bytes)
         if read.result.exit_code != 0:
             return ToolExecutionResult(result=read.result)
         if read.file is None:
@@ -329,11 +273,7 @@ class ToolCallExecutor:
         workspace_file = read.file
         content_ref = content_ref_from_workspace_file(workspace_file)
         if content_ref.kind == "image":
-            full_read = await self._runtime.read_file_bytes(
-                user_id,
-                input.path,
-                None,
-            )
+            full_read = await self._runtime.read_file_bytes(user_id, input.path, None)
             if full_read.result.exit_code != 0:
                 return ToolExecutionResult(result=full_read.result)
             if full_read.file is None:
@@ -351,419 +291,56 @@ class ToolCallExecutor:
             )
         )
 
-    async def _file_write(
-        self,
-        user_id: str,
-        event: ToolCallRequested,
-    ) -> RuntimeToolResult:
+    async def _file_write(self, user_id: str, event: ToolCallRequested) -> RuntimeToolResult:
         return await self._runtime.file_write(user_id, FileWriteInput.model_validate(event.input))
 
-    async def _file_edit(
-        self,
-        user_id: str,
-        event: ToolCallRequested,
-    ) -> RuntimeToolResult:
+    async def _file_edit(self, user_id: str, event: ToolCallRequested) -> RuntimeToolResult:
         return await self._runtime.file_edit(user_id, FileEditInput.model_validate(event.input))
 
-    async def _file_multi_edit(
-        self,
-        user_id: str,
-        event: ToolCallRequested,
-    ) -> RuntimeToolResult:
+    async def _file_multi_edit(self, user_id: str, event: ToolCallRequested) -> RuntimeToolResult:
         return await self._runtime.file_multi_edit(
-            user_id,
-            FileMultiEditInput.model_validate(event.input),
+            user_id, FileMultiEditInput.model_validate(event.input)
         )
 
-    async def _file_glob(
-        self,
-        user_id: str,
-        event: ToolCallRequested,
-    ) -> RuntimeToolResult:
+    async def _file_glob(self, user_id: str, event: ToolCallRequested) -> RuntimeToolResult:
         return await self._runtime.file_glob(user_id, FileGlobInput.model_validate(event.input))
 
-    async def _file_grep(
-        self,
-        user_id: str,
-        event: ToolCallRequested,
-    ) -> RuntimeToolResult:
+    async def _file_grep(self, user_id: str, event: ToolCallRequested) -> RuntimeToolResult:
         return await self._runtime.file_grep(user_id, FileGrepInput.model_validate(event.input))
 
-    async def _file_list(
-        self,
-        user_id: str,
-        event: ToolCallRequested,
-    ) -> RuntimeToolResult:
+    async def _file_list(self, user_id: str, event: ToolCallRequested) -> RuntimeToolResult:
         return await self._runtime.file_list(user_id, FileListInput.model_validate(event.input))
 
-    async def _web_fetch(
-        self,
-        user_id: str,
-        event: ToolCallRequested,
-    ) -> RuntimeToolResult:
+    async def _web_fetch(self, user_id: str, event: ToolCallRequested) -> RuntimeToolResult:
         if self._web_fetcher is None:
             raise RuntimeError("web fetcher is not configured")
         return await self._web_fetcher.fetch(WebFetchInput.model_validate(event.input))
 
-    async def _image_generate(
-        self,
-        user_id: str,
-        event: ToolCallRequested,
-    ) -> RuntimeToolResult:
-        record = await self._require_image_jobs().start(
-            user_id=user_id,
-            conversation_id=event.conversation_id,
-            parent_call_id=event.call_id,
-            input=ImageGenerateInput.model_validate(event.input),
-        )
-        return RuntimeToolResult(stdout=render_image_job_record(record))
-
-    async def _image_status_for_model(
-        self,
-        user_id: str,
-        event: ToolCallRequested,
-    ) -> ToolExecutionResult:
-        input = ImageStatusInput.model_validate(event.input)
-        record = await self._require_image_jobs().get(
-            job_id=input.image_id,
-            user_id=user_id,
-            conversation_id=event.conversation_id,
-        )
-        if record is None:
-            return ToolExecutionResult(
-                result=RuntimeToolResult(
-                    stderr=f"Unknown image job: {input.image_id}\n",
-                    exit_code=1,
-                )
-            )
-        if record.status != "completed":
-            return ToolExecutionResult(
-                result=RuntimeToolResult(stdout=render_image_job_record(record))
-            )
-        if record.mime_type is None:
-            raise RuntimeError(
-                f"completed image job {record.id} is missing mime_type"
-            )
-        read = await self._runtime.read_file_bytes(user_id, record.output_path, None)
-        if read.result.exit_code != 0:
-            return ToolExecutionResult(result=read.result)
-        if read.file is None:
-            raise RuntimeError("image file read succeeded without file content")
-        content_ref = content_ref_from_bytes(
-            kind="image",
-            file_name=_basename(record.output_path),
-            mime_type=record.mime_type,
-            workspace_path=record.output_path,
-            content=read.file.content,
-        )
-        return ToolExecutionResult(
-            result=RuntimeToolResult(stdout=render_image_job_record(record)),
-            attachments=[content_ref],
-        )
-
-    def _require_image_jobs(self) -> ImageJobService:
-        if self._image_jobs is None:
-            raise RuntimeError("image job service is not configured")
-        return self._image_jobs
-
-    async def _task_create(
-        self,
-        user_id: str,
-        event: ToolCallRequested,
-    ) -> RuntimeToolResult:
-        input = TaskCreateInput.model_validate(event.input)
-        task = await self._require_task_store().create(
-            user_id=user_id,
-            conversation_id=event.conversation_id,
-            title=input.title,
-            status=input.status,
-        )
-        return self._text_result(task.model_dump_json(indent=2))
-
-    async def _task_get(
-        self,
-        user_id: str,
-        event: ToolCallRequested,
-    ) -> RuntimeToolResult:
-        input = TaskGetInput.model_validate(event.input)
-        task = await self._require_task_store().get(
-            task_id=input.task_id,
-            user_id=user_id,
-            conversation_id=event.conversation_id,
-        )
-        if task is None:
-            raise KeyError(input.task_id)
-        return self._text_result(task.model_dump_json(indent=2))
-
-    async def _task_list(
-        self,
-        user_id: str,
-        event: ToolCallRequested,
-    ) -> RuntimeToolResult:
-        input = TaskListInput.model_validate(event.input)
-        tasks = await self._require_task_store().list(
-            user_id=user_id,
-            conversation_id=event.conversation_id,
-            include_stopped=input.include_stopped,
-        )
-        return self._text_result(tasks_to_json(tasks))
-
-    async def _task_update(
-        self,
-        user_id: str,
-        event: ToolCallRequested,
-    ) -> RuntimeToolResult:
-        input = TaskUpdateInput.model_validate(event.input)
-        task = await self._require_task_store().update(
-            task_id=input.task_id,
-            user_id=user_id,
-            conversation_id=event.conversation_id,
-            title=input.title,
-            status=input.status,
-        )
-        if task is None:
-            raise KeyError(input.task_id)
-        return self._text_result(task.model_dump_json(indent=2))
-
-    async def _task_stop(
-        self,
-        user_id: str,
-        event: ToolCallRequested,
-    ) -> RuntimeToolResult:
-        input = TaskStopInput.model_validate(event.input)
-        task = await self._require_task_store().update(
-            task_id=input.task_id,
-            user_id=user_id,
-            conversation_id=event.conversation_id,
-            title=None,
-            status="stopped",
-        )
-        if task is None:
-            raise KeyError(input.task_id)
-        return self._text_result(task.model_dump_json(indent=2))
-
-    async def _skill_list(
-        self,
-        user_id: str,
-        event: ToolCallRequested,
-    ) -> RuntimeToolResult:
+    async def _skill_list(self, user_id: str, event: ToolCallRequested) -> RuntimeToolResult:
         input = SkillListInput.model_validate(event.input)
         skills = await self._runtime.list_skills(user_id)
         if input.include_descriptions:
             text = "\n".join(f"{skill.name}: {skill.description}" for skill in skills)
         else:
             text = "\n".join(skill.name for skill in skills)
-        return self._text_result(text)
+        return RuntimeToolResult(stdout=text)
 
-    async def _skill_read(
-        self,
-        user_id: str,
-        event: ToolCallRequested,
-    ) -> RuntimeToolResult:
+    async def _skill_read(self, user_id: str, event: ToolCallRequested) -> RuntimeToolResult:
         input = SkillReadInput.model_validate(event.input)
         skills = await self._runtime.list_skills(user_id)
         for skill in skills:
             if skill.name == input.name:
-                return self._text_result(skill.render_for_prompt())
+                return RuntimeToolResult(stdout=skill.render_for_prompt())
         raise KeyError(input.name)
 
-    async def _schedule_once(
-        self,
-        user_id: str,
-        event: ToolCallRequested,
-    ) -> RuntimeToolResult:
-        input = ScheduleOnceInput.model_validate(event.input)
-        run_at_utc = None
-        if input.run_at_utc is not None:
-            run_at_utc = datetime.fromisoformat(input.run_at_utc).astimezone(UTC)
-        schedule = await self._require_schedule_store().create_once(
-            user_id=user_id,
-            conversation_id=event.conversation_id,
-            message=input.message,
-            reply_target=event.reply_target,
-            delay_seconds=input.delay_seconds,
-            run_at_utc=run_at_utc,
-        )
-        return self._text_result(schedule.model_dump_json(indent=2))
-
-    async def _schedule_cron(
-        self,
-        user_id: str,
-        event: ToolCallRequested,
-    ) -> RuntimeToolResult:
-        input = ScheduleCronInput.model_validate(event.input)
-        schedule = await self._require_schedule_store().create_cron(
-            user_id=user_id,
-            conversation_id=event.conversation_id,
-            message=input.message,
-            reply_target=event.reply_target,
-            cron=input.cron,
-            timezone=input.timezone,
-        )
-        return self._text_result(schedule.model_dump_json(indent=2))
-
-    async def _schedule_list(
-        self,
-        user_id: str,
-        event: ToolCallRequested,
-    ) -> RuntimeToolResult:
-        input = ScheduleListInput.model_validate(event.input)
-        schedules = await self._require_schedule_store().list_for_conversation(
-            user_id=user_id,
-            conversation_id=event.conversation_id,
-            include_stopped=input.include_stopped,
-        )
-        return self._text_result(
-            "[\n"
-            + ",\n".join(schedule.model_dump_json(indent=2) for schedule in schedules)
-            + "\n]"
-        )
-
-    async def _schedule_cancel(
-        self,
-        user_id: str,
-        event: ToolCallRequested,
-    ) -> RuntimeToolResult:
-        input = ScheduleCancelInput.model_validate(event.input)
-        schedule = await self._require_schedule_store().cancel(
-            schedule_id=input.schedule_id,
-            user_id=user_id,
-            conversation_id=event.conversation_id,
-        )
-        return self._text_result(schedule.model_dump_json(indent=2))
-
-    async def _agent_run(
-        self,
-        user_id: str,
-        event: ToolCallRequested,
-    ) -> RuntimeToolResult:
-        input = AgentRunInput.model_validate(event.input)
-        record = await self._require_sub_agents().run(
-            user_id=user_id,
-            parent_conversation_id=event.conversation_id,
-            parent_call_id=event.call_id,
-            input=input,
-        )
-        exit_code = 0 if record.status == "completed" else 1
-        return RuntimeToolResult(
-            stdout=render_sub_agent_record(record),
-            stderr="" if record.error is None else record.error,
-            exit_code=exit_code,
-        )
-
-    async def _agent_spawn(
-        self,
-        user_id: str,
-        event: ToolCallRequested,
-    ) -> RuntimeToolResult:
-        input = AgentSpawnInput.model_validate(event.input)
-        record = await self._require_sub_agents().spawn(
-            user_id=user_id,
-            parent_conversation_id=event.conversation_id,
-            parent_call_id=event.call_id,
-            input=input,
-        )
-        return self._text_result(render_sub_agent_record(record))
-
-    async def _agent_result(
-        self,
-        user_id: str,
-        event: ToolCallRequested,
-    ) -> RuntimeToolResult:
-        input = AgentResultInput.model_validate(event.input)
-        record = await self._require_sub_agents().result(
-            agent_id=input.agent_id,
-            user_id=user_id,
-            parent_conversation_id=event.conversation_id,
-        )
-        if record is None:
-            return RuntimeToolResult(stderr=f"Unknown sub-agent: {input.agent_id}\n", exit_code=1)
-        return self._text_result(render_sub_agent_record(record))
-
-    async def _agent_list(
-        self,
-        user_id: str,
-        event: ToolCallRequested,
-    ) -> RuntimeToolResult:
-        input = AgentListInput.model_validate(event.input)
-        records = await self._require_sub_agents().list_for_parent(
-            user_id=user_id,
-            parent_conversation_id=event.conversation_id,
-            include_completed=input.include_completed,
-        )
-        return self._text_result(render_sub_agent_records(records))
-
-    async def _agent_cancel(
-        self,
-        user_id: str,
-        event: ToolCallRequested,
-    ) -> RuntimeToolResult:
-        input = AgentCancelInput.model_validate(event.input)
-        record = await self._require_sub_agents().cancel(
-            agent_id=input.agent_id,
-            user_id=user_id,
-            parent_conversation_id=event.conversation_id,
-        )
-        if record is None:
-            return RuntimeToolResult(stderr=f"Unknown sub-agent: {input.agent_id}\n", exit_code=1)
-        return self._text_result(render_sub_agent_record(record))
-
-    def _require_task_store(self) -> SQLiteTaskStore:
-        if self._task_store is None:
-            raise RuntimeError("task store is not configured")
-        return self._task_store
-
-    def _require_schedule_store(self) -> SQLiteScheduleStore:
-        if self._schedule_store is None:
-            raise RuntimeError("schedule store is not configured")
-        return self._schedule_store
-
-    def _require_sub_agents(self) -> SubAgentService:
-        if self._sub_agents is None:
-            raise RuntimeError("sub-agent service is not configured")
-        return self._sub_agents
-
-    def _text_result(self, text: str) -> RuntimeToolResult:
-        return RuntimeToolResult(stdout=text)
-
-    async def _memory(
-        self,
-        user_id: str,
-        event: ToolCallRequested,
-    ) -> RuntimeToolResult:
+    async def _memory(self, user_id: str, event: ToolCallRequested) -> RuntimeToolResult:
         return await self._memory_service.execute(
             user_id, MemoryToolInput.model_validate(event.input)
         )
 
-    async def _session_search(
-        self,
-        user_id: str,
-        event: ToolCallRequested,
-    ) -> RuntimeToolResult:
+    async def _session_search(self, user_id: str, event: ToolCallRequested) -> RuntimeToolResult:
         return await self._session_search_service.execute(
             user_id=user_id,
             current_conversation_id=event.conversation_id,
             input=SessionSearchInput.model_validate(event.input),
         )
-
-
-def _tool_call_key(event: ToolCallRequested | ToolCallCompleted) -> ToolCallKey:
-    return (event.conversation_id, event.generation, event.call_id)
-
-
-def _tool_result_path(event: ToolCallRequested) -> str:
-    # Use `/` between components: safe_conversation_id_part percent-escapes
-    # any `/` inside the encoded conversation_id / call_id, so `/` only
-    # ever appears as our separator. A flat `-` join would collide on
-    # tuples like (conv="cli-1", gen=2, call="a") vs (conv="cli", gen=1,
-    # call="2-a") because `-` is in the percent-encoding safe set.
-    return (
-        "/workspace/content/tool-results/"
-        f"{safe_conversation_id_part(event.conversation_id)}/"
-        f"{event.generation}/"
-        f"{safe_conversation_id_part(event.call_id)}.txt"
-    )
-
-
-def _basename(path: str) -> str:
-    return path.rsplit("/", 1)[-1] or path
